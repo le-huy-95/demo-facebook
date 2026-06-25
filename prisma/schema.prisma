@@ -1,0 +1,86 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model FacebookCredential {
+  id                 String         @id @default(uuid())
+  organizationId     String         @default("default-org") @map("organization_id")
+  friendlyName       String         @map("friendly_name")
+  fbUserId           String?        @map("fb_user_id")
+  fbUserName         String?        @map("fb_user_name")
+  userAccessToken    String?        @map("user_access_token")
+  userTokenExpiresAt DateTime?      @map("user_token_expires_at")
+  userTokenStatus    String         @default("VALID") @map("user_token_status")
+  status             String         @default("PENDING")
+  createdAt          DateTime       @default(now()) @map("created_at")
+  updatedAt          DateTime       @updatedAt @map("updated_at")
+  pages              FacebookPage[]
+
+  @@index([organizationId])
+  @@map("facebook_credentials")
+}
+
+model FacebookPage {
+  id                  String             @id @default(uuid())
+  credentialId        String             @map("credential_id")
+  organizationId      String             @map("organization_id")
+  pageId              String             @map("page_id")
+  name                String?
+  category            String?
+  pictureUrl          String?            @map("picture_url")
+  pageAccessToken     String?            @map("page_access_token")
+  tasks               String             @default("[]")
+  webhookSubscribed   Boolean            @default(false) @map("webhook_subscribed")
+  webhookSubscribedAt DateTime?          @map("webhook_subscribed_at")
+  isPinned            Boolean            @default(false) @map("is_pinned")
+  pinnedAt            DateTime?          @map("pinned_at")
+  status              String             @default("ACTIVE")
+  createdAt           DateTime           @default(now()) @map("created_at")
+  updatedAt           DateTime           @updatedAt @map("updated_at")
+  credential          FacebookCredential @relation(fields: [credentialId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, pageId])
+  @@index([credentialId])
+  @@map("facebook_pages")
+}
+
+model WebhookEvent {
+  id             String   @id @default(uuid())
+  organizationId String?  @map("organization_id")
+  pageId         String?  @map("page_id")
+  eventType      String   @default("MESSENGER") @map("event_type")
+  direction      String?
+  senderId       String?  @map("sender_id")
+  senderName     String?  @map("sender_name")
+  recipientId    String?  @map("recipient_id")
+  messageId      String?  @map("message_id")
+  postId         String?  @map("post_id")
+  commentId      String?  @map("comment_id")
+  msgType        String?  @map("msg_type")
+  content        String?
+  rawPayload     String   @map("raw_payload")
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  @@index([pageId])
+  @@index([eventType])
+  @@index([createdAt])
+  @@map("webhook_events")
+}
+
+model CustomerProfile {
+  id         String   @id @default(uuid())
+  pageId     String   @map("page_id")
+  senderId   String   @map("sender_id")
+  senderName String?  @map("sender_name")
+  pictureUrl String?  @map("picture_url")
+  updatedAt  DateTime @updatedAt @map("updated_at")
+
+  @@unique([pageId, senderId])
+  @@index([pageId])
+  @@map("customer_profiles")
+}

@@ -1,0 +1,12 @@
+# Copy to: C:\Users\<YOU>\.cloudflared\config.yml
+# Then: cloudflared tunnel run <TUNNEL_NAME>
+#
+# QUAN TRỌNG: service phải trỏ localhost:3000 (backend NestJS), KHÔNG phải VPS cũ.
+
+tunnel: <YOUR_TUNNEL_ID>
+credentials-file: C:\Users\<YOU>\.cloudflared\<YOUR_TUNNEL_ID>.json
+
+ingress:
+  - hostname: forward.kindergartenmng.vn
+    service: http://localhost:3000
+  - service: http_status:404
