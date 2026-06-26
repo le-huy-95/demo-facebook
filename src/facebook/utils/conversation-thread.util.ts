@@ -15,6 +15,7 @@ export interface ConversationThread {
   postId: string | null;
   commentId: string | null;
   messageCount: number;
+  unreadCount: number;
 }
 
 const GENERIC_SENDER_NAMES = new Set([
@@ -133,8 +134,22 @@ export function resolveCustomerId(event: WebhookEvent): string {
 
 export function aggregateConversations(
   events: WebhookEvent[],
+  readAtByThread: ReadonlyMap<string, Date> = new Map(),
 ): ConversationThread[] {
   const map = new Map<string, ConversationThread & { _latest: number }>();
+  const latestOutboundByThread = new Map<string, number>();
+
+  for (const event of events) {
+    if (isMessagingReceiptMsgType(event.msgType)) continue;
+    if (event.direction !== 'OUT') continue;
+
+    const threadId = buildThreadId(event);
+    if (!threadId) continue;
+
+    const ts = new Date(event.createdAt).getTime();
+    const current = latestOutboundByThread.get(threadId) ?? 0;
+    if (ts > current) latestOutboundByThread.set(threadId, ts);
+  }
 
   for (const event of events) {
     if (isMessagingReceiptMsgType(event.msgType)) continue;
@@ -148,6 +163,9 @@ export function aggregateConversations(
 
     const existing = map.get(threadId);
     const customerId = resolveCustomerId(event);
+    const readAt = readAtByThread.get(threadId)?.getTime();
+    const unreadCutoff = readAt ?? latestOutboundByThread.get(threadId) ?? 0;
+    const isUnreadInbound = event.direction === 'IN' && ts > unreadCutoff;
 
     if (!existing) {
       const inboundName =
@@ -168,12 +186,16 @@ export function aggregateConversations(
         postId: event.postId,
         commentId: event.commentId,
         messageCount: 1,
+        unreadCount: isUnreadInbound ? 1 : 0,
         _latest: ts,
       });
       continue;
     }
 
     existing.messageCount += 1;
+    if (isUnreadInbound) {
+      existing.unreadCount += 1;
+    }
     if (ts >= existing._latest) {
       existing._latest = ts;
       existing.lastMessageAt = event.createdAt.toISOString();

@@ -56,6 +56,13 @@ export interface ConversationListPage {
 const MESSAGE_PAGE_SIZE = 15;
 const CONVERSATION_PAGE_SIZE = 15;
 
+function parseDateCursor(cursor: string | undefined): Date | null {
+  if (!cursor) return null;
+
+  const date = new Date(cursor);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
 @Injectable()
 export class ConversationsService {
   constructor(
@@ -71,7 +78,8 @@ export class ConversationsService {
     options?: { limit?: number; before?: string },
   ): Promise<ConversationListPage> {
     const limit = options?.limit ?? CONVERSATION_PAGE_SIZE;
-    const merged = await this.fetchMergedThreads(pageId, orgId);
+    const readAtByThread = await this.getReadAtByThread(pageId, orgId);
+    const merged = await this.fetchMergedThreads(pageId, orgId, readAtByThread);
     const withPictures = await this.enrichThreadPictures(merged, pageId);
     const enriched = await this.enrichThreadNames(withPictures, pageId, orgId);
 
@@ -81,11 +89,12 @@ export class ConversationsService {
         new Date(a.lastMessageAt).getTime(),
     );
 
-    const eligible = options?.before
+    const beforeDate = parseDateCursor(options?.before);
+    const eligible = beforeDate
       ? sorted.filter(
           (t) =>
             new Date(t.lastMessageAt).getTime() <
-            new Date(options.before!).getTime(),
+            beforeDate.getTime(),
         )
       : sorted;
 
@@ -105,6 +114,7 @@ export class ConversationsService {
   private async fetchMergedThreads(
     pageId: string,
     orgId: string,
+    readAtByThread: ReadonlyMap<string, Date>,
   ): Promise<ConversationThread[]> {
     await this.assertPageBelongsToOrg(pageId, orgId);
 
@@ -118,7 +128,7 @@ export class ConversationsService {
       take: 2000,
     });
 
-    const fromWebhook = aggregateConversations(events);
+    const fromWebhook = aggregateConversations(events, readAtByThread);
 
     const [fromMessengerGraph, fromCommentGraph] = await Promise.all([
       this.listMessengerThreadsFromGraph(pageId, orgId).catch(
@@ -160,7 +170,10 @@ export class ConversationsService {
       options?.before,
     );
     const cached = await this.redisCache.get<ThreadMessagesPage>(cacheKey);
-    if (cached) return cached;
+    if (cached) {
+      await this.markThreadRead(pageId, orgId, threadId);
+      return cached;
+    }
 
     let result: ThreadMessagesPage;
     if (parsed.kind === 'MESSENGER') {
@@ -185,6 +198,7 @@ export class ConversationsService {
     }
 
     await this.redisCache.set(cacheKey, result);
+    await this.markThreadRead(pageId, orgId, threadId);
     return result;
   }
 
@@ -302,6 +316,7 @@ export class ConversationsService {
             postId,
             commentId: comment.id,
             messageCount: 1,
+            unreadCount: 0,
             _latest: ts,
           });
           continue;
@@ -363,6 +378,7 @@ export class ConversationsService {
       postId: null,
       commentId: null,
       messageCount: conv.message_count ?? 0,
+      unreadCount: 0,
     };
   }
 
@@ -395,6 +411,7 @@ export class ConversationsService {
         lastMessageAt:
           webhookTs >= graphTs ? thread.lastMessageAt : existing.lastMessageAt,
         messageCount: Math.max(thread.messageCount, existing.messageCount),
+        unreadCount: Math.max(thread.unreadCount, existing.unreadCount),
         postId: thread.postId ?? existing.postId,
         commentId: thread.commentId ?? existing.commentId,
         kind: thread.kind,
@@ -406,6 +423,60 @@ export class ConversationsService {
         new Date(b.lastMessageAt).getTime() -
         new Date(a.lastMessageAt).getTime(),
     );
+  }
+
+  private async getReadAtByThread(
+    pageId: string,
+    orgId: string,
+  ): Promise<Map<string, Date>> {
+    try {
+      const rows = await this.prisma.$queryRaw<
+        Array<{ thread_id: string; last_read_at: Date | string }>
+      >`
+        SELECT thread_id, last_read_at
+        FROM conversation_read_states
+        WHERE page_id = ${pageId} AND organization_id = ${orgId}
+      `;
+
+      return new Map(
+        rows.map((row) => [row.thread_id, new Date(row.last_read_at)]),
+      );
+    } catch {
+      return new Map();
+    }
+  }
+
+  private async markThreadRead(
+    pageId: string,
+    orgId: string,
+    threadId: string,
+  ): Promise<void> {
+    try {
+      await this.prisma.$executeRaw`
+        INSERT INTO conversation_read_states (
+          id,
+          organization_id,
+          page_id,
+          thread_id,
+          last_read_at,
+          updated_at
+        )
+        VALUES (
+          lower(hex(randomblob(16))),
+          ${orgId},
+          ${pageId},
+          ${threadId},
+          CURRENT_TIMESTAMP,
+          CURRENT_TIMESTAMP
+        )
+        ON CONFLICT(organization_id, page_id, thread_id)
+        DO UPDATE SET
+          last_read_at = excluded.last_read_at,
+          updated_at = excluded.updated_at
+      `;
+    } catch {
+      // Bỏ qua khi database local chưa chạy migration read-state.
+    }
   }
 
   private async getMessengerThreadMessages(
@@ -461,8 +532,9 @@ export class ConversationsService {
       (a, b) => a.createdAt.getTime() - b.createdAt.getTime(),
     );
 
-    const eligible = before
-      ? sorted.filter((m) => m.createdAt.getTime() < new Date(before).getTime())
+    const beforeDate = parseDateCursor(before);
+    const eligible = beforeDate
+      ? sorted.filter((m) => m.createdAt.getTime() < beforeDate.getTime())
       : sorted;
     const hasMore = eligible.length > limit || graphPaging.hasMore;
     const pageMessages = eligible.slice(-limit);
@@ -548,8 +620,9 @@ export class ConversationsService {
       (a, b) => a.createdAt.getTime() - b.createdAt.getTime(),
     );
 
-    const eligible = before
-      ? sorted.filter((m) => m.createdAt.getTime() < new Date(before).getTime())
+    const beforeDate = parseDateCursor(before);
+    const eligible = beforeDate
+      ? sorted.filter((m) => m.createdAt.getTime() < beforeDate.getTime())
       : sorted;
     const hasMore = eligible.length > limit;
     const pageMessages = eligible.slice(-limit);
@@ -584,9 +657,10 @@ export class ConversationsService {
       throw new NotFoundException('Cuộc trò chuyện không hợp lệ');
     }
 
+    const beforeDate = parseDateCursor(before);
     const where = {
       ...threadWhere,
-      ...(before ? { createdAt: { lt: new Date(before) } } : {}),
+      ...(beforeDate ? { createdAt: { lt: beforeDate } } : {}),
     };
 
     const events = await this.prisma.webhookEvent.findMany({

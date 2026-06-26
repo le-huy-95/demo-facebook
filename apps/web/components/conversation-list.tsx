@@ -80,36 +80,78 @@ export function ConversationList({
         ) : (
           <>
             {items.map((item) => {
-            const active = selectedId === item.id;
-            return (
-              <button
-                key={item.id}
-                type="button"
-                onClick={() => onSelect(item)}
-                className={`flex w-full gap-3 border-b border-[#f3f4f6] px-3 py-3 text-left transition hover:bg-[#f8fafc] ${
-                  active ? 'bg-[#eff6ff]' : ''
-                }`}
-              >
-                <UserAvatar
-                  name={item.senderName}
-                  pictureUrl={item.senderPictureUrl}
-                  senderId={item.senderId}
-                  pageId={item.pageId}
-                  size="md"
-                />
-                <div className="min-w-0 flex-1">
-                  <div className="flex items-start justify-between gap-2">
-                    <p className="truncate text-sm font-semibold text-[#111827]">{item.senderName}</p>
-                    <span className="shrink-0 text-[11px] text-[#9ca3af]">{formatDateTime(item.lastMessageAt)}</span>
+              const active = selectedId === item.id;
+              const unreadCount = item.unreadCount ?? 0;
+              const hasUnread = unreadCount > 0;
+
+              return (
+                <button
+                  key={item.id}
+                  type="button"
+                  onClick={() => onSelect(item)}
+                  className={`flex w-full gap-3 border-b border-[#f3f4f6] px-3 py-3 text-left transition hover:bg-[#f8fafc] ${
+                    active ? 'bg-[#eff6ff]' : ''
+                  }`}
+                >
+                  <UserAvatar
+                    name={item.senderName}
+                    pictureUrl={item.senderPictureUrl}
+                    senderId={item.senderId}
+                    pageId={item.pageId}
+                    size="md"
+                  />
+                  <div className="min-w-0 flex-1">
+                    <div className="flex items-start justify-between gap-2">
+                      <p
+                        className={`truncate text-sm ${
+                          hasUnread
+                            ? 'font-bold text-[#111827]'
+                            : 'font-semibold text-[#111827]'
+                        }`}
+                      >
+                        {item.senderName}
+                      </p>
+                      <span
+                        className={`shrink-0 text-[11px] ${
+                          hasUnread
+                            ? 'font-semibold text-[#2563eb]'
+                            : 'text-[#9ca3af]'
+                        }`}
+                      >
+                        {formatDateTime(item.lastMessageAt)}
+                      </span>
+                    </div>
+                    <p
+                      className={`mt-0.5 truncate text-xs ${
+                        hasUnread
+                          ? 'font-semibold text-[#374151]'
+                          : 'text-[#6b7280]'
+                      }`}
+                    >
+                      {item.preview}
+                    </p>
                   </div>
-                  <p className="mt-0.5 truncate text-xs text-[#6b7280]">{item.preview}</p>
-                </div>
-                <div className="flex shrink-0 items-end pb-1">
-                  {item.kind === 'FEED_COMMENT' ? <EnvelopeIcon /> : <MessageIcon />}
-                </div>
-              </button>
-            );
-          })}
+                  <div className="flex shrink-0 flex-col items-end justify-between gap-2 pb-1">
+                    {hasUnread && (
+                      <span
+                        aria-label={`${unreadCount} tin nhắn chưa đọc`}
+                        className={[
+                          'min-w-5 rounded-full bg-[#dc2626] px-1.5 py-0.5',
+                          'text-center text-[11px] font-semibold text-white',
+                        ].join(' ')}
+                      >
+                        {unreadCount > 99 ? '99+' : unreadCount}
+                      </span>
+                    )}
+                    {item.kind === 'FEED_COMMENT' ? (
+                      <EnvelopeIcon />
+                    ) : (
+                      <MessageIcon />
+                    )}
+                  </div>
+                </button>
+              );
+            })}
             {hasMore && (
               <div ref={bottomSentinelRef} className="flex justify-center py-3">
                 {loadingMore ? (

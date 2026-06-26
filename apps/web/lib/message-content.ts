@@ -12,7 +12,7 @@ export type ParsedMessageContent =
   | { kind: 'text'; text: string }
   | { kind: 'attachment'; attachment: ParsedAttachment }
   | { kind: 'attachments'; attachments: ParsedAttachment[] }
-  | { kind: 'receipt'; receiptType: 'read' | 'delivery'; label: string };
+  | { kind: 'receipt'; receiptType: 'read' | 'delivery' };
 
 export function isReceiptMessage(msg: WebhookMessage): boolean {
   return msg.msgType === 'read' || msg.msgType === 'delivery';
@@ -30,19 +30,11 @@ function parseAttachmentJson(raw: string): ParsedAttachment | null {
   return null;
 }
 
-function receiptLabel(msg: WebhookMessage): string {
-  if (msg.msgType === 'read') {
-    return msg.direction === 'IN' ? 'Khách hàng đã xem tin nhắn' : 'Đã xem';
-  }
-  return msg.direction === 'OUT' ? 'Đã gửi tới khách hàng' : 'Đã nhận';
-}
-
 export function parseMessageContent(msg: WebhookMessage): ParsedMessageContent {
   if (isReceiptMessage(msg)) {
     return {
       kind: 'receipt',
       receiptType: msg.msgType as 'read' | 'delivery',
-      label: receiptLabel(msg),
     };
   }
 

@@ -9,6 +9,14 @@ import { UserAvatar } from '@/components/user-avatar';
 
 const URL_SPLIT_REGEX = /(https?:\/\/[^\s]+)/g;
 
+type MessageDeliveryStatus = 'delivery' | 'read';
+
+interface DisplayMessage {
+  msg: WebhookMessage;
+  status?: MessageDeliveryStatus;
+  showDateSeparator: boolean;
+}
+
 function isHttpUrl(text: string): boolean {
   return /^https?:\/\//i.test(text);
 }
@@ -49,12 +57,7 @@ function MessageBody({ msg }: { msg: WebhookMessage }) {
   const parsed = parseMessageContent(msg);
 
   if (parsed.kind === 'receipt') {
-    return (
-      <p className="text-center text-xs text-[#6b7280]">
-        {parsed.receiptType === 'read' ? '✓✓ ' : '✓ '}
-        {parsed.label}
-      </p>
-    );
+    return null;
   }
 
   if (parsed.kind === 'attachments') {
@@ -115,6 +118,119 @@ function AttachmentBlock({ attachment }: { attachment: { title?: string; href?: 
   }
 
   return <p className="text-sm">{attachment.title ?? '[Tệp đính kèm]'}</p>;
+}
+
+function ThreadMessagesSkeleton() {
+  return (
+    <div className="space-y-4" aria-label="Đang tải tin nhắn">
+      <div className="flex justify-center">
+        <div className="h-6 w-24 animate-pulse rounded-full bg-[#e5e7eb]" />
+      </div>
+      {[0, 1, 2, 3].map((index) => {
+        const isOut = index % 2 === 1;
+
+        return (
+          <div
+            key={index}
+            className={`flex items-end gap-2 ${isOut ? 'flex-row-reverse' : 'flex-row'}`}
+          >
+            <div className="h-8 w-8 animate-pulse rounded-full bg-[#e5e7eb]" />
+            <div
+              className={`animate-pulse rounded-2xl px-4 py-3 shadow-sm ${
+                isOut
+                  ? 'w-[42%] rounded-br-md bg-[#d9f5c3]'
+                  : 'w-[58%] rounded-bl-md bg-white'
+              }`}
+            >
+              <div className="mb-2 h-3 w-1/3 rounded bg-[#e5e7eb]" />
+              <div className="h-3 w-full rounded bg-[#e5e7eb]" />
+              <div className="mt-2 h-2 w-16 rounded bg-[#e5e7eb]" />
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function formatDateOnly(iso: string | Date): string {
+  const d = iso instanceof Date ? iso : new Date(iso);
+  if (Number.isNaN(d.getTime())) return '';
+  return d.toLocaleDateString('vi-VN', {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  });
+}
+
+function messageTimestamp(msg: WebhookMessage): number {
+  const parsed = parseMessageContent(msg);
+  const fallback = new Date(msg.createdAt).getTime();
+  if (parsed.kind !== 'receipt' || !msg.content) return fallback;
+
+  try {
+    const payload = JSON.parse(msg.content) as {
+      watermark?: number | string | null;
+      timestamp?: number | string | null;
+    };
+    const raw = payload.watermark ?? payload.timestamp;
+    const numeric = typeof raw === 'string' ? Number(raw) : raw;
+    if (typeof numeric === 'number' && Number.isFinite(numeric)) {
+      return numeric;
+    }
+  } catch {
+    // Receipt payload cũ có thể không phải JSON hợp lệ.
+  }
+
+  return fallback;
+}
+
+function receiptPriority(status: MessageDeliveryStatus): number {
+  return status === 'read' ? 2 : 1;
+}
+
+function buildDisplayMessages(messages: WebhookMessage[]): DisplayMessage[] {
+  const statusByMessageId = new Map<string, MessageDeliveryStatus>();
+  const normalMessages: WebhookMessage[] = [];
+
+  for (const msg of messages) {
+    const parsed = parseMessageContent(msg);
+    if (parsed.kind !== 'receipt') {
+      normalMessages.push(msg);
+      continue;
+    }
+
+    const receiptAt = messageTimestamp(msg);
+    const target =
+      normalMessages
+        .filter((m) => {
+          if (m.direction !== 'OUT') return false;
+          if (msg.messageId && m.messageId === msg.messageId) return true;
+          return new Date(m.createdAt).getTime() <= receiptAt;
+        })
+        .at(-1) ?? null;
+
+    if (!target) continue;
+
+    const nextStatus = parsed.receiptType;
+    const currentStatus = statusByMessageId.get(target.id);
+    if (!currentStatus || receiptPriority(nextStatus) > receiptPriority(currentStatus)) {
+      statusByMessageId.set(target.id, nextStatus);
+    }
+  }
+
+  let previousDate = '';
+  return normalMessages.map((msg) => {
+    const date = formatDateOnly(msg.createdAt);
+    const showDateSeparator = !!date && date !== previousDate;
+    previousDate = date || previousDate;
+
+    return {
+      msg,
+      status: statusByMessageId.get(msg.id),
+      showDateSeparator,
+    };
+  });
 }
 
 interface PostPreviewPanelProps {
@@ -257,6 +373,7 @@ interface ThreadMessagesProps {
   onSelectMessage?: (msg: WebhookMessage) => void;
   post?: FacebookPostPreview | null;
   postLoading?: boolean;
+  initialLoading?: boolean;
   highlightComment?: string;
   highlightSenderName?: string;
   showFeedCommentBanner?: boolean;
@@ -280,6 +397,7 @@ export function ThreadMessages({
   onSelectMessage,
   post,
   postLoading = false,
+  initialLoading = false,
   highlightComment,
   highlightSenderName,
   showFeedCommentBanner = false,
@@ -339,6 +457,8 @@ export function ThreadMessages({
   }, [handleLoadMore, onLoadMore, hasMore]);
 
   const showPost = postLoading || !!post || showPostHintWhenEmpty;
+  const displayMessages = buildDisplayMessages(messages);
+  const showInitialSkeleton = initialLoading && displayMessages.length === 0;
 
   return (
     <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto bg-[#f3f4f6]">
@@ -376,23 +496,12 @@ export function ThreadMessages({
           </div>
         )}
 
-        {messages.length === 0 ? (
+        {showInitialSkeleton ? (
+          <ThreadMessagesSkeleton />
+        ) : displayMessages.length === 0 ? (
           <p className="text-center text-sm text-[#6b7280]">Chưa có tin nhắn trong cuộc trò chuyện này</p>
         ) : (
-          messages.map((msg) => {
-            const parsed = parseMessageContent(msg);
-
-            if (parsed.kind === 'receipt') {
-              return (
-                <div key={msg.id} className="py-1">
-                  <MessageBody msg={msg} />
-                  <p className="mt-0.5 text-center text-[10px] text-[#9ca3af]">
-                    {formatDateTime(msg.createdAt)}
-                  </p>
-                </div>
-              );
-            }
-
+          displayMessages.map(({ msg, status, showDateSeparator }) => {
             const isOut = msg.direction === 'OUT';
             const avatarUrl =
               msg.senderPictureUrl ??
@@ -405,36 +514,62 @@ export function ThreadMessages({
             const isSelected = !!selectedCommentId && msg.commentId === selectedCommentId;
 
             return (
-              <div key={msg.id} className={`flex items-end gap-2 ${isOut ? 'flex-row-reverse' : 'flex-row'}`}>
-                <UserAvatar
-                  name={displayName}
-                  pictureUrl={avatarUrl}
-                  senderId={avatarSenderId}
-                  pageId={avatarPageId}
-                  size="sm"
-                />
-                <div
-                  role={onSelectMessage ? 'button' : undefined}
-                  tabIndex={onSelectMessage ? 0 : undefined}
-                  onClick={onSelectMessage ? () => onSelectMessage(msg) : undefined}
-                  onKeyDown={
-                    onSelectMessage
-                      ? (e) => {
-                          if (e.key === 'Enter' || e.key === ' ') onSelectMessage(msg);
-                        }
-                      : undefined
-                  }
-                  className={`max-w-[75%] rounded-2xl px-4 py-2 text-sm shadow-sm ${
-                    isOut
-                      ? 'rounded-br-md bg-[#dcf8c6] text-[#111827]'
-                      : 'rounded-bl-md bg-white text-[#111827]'
-                  } ${isSelected ? 'ring-2 ring-[#f59e0b]' : ''}`}
-                >
-                  {!isOut && (
-                    <p className="mb-1 text-xs font-semibold text-[#3b82f6]">{displayName}</p>
-                  )}
-                  <MessageBody msg={msg} />
-                  <p className="mt-1 text-right text-[10px] text-[#9ca3af]">{formatDateTime(msg.createdAt)}</p>
+              <div key={msg.id} className="space-y-2">
+                {showDateSeparator && (
+                  <div className="flex justify-center">
+                    <span className="rounded-full bg-[#e5e7eb] px-3 py-1 text-[11px] text-[#6b7280]">
+                      {formatDateOnly(msg.createdAt)}
+                    </span>
+                  </div>
+                )}
+                <div className={`flex items-end gap-2 ${isOut ? 'flex-row-reverse' : 'flex-row'}`}>
+                  <UserAvatar
+                    name={displayName}
+                    pictureUrl={avatarUrl}
+                    senderId={avatarSenderId}
+                    pageId={avatarPageId}
+                    size="sm"
+                  />
+                  <div
+                    role={onSelectMessage ? 'button' : undefined}
+                    tabIndex={onSelectMessage ? 0 : undefined}
+                    onClick={
+                      onSelectMessage
+                        ? () => {
+                            void onSelectMessage(msg);
+                          }
+                        : undefined
+                    }
+                    onKeyDown={
+                      onSelectMessage
+                        ? (e) => {
+                            if (e.key === 'Enter' || e.key === ' ') {
+                              void onSelectMessage(msg);
+                            }
+                          }
+                        : undefined
+                    }
+                    className={`max-w-[75%] rounded-2xl px-4 py-2 text-sm shadow-sm ${
+                      isOut
+                        ? 'rounded-br-md bg-[#dcf8c6] text-[#111827]'
+                        : 'rounded-bl-md bg-white text-[#111827]'
+                    } ${isSelected ? 'ring-2 ring-[#f59e0b]' : ''}`}
+                  >
+                    {!isOut && (
+                      <p className="mb-1 text-xs font-semibold text-[#3b82f6]">
+                        {displayName}
+                      </p>
+                    )}
+                    <MessageBody msg={msg} />
+                    <div className="mt-1 flex items-center justify-end gap-1 text-[10px] text-[#9ca3af]">
+                      <span>{formatDateTime(msg.createdAt)}</span>
+                      {isOut && status && (
+                        <span>
+                          {status === 'read' ? '✓✓ Đã xem' : '✓ Đã gửi'}
+                        </span>
+                      )}
+                    </div>
+                  </div>
                 </div>
               </div>
             );

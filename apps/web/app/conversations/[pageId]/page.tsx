@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import { useParams } from 'next/navigation';
 import { ConversationList } from '@/components/conversation-list';
@@ -77,6 +77,53 @@ export default function ConversationsPage() {
   const [hasMoreConversations, setHasMoreConversations] = useState(false);
   const [loadingMoreConversations, setLoadingMoreConversations] = useState(false);
   const [conversationsCursor, setConversationsCursor] = useState<string | null>(null);
+  const seenConversationEventIdsRef = useRef<Set<string>>(new Set());
+  const threadLoadSeqRef = useRef(0);
+
+  const shouldApplyConversationEvent = useCallback((eventId: string): boolean => {
+    const seen = seenConversationEventIdsRef.current;
+    if (seen.has(eventId)) return false;
+
+    seen.add(eventId);
+    if (seen.size > 500) {
+      const oldest = seen.values().next().value;
+      if (oldest) seen.delete(oldest);
+    }
+    return true;
+  }, []);
+
+  const appendRealtimeMessage = useCallback((event: WebhookMessage, threadId: string) => {
+    setSelected((current) => {
+      if (current?.id === threadId) {
+        setMessages((msgs) => {
+          if (msgs.some((m) => m.id === event.id)) return msgs;
+          if (
+            event.messageId &&
+            msgs.some(
+              (m) => m.messageId === event.messageId && m.msgType === event.msgType,
+            )
+          ) {
+            return msgs;
+          }
+
+          let next = msgs;
+          if (event.direction === 'OUT' && event.content) {
+            next = msgs.filter(
+              (m) =>
+                !(
+                  m.id.startsWith('client-') &&
+                  m.direction === 'OUT' &&
+                  m.content === event.content
+                ),
+            );
+          }
+
+          return [...next, event];
+        });
+      }
+      return current;
+    });
+  }, []);
 
   const loadConversations = useCallback(async () => {
     const status = await getAuthStatus();
@@ -91,6 +138,42 @@ export default function ConversationsPage() {
     setHasMoreConversations(paging.hasMore);
     return filtered;
   }, [pageId]);
+
+  const updateConversationFromEvent = useCallback(
+    (event: WebhookMessage, threadId: string, reloadMissing: boolean) => {
+      if (isReceiptMessage(event) || !shouldApplyConversationEvent(event.id)) return;
+
+      setConversations((prev) => {
+        const existing = prev.find((c) => c.id === threadId);
+        if (!existing) {
+          if (reloadMissing) void loadConversations();
+          return prev;
+        }
+
+        const updated = prev.map((c) =>
+          c.id === threadId
+            ? {
+                ...c,
+                preview: event.content ?? c.preview,
+                lastMessageAt: event.createdAt,
+                messageCount: c.messageCount + 1,
+                unreadCount:
+                  event.direction === 'IN' && selected?.id !== threadId
+                    ? (c.unreadCount ?? 0) + 1
+                    : 0,
+              }
+            : c,
+        );
+
+        return [...updated].sort(
+          (a, b) =>
+            new Date(b.lastMessageAt).getTime() -
+            new Date(a.lastMessageAt).getTime(),
+        );
+      });
+    },
+    [loadConversations, selected?.id, shouldApplyConversationEvent],
+  );
 
   const loadMoreConversations = useCallback(async () => {
     if (!hasMoreConversations || loadingMoreConversations || !conversationsCursor) return;
@@ -116,6 +199,8 @@ export default function ConversationsPage() {
 
   const loadThread = useCallback(
     async (thread: ConversationThread) => {
+      const loadSeq = threadLoadSeqRef.current + 1;
+      threadLoadSeqRef.current = loadSeq;
       setSelected(thread);
       setMessages([]);
       setMessagesCursor(null);
@@ -128,11 +213,15 @@ export default function ConversationsPage() {
 
       try {
         const { data: msgs, paging } = await getConversationMessages(pageId, thread.id, { limit: 15 });
+        if (threadLoadSeqRef.current !== loadSeq) return;
+
         const resolvedName = resolveCustomerNameFromMessages(msgs, thread.senderName);
-        const enrichedThread = { ...thread, senderName: resolvedName };
+        const enrichedThread = { ...thread, senderName: resolvedName, unreadCount: 0 };
         setSelected(enrichedThread);
         setConversations((prev) =>
-          prev.map((c) => (c.id === thread.id ? { ...c, senderName: resolvedName } : c)),
+          prev.map((c) =>
+            c.id === thread.id ? { ...c, senderName: resolvedName, unreadCount: 0 } : c,
+          ),
         );
         setMessages(msgs);
         setMessagesCursor(paging.nextBefore);
@@ -150,31 +239,33 @@ export default function ConversationsPage() {
             setPostLoading(true);
             try {
               const { data: postData } = await getPostPreview(pageId, latestWithPost);
+              if (threadLoadSeqRef.current !== loadSeq) return;
               setPost(postData);
             } catch {
               // keep last post panel on error
             } finally {
-              setPostLoading(false);
+              if (threadLoadSeqRef.current === loadSeq) setPostLoading(false);
             }
           }
         }
       } finally {
-        setMessagesLoading(false);
+        if (threadLoadSeqRef.current === loadSeq) setMessagesLoading(false);
       }
 
       if (thread.kind === 'FEED_COMMENT' && thread.postId) {
         setPostLoading(true);
         try {
           const { data: postData } = await getPostPreview(pageId, thread.postId);
+          if (threadLoadSeqRef.current !== loadSeq) return;
           setPost(postData);
         } catch {
-          setPost(null);
+          if (threadLoadSeqRef.current === loadSeq) setPost(null);
         } finally {
-          setPostLoading(false);
+          if (threadLoadSeqRef.current === loadSeq) setPostLoading(false);
         }
       } else {
         // Keep the last post panel by default for Messenger threads unless user clicks a message with postId
-        setPostLoading(false);
+        if (threadLoadSeqRef.current === loadSeq) setPostLoading(false);
       }
     },
     [pageId],
@@ -241,8 +332,9 @@ export default function ConversationsPage() {
     setPost(null);
     setConversationsCursor(null);
     setHasMoreConversations(false);
+    seenConversationEventIdsRef.current.clear();
 
-    (async () => {
+    void (async () => {
       setLoading(true);
       try {
         const status = await getAuthStatus();
@@ -292,64 +384,10 @@ export default function ConversationsPage() {
       const threadId = buildThreadIdFromEvent(event);
       if (!threadId) return;
 
-      const isReceipt = isReceiptMessage(event);
-
-      if (!isReceipt) {
-        setConversations((prev) => {
-          const existing = prev.find((c) => c.id === threadId);
-          if (!existing) {
-            void loadConversations();
-            return prev;
-          }
-          const updated = prev.map((c) =>
-            c.id === threadId
-              ? {
-                  ...c,
-                  preview: event.content ?? c.preview,
-                  lastMessageAt: event.createdAt,
-                  messageCount: c.messageCount + 1,
-                }
-              : c,
-          );
-          return [...updated].sort(
-            (a, b) =>
-              new Date(b.lastMessageAt).getTime() - new Date(a.lastMessageAt).getTime(),
-          );
-        });
-      }
-
-      setSelected((current) => {
-        if (current?.id === threadId) {
-          setMessages((msgs) => {
-            if (msgs.some((m) => m.id === event.id)) return msgs;
-            if (
-              event.messageId &&
-              msgs.some(
-                (m) => m.messageId === event.messageId && m.msgType === event.msgType,
-              )
-            ) {
-              return msgs;
-            }
-
-            let next = msgs;
-            if (event.direction === 'OUT' && event.content) {
-              next = msgs.filter(
-                (m) =>
-                  !(
-                    m.id.startsWith('client-') &&
-                    m.direction === 'OUT' &&
-                    m.content === event.content
-                  ),
-              );
-            }
-
-            return [...next, event];
-          });
-        }
-        return current;
-      });
+      updateConversationFromEvent(event, threadId, true);
+      appendRealtimeMessage(event, threadId);
     });
-  }, [pageId, loadConversations]);
+  }, [appendRealtimeMessage, pageId, updateConversationFromEvent]);
 
   // Fallback: also listen via SSE stream (helps when Socket.IO delivery is flaky).
   useEffect(() => {
@@ -358,50 +396,10 @@ export default function ConversationsPage() {
       const threadId = buildThreadIdFromEvent(event);
       if (!threadId) return;
 
-      const isReceipt = isReceiptMessage(event);
-
-      if (!isReceipt) {
-        setConversations((prev) => {
-          const existing = prev.find((c) => c.id === threadId);
-          if (!existing) return prev;
-          const updated = prev.map((c) =>
-            c.id === threadId
-              ? {
-                  ...c,
-                  preview: event.content ?? c.preview,
-                  lastMessageAt: event.createdAt,
-                  messageCount: c.messageCount + 1,
-                }
-              : c,
-          );
-          return [...updated].sort(
-            (a, b) =>
-              new Date(b.lastMessageAt).getTime() -
-              new Date(a.lastMessageAt).getTime(),
-          );
-        });
-      }
-
-      setSelected((current) => {
-        if (current?.id === threadId) {
-          setMessages((msgs) => {
-            if (msgs.some((m) => m.id === event.id)) return msgs;
-            if (
-              event.messageId &&
-              msgs.some(
-                (m) =>
-                  m.messageId === event.messageId && m.msgType === event.msgType,
-              )
-            ) {
-              return msgs;
-            }
-            return [...msgs, event];
-          });
-        }
-        return current;
-      });
+      updateConversationFromEvent(event, threadId, false);
+      appendRealtimeMessage(event, threadId);
     });
-  }, [pageId]);
+  }, [appendRealtimeMessage, pageId, updateConversationFromEvent]);
 
   if (loading) {
     return (
@@ -434,10 +432,14 @@ export default function ConversationsPage() {
           <ConversationList
             items={conversations}
             selectedId={selected?.id ?? null}
-            onSelect={loadThread}
+            onSelect={(thread) => {
+              void loadThread(thread);
+            }}
             hasMore={hasMoreConversations}
             loadingMore={loadingMoreConversations}
-            onLoadMore={loadMoreConversations}
+            onLoadMore={() => {
+              void loadMoreConversations();
+            }}
           />
         </aside>
 
@@ -473,10 +475,15 @@ export default function ConversationsPage() {
                 selectedCommentId={selected.kind === 'FEED_COMMENT' ? replyCommentId : null}
                 hasMore={hasMoreMessages}
                 loadingMore={loadingMoreMessages || messagesLoading}
-                onLoadMore={loadMoreMessages}
-                onSelectMessage={handleSelectMessage}
+                onLoadMore={() => {
+                  void loadMoreMessages();
+                }}
+                onSelectMessage={(msg) => {
+                  void handleSelectMessage(msg);
+                }}
                 post={post}
                 postLoading={postLoading}
+                initialLoading={messagesLoading}
                 highlightComment={resolvedHighlightComment}
                 highlightSenderName={selected.senderName}
                 showFeedCommentBanner={selected.kind === 'FEED_COMMENT'}
@@ -519,6 +526,7 @@ export default function ConversationsPage() {
                                   ...c,
                                   preview: text,
                                   lastMessageAt: optimistic.createdAt,
+                                  unreadCount: 0,
                                 }
                               : c,
                           )

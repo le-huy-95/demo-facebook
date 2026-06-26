@@ -103,6 +103,7 @@ export interface ConversationThread {
   postId: string | null;
   commentId: string | null;
   messageCount: number;
+  unreadCount: number;
 }
 
 export interface FacebookPostPreview {

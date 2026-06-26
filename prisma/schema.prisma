@@ -84,3 +84,16 @@ model CustomerProfile {
   @@index([pageId])
   @@map("customer_profiles")
 }
+
+model ConversationReadState {
+  id             String   @id @default(uuid())
+  organizationId String   @map("organization_id")
+  pageId         String   @map("page_id")
+  threadId       String   @map("thread_id")
+  lastReadAt     DateTime @map("last_read_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  @@unique([organizationId, pageId, threadId])
+  @@index([pageId])
+  @@map("conversation_read_states")
+}
