@@ -3,6 +3,7 @@ import { BadRequestException, Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import * as crypto from 'crypto';
 import got from 'got';
+import { isValidFacebookCommentId } from '../utils/facebook-comment-id.util';
 
 export interface OAuthStateData {
   orgId: string;
@@ -53,16 +54,30 @@ export interface GraphConversationMessage {
   };
 }
 
+export interface GraphCommentAttachment {
+  type?: string;
+  url?: string;
+  title?: string;
+  media?: {
+    image?: { src?: string; width?: number; height?: number };
+    source?: string;
+  };
+  target?: { url?: string };
+}
+
 export interface GraphPostComment {
   id: string;
   message?: string;
   created_time: string;
+  is_hidden?: boolean;
   from?: GraphConversationParticipant;
   parent?: { id?: string };
-  comments?: {
-    data: GraphPostComment[];
-  };
+  attachment?: GraphCommentAttachment;
 }
+
+/** Fields Graph API cho comment — gồm ảnh/sticker đính kèm. */
+export const GRAPH_COMMENT_FIELDS =
+  'id,message,from{id,name,picture},created_time,parent{id},is_hidden,attachment{type,url,title,media,target}';
 
 export interface GraphFeedPost {
   id: string;
@@ -91,6 +106,12 @@ export function extractGraphPictureUrl(
 
 @Injectable()
 export class FacebookOAuthService {
+  /** Quyền tối thiểu để đọc/trả lời bình luận trên bài viết fanpage. */
+  static readonly COMMENT_SCOPES = [
+    'pages_read_user_content',
+    'pages_manage_engagement',
+  ] as const;
+
   private readonly oauthScopes: string[] = [
     'business_management',
     'pages_show_list',
@@ -100,6 +121,7 @@ export class FacebookOAuthService {
     'pages_manage_posts',
     'pages_read_engagement',
     'pages_read_user_content',
+    'pages_manage_engagement',
   ];
 
   private readonly webhookFields: string[] = [
@@ -117,6 +139,9 @@ export class FacebookOAuthService {
     'standby',
   ];
 
+  /** Field webhook bắt buộc để nhận comment realtime (Meta: Pages API → field `feed`). */
+  static readonly COMMENT_WEBHOOK_FIELDS = ['feed'] as const;
+
   private readonly graphApiVersion: string;
   private readonly appId: string;
   private readonly appSecret: string;
@@ -129,7 +154,7 @@ export class FacebookOAuthService {
     private readonly configService: ConfigService,
     private readonly logger: AppLogger,
   ) {
-    this.graphApiVersion = 'v25.0';
+    this.graphApiVersion = 'v24.0';
     this.appId = this.configService.get<string>('FACEBOOK_APP_ID', '');
     this.appSecret = this.configService.get<string>('FACEBOOK_APP_SECRET', '');
     this.redirectUri =
@@ -619,8 +644,7 @@ export class FacebookOAuthService {
           {
             searchParams: {
               access_token: accessToken,
-              fields:
-                'id,message,created_time,comments.filter(stream).limit(100){id,message,from{id,name,picture.type(large)},created_time,parent{id},comments{id,message,from{id,name,picture.type(large)},created_time,parent{id}}}',
+              fields: `id,message,created_time,comments.limit(100){${GRAPH_COMMENT_FIELDS}}`,
               limit,
             },
             timeout: { request: 15_000 },
@@ -628,24 +652,16 @@ export class FacebookOAuthService {
         )
         .json<{ data: GraphFeedPost[] }>();
 
-      const posts = response.data ?? [];
-      for (const post of posts) {
-        if (post.comments?.data) {
-          post.comments.data = this.flattenComments(post.comments.data);
-        }
-      }
-      return posts;
+      const data = response.data ?? [];
+      this.logger.log(
+        `[FacebookOAuth] listPageFeedWithComments: fetched ${data.length} posts for page ${pageId}`,
+      );
+      return data;
     } catch (err: any) {
       const body = err?.response?.body;
-      const fbError =
-        typeof body === 'string'
-          ? body.startsWith('{')
-            ? JSON.parse(body)
-            : { message: body }
-          : body;
       this.logger.warn(
-        `Failed to list feed comments for page ${pageId}`,
-        fbError ?? err.message,
+        `Failed to list feed comments for page ${pageId}. Body: ${body}`,
+        err.message,
       );
       return [];
     }
@@ -654,10 +670,15 @@ export class FacebookOAuthService {
   async getPostComments(
     postId: string,
     accessToken: string,
-    options?: { limit?: number; before?: string },
+    options?: {
+      limit?: number;
+      before?: string;
+      after?: string;
+      order?: 'chronological' | 'reverse_chronological';
+    },
   ): Promise<{
     comments: GraphPostComment[];
-    paging?: { cursors?: { before?: string; after?: string } };
+    paging?: { cursors?: { before?: string; after?: string }; next?: string };
   }> {
     if (!postId || !accessToken) {
       return { comments: [] };
@@ -666,15 +687,18 @@ export class FacebookOAuthService {
     const limit = options?.limit ?? 50;
     const searchParams: Record<string, string | number> = {
       access_token: accessToken,
-      fields:
-        'id,message,from{id,name,picture.type(large)},created_time,parent{id},comments{id,message,from{id,name,picture.type(large)},created_time,parent{id}}',
+      fields: GRAPH_COMMENT_FIELDS,
       limit,
       filter: 'stream',
-      order: 'chronological',
+      // Mặc định lấy comment mới nhất trước — tránh bỏ sót thread khi bài có >100 comment
+      order: options?.order ?? 'reverse_chronological',
     };
 
     if (options?.before) {
       searchParams.before = options.before;
+    }
+    if (options?.after) {
+      searchParams.after = options.after;
     }
 
     try {
@@ -698,82 +722,100 @@ export class FacebookOAuthService {
       };
     } catch (err: any) {
       const body = err?.response?.body;
-      const fbError =
-        typeof body === 'string'
-          ? body.startsWith('{')
-            ? JSON.parse(body)
-            : { message: body }
-          : body;
       this.logger.warn(
-        `Failed to fetch comments for post ${postId}`,
-        fbError ?? err.message,
+        `Failed to fetch comments for post ${postId}. Body: ${body}`,
+        err.message,
       );
       return { comments: [] };
     }
   }
 
-  async getAllPostComments(
+  /** Lấy comment của bài viết qua phân trang (tối đa maxComments). */
+  async listAllPostComments(
     postId: string,
     accessToken: string,
-    maxPages = 5,
+    options?: { pageSize?: number; maxComments?: number },
   ): Promise<GraphPostComment[]> {
-    if (!postId || !accessToken) return [];
+    const pageSize = options?.pageSize ?? 100;
+    const maxComments = options?.maxComments ?? 500;
+    const all: GraphPostComment[] = [];
+    let after: string | undefined;
 
-    const allComments: GraphPostComment[] = [];
-    let afterCursor: string | undefined;
+    while (all.length < maxComments) {
+      const { comments, paging } = await this.getPostComments(
+        postId,
+        accessToken,
+        {
+          limit: pageSize,
+          after,
+          order: 'reverse_chronological',
+        },
+      );
 
-    for (let page = 0; page < maxPages; page++) {
-      const searchParams: Record<string, string | number> = {
-        access_token: accessToken,
-        fields:
-          'id,message,from{id,name,picture.type(large)},created_time,parent{id},comments{id,message,from{id,name,picture.type(large)},created_time,parent{id}}',
-        limit: 100,
-        filter: 'stream',
-        order: 'chronological',
-      };
-      if (afterCursor) {
-        searchParams.after = afterCursor;
-      }
+      if (!comments.length) break;
+      all.push(...comments);
 
-      try {
-        const response = await got
-          .get(
-            `https://graph.facebook.com/${this.graphApiVersion}/${postId}/comments`,
-            { searchParams, timeout: { request: 15_000 } },
-          )
-          .json<{
-            data: GraphPostComment[];
-            paging?: { cursors?: { after?: string }; next?: string };
-          }>();
-
-        const comments = response.data ?? [];
-        allComments.push(...this.flattenComments(comments));
-
-        if (!response.paging?.next || comments.length < 100) break;
-        afterCursor = response.paging.cursors?.after;
-        if (!afterCursor) break;
-      } catch (err: any) {
-        this.logger.warn(
-          `Failed to paginate comments for post ${postId} (page ${page})`,
-          err?.message,
-        );
+      const nextAfter = paging?.cursors?.after;
+      if (!nextAfter || nextAfter === after || comments.length < pageSize) {
         break;
       }
+      after = nextAfter;
     }
 
-    return allComments;
+    return all.slice(0, maxComments);
   }
 
-  private flattenComments(comments: GraphPostComment[]): GraphPostComment[] {
-    const result: GraphPostComment[] = [];
-    for (const comment of comments) {
-      const { comments: children, ...rest } = comment;
-      result.push(rest);
-      if (children?.data?.length) {
-        result.push(...this.flattenComments(children.data));
-      }
+  async getCommentMeta(
+    commentId: string,
+    accessToken: string,
+  ): Promise<{
+    id: string;
+    message?: string;
+    postId?: string;
+    fromId?: string;
+    fromName?: string;
+    parentId?: string;
+  } | null> {
+    if (!commentId || !accessToken || !isValidFacebookCommentId(commentId)) {
+      return null;
     }
-    return result;
+
+    try {
+      const data = await got
+        .get(
+          `https://graph.facebook.com/${this.graphApiVersion}/${commentId}`,
+          {
+            searchParams: {
+              access_token: accessToken,
+              fields: 'id,message,from{id,name},parent{id},post{id}',
+            },
+            timeout: { request: 10_000 },
+          },
+        )
+        .json<{
+          id: string;
+          message?: string;
+          from?: { id?: string; name?: string };
+          parent?: { id?: string };
+          post?: { id?: string };
+        }>();
+
+      return {
+        id: data.id,
+        message: data.message,
+        postId: data.post?.id,
+        fromId: data.from?.id,
+        fromName: data.from?.name,
+        parentId: data.parent?.id,
+      };
+    } catch (err: any) {
+      const body = err?.response?.body;
+      this.logger.warn(
+        `Failed to fetch comment meta ${commentId}`,
+        typeof body === 'string' ? body : err.message,
+      );
+      return null;
+    }
   }
 
   async getMe(accessToken: string): Promise<{ id: string; name: string }> {
@@ -800,73 +842,77 @@ export class FacebookOAuthService {
 
     const { code, message, fbtrace_id: fbtraceId } = error;
 
-    if (code === 190)
-      return new BadRequestException(`Token invalid or expired: ${message}`);
-    if (code === 10 || code === 200)
+    if (code === 190) {
       return new BadRequestException(
-        `Permission denied: ${message}. Vui lòng liên kết lại Page và cấp đủ quyền pages_manage_engagement, pages_manage_posts, pages_read_engagement. fbtrace_id=${fbtraceId ?? 'n/a'}`,
+        `Token Facebook hết hạn hoặc không hợp lệ. Vui lòng liên kết lại fanpage. (${message})`,
       );
+    }
+    if (code === 10 || code === 200) {
+      return new BadRequestException(
+        `Thiếu quyền Facebook để thao tác bình luận. Vui lòng vào Shops → "Liên kết lại Facebook" và cấp quyền đọc/trả lời bình luận. (${message})`,
+      );
+    }
     if (code === 4 || code === 17 || code === 32) {
       return new BadRequestException(`Rate limit exceeded: ${message}`);
+    }
+    if (code === 100) {
+      return new BadRequestException(
+        `Comment không tồn tại hoặc đã bị xóa trên Facebook. Hãy chọn lại bình luận của khách hàng trong thread. (${message})`,
+      );
     }
 
     return new BadRequestException(`Facebook API error [${code}]: ${message}`);
   }
 
-  /**
-   * GET /{app_id}/subscriptions — verify what webhook fields
-   * are currently registered at the app level.
-   */
-  async getAppSubscriptions(): Promise<any> {
-    if (!this.appId || !this.appSecret) return { error: 'Missing appId or appSecret' };
-
-    const appAccessToken = `${this.appId}|${this.appSecret}`;
-    try {
-      const res = await got
-        .get(
-          `https://graph.facebook.com/${this.graphApiVersion}/${this.appId}/subscriptions`,
-          {
-            searchParams: { access_token: appAccessToken },
-            timeout: { request: 10_000 },
-          },
-        )
-        .json<any>();
-      return res;
-    } catch (err: any) {
-      const body = err?.response?.body;
-      let fbError: any;
-      try { fbError = typeof body === 'string' ? JSON.parse(body) : body; } catch { fbError = err.message; }
-      this.logger.error('[getAppSubscriptions] Failed', fbError);
-      return { error: fbError };
+  /** Kiểm tra page token có đủ quyền đọc/trả lời bình luận không. */
+  async inspectPageTokenScopes(pageAccessToken: string): Promise<{
+    scopes: string[];
+    missingCommentScopes: string[];
+    commentPermissionsOk: boolean;
+  }> {
+    if (!pageAccessToken?.trim()) {
+      return {
+        scopes: [],
+        missingCommentScopes: [...FacebookOAuthService.COMMENT_SCOPES],
+        commentPermissionsOk: false,
+      };
     }
-  }
-
-  /**
-   * GET /{page_id}/subscribed_apps — verify which apps are subscribed
-   * to a page's webhooks and which fields.
-   */
-  async getPageSubscriptionStatus(
-    pageId: string,
-    pageAccessToken: string,
-  ): Promise<any> {
-    if (!pageId || !pageAccessToken) return { error: 'Missing pageId or token' };
 
     try {
-      const res = await got
+      const appToken = `${this.appId}|${this.appSecret}`;
+      const response = await got
         .get(
-          `https://graph.facebook.com/${this.graphApiVersion}/${pageId}/subscribed_apps`,
+          `https://graph.facebook.com/${this.graphApiVersion}/debug_token`,
           {
-            searchParams: { access_token: pageAccessToken },
+            searchParams: {
+              input_token: pageAccessToken,
+              access_token: appToken,
+            },
             timeout: { request: 10_000 },
           },
         )
-        .json<any>();
-      return res;
+        .json<{ data?: { scopes?: string[]; is_valid?: boolean } }>();
+
+      const scopes = response.data?.scopes ?? [];
+      const missingCommentScopes = FacebookOAuthService.COMMENT_SCOPES.filter(
+        (scope) => !scopes.includes(scope),
+      );
+
+      return {
+        scopes,
+        missingCommentScopes: [...missingCommentScopes],
+        commentPermissionsOk:
+          Boolean(response.data?.is_valid) && missingCommentScopes.length === 0,
+      };
     } catch (err: any) {
-      const body = err?.response?.body;
-      let fbError: any;
-      try { fbError = typeof body === 'string' ? JSON.parse(body) : body; } catch { fbError = err.message; }
-      return { pageId, error: fbError };
+      this.logger.warn(
+        `inspectPageTokenScopes failed: ${err?.message ?? err}`,
+      );
+      return {
+        scopes: [],
+        missingCommentScopes: [...FacebookOAuthService.COMMENT_SCOPES],
+        commentPermissionsOk: false,
+      };
     }
   }
 
@@ -982,10 +1028,8 @@ export class FacebookOAuthService {
   ): Promise<boolean> {
     if (!pageId || !pageAccessToken) return false;
 
-    const fields = this.webhookFields.join(',');
-    this.logger.log(
-      `[subscribeToPageWebhook] pageId=${pageId} fields=${fields}`,
-    );
+    // Meta yêu cầu subscribe cả App-level lẫn Page-level cho cùng field
+    await this.ensureAppWebhookSubscription();
 
     try {
       const response = await got
@@ -1001,16 +1045,28 @@ export class FacebookOAuthService {
         )
         .json<{ success: boolean }>();
 
-      if (response.success) {
-        this.logger.log(
-          `[subscribeToPageWebhook] SUCCESS pageId=${pageId}`,
+      if (!response.success) {
+        this.logger.warn(
+          `[FacebookOAuthService] Failed to subscribe Facebook webhook for page ${pageId}`,
         );
-        return true;
+        return false;
       }
-      this.logger.warn(
-        `[subscribeToPageWebhook] Facebook returned success=false for pageId=${pageId}`,
+
+      const inspection = await this.inspectPageWebhookSubscription(
+        pageId,
+        pageAccessToken,
       );
-      return false;
+      if (!inspection.feedSubscribed) {
+        this.logger.warn(
+          `[FacebookOAuthService] Page ${pageId} chưa có field feed trong subscribed_apps. fields=${inspection.subscribedFields.join(',') || 'none'}`,
+        );
+        return false;
+      }
+
+      this.logger.log(
+        `[FacebookOAuthService] Subscribed webhooks for page ${pageId} (feed OK)`,
+      );
+      return true;
     } catch (err: any) {
       const body = err?.response?.body;
       const fbError =
@@ -1025,6 +1081,125 @@ export class FacebookOAuthService {
       );
       return false;
     }
+  }
+
+  /**
+   * Đăng ký webhook cấp App (POST /{app-id}/subscriptions).
+   * Bắt buộc song song với /{page-id}/subscribed_apps — nếu thiếu, Meta không gửi feed/comment.
+   * @see https://developers.facebook.com/docs/graph-api/reference/app/subscriptions
+   * @see https://developers.facebook.com/docs/pages-api/webhooks-for-pages
+   */
+  async ensureAppWebhookSubscription(): Promise<boolean> {
+    const callbackUrl = this.getWebhookCallbackUrl();
+    const verifyToken = this.configService.get<string>(
+      'FACEBOOK_WEBHOOK_VERIFY_TOKEN',
+      '',
+    );
+    if (!verifyToken?.trim()) {
+      this.logger.warn(
+        '[FacebookOAuth] Thiếu FACEBOOK_WEBHOOK_VERIFY_TOKEN — không đăng ký app webhook',
+      );
+      return false;
+    }
+
+    try {
+      const response = await got
+        .post(
+          `https://graph.facebook.com/${this.graphApiVersion}/${this.appId}/subscriptions`,
+          {
+            searchParams: {
+              object: 'page',
+              callback_url: callbackUrl,
+              verify_token: verifyToken,
+              fields: this.webhookFields.join(','),
+              // Bắt buộc: nếu false, Meta chỉ gửi changed_fields (không có changes.value) → mất comment
+              include_values: 'true',
+              access_token: this.getAppAccessToken(),
+            },
+            timeout: { request: 15_000 },
+          },
+        )
+        .json<{ success?: boolean }>();
+
+      const ok = response.success === true;
+      this.logger.log(
+        `[FacebookOAuth] App webhook ${ok ? 'OK' : 'FAILED'} → ${callbackUrl}`,
+      );
+      return ok;
+    } catch (err: any) {
+      const body = err?.response?.body;
+      this.logger.error(
+        `[FacebookOAuth] ensureAppWebhookSubscription failed: ${typeof body === 'string' ? body : err?.message}`,
+      );
+      return false;
+    }
+  }
+
+  /** Kiểm tra app đã cài trên page và có field feed chưa. */
+  async inspectPageWebhookSubscription(
+    pageId: string,
+    pageAccessToken: string,
+  ): Promise<{
+    installed: boolean;
+    subscribedFields: string[];
+    feedSubscribed: boolean;
+    missingFields: string[];
+  }> {
+    const required = [...FacebookOAuthService.COMMENT_WEBHOOK_FIELDS];
+    if (!pageId || !pageAccessToken) {
+      return {
+        installed: false,
+        subscribedFields: [],
+        feedSubscribed: false,
+        missingFields: required,
+      };
+    }
+
+    try {
+      const response = await got
+        .get(
+          `https://graph.facebook.com/${this.graphApiVersion}/${pageId}/subscribed_apps`,
+          {
+            searchParams: { access_token: pageAccessToken },
+            timeout: { request: 10_000 },
+          },
+        )
+        .json<{
+          data?: Array<{ id?: string; subscribed_fields?: string[] }>;
+        }>();
+
+      const app = (response.data ?? []).find((row) => row.id === this.appId);
+      const fields = app?.subscribed_fields ?? [];
+      const missingFields = required.filter((f) => !fields.includes(f));
+
+      return {
+        installed: !!app,
+        subscribedFields: fields,
+        feedSubscribed: missingFields.length === 0,
+        missingFields,
+      };
+    } catch (err: any) {
+      this.logger.warn(
+        `inspectPageWebhookSubscription failed for page ${pageId}: ${err?.message ?? err}`,
+      );
+      return {
+        installed: false,
+        subscribedFields: [],
+        feedSubscribed: false,
+        missingFields: required,
+      };
+    }
+  }
+
+  private getAppAccessToken(): string {
+    return `${this.appId}|${this.appSecret}`;
+  }
+
+  private getWebhookCallbackUrl(): string {
+    const base = this.configService
+      .get<string>('PUBLIC_BASE_URL', 'http://localhost:3000')
+      .replace(/\/$/, '');
+    return `${base}/webhook/facebook`;
   }
 
   async unsubscribeFromPageWebhook(
@@ -1143,6 +1318,94 @@ export class FacebookOAuthService {
     );
   }
 
+  /** Thích bình luận (Page like comment). */
+  async likeComment(
+    commentId: string,
+    pageAccessToken: string,
+  ): Promise<{ success: boolean }> {
+    if (!commentId?.trim()) {
+      throw new BadRequestException('Missing commentId');
+    }
+    if (!isValidFacebookCommentId(commentId)) {
+      throw new BadRequestException(
+        'commentId không hợp lệ — cần định dạng Facebook (ví dụ: 123456_789012)',
+      );
+    }
+    if (!pageAccessToken?.trim()) {
+      throw new BadRequestException('Missing pageAccessToken');
+    }
+
+    try {
+      await got.post(
+        `https://graph.facebook.com/${this.graphApiVersion}/${commentId}/likes`,
+        {
+          searchParams: { access_token: pageAccessToken },
+          timeout: { request: 15_000 },
+        },
+      );
+      return { success: true };
+    } catch (err: any) {
+      const body = err?.response?.body;
+      const fbError =
+        typeof body === 'string'
+          ? body.startsWith('{')
+            ? JSON.parse(body)
+            : { message: body }
+          : body;
+      this.logger.error(
+        `Failed to like comment ${commentId}`,
+        fbError ?? err.message,
+      );
+      throw this.mapFbError(fbError?.error);
+    }
+  }
+
+  /** Ẩn / hiện bình luận trên Facebook. */
+  async setCommentHidden(
+    commentId: string,
+    pageAccessToken: string,
+    isHidden: boolean,
+  ): Promise<{ success: boolean }> {
+    if (!commentId?.trim()) {
+      throw new BadRequestException('Missing commentId');
+    }
+    if (!isValidFacebookCommentId(commentId)) {
+      throw new BadRequestException(
+        'commentId không hợp lệ — cần định dạng Facebook (ví dụ: 123456_789012)',
+      );
+    }
+    if (!pageAccessToken?.trim()) {
+      throw new BadRequestException('Missing pageAccessToken');
+    }
+
+    try {
+      await got.post(
+        `https://graph.facebook.com/${this.graphApiVersion}/${commentId}`,
+        {
+          searchParams: {
+            access_token: pageAccessToken,
+            is_hidden: isHidden ? 'true' : 'false',
+          },
+          timeout: { request: 15_000 },
+        },
+      );
+      return { success: true };
+    } catch (err: any) {
+      const body = err?.response?.body;
+      const fbError =
+        typeof body === 'string'
+          ? body.startsWith('{')
+            ? JSON.parse(body)
+            : { message: body }
+          : body;
+      this.logger.error(
+        `Failed to ${isHidden ? 'hide' : 'unhide'} comment ${commentId}`,
+        fbError ?? err.message,
+      );
+      throw this.mapFbError(fbError?.error);
+    }
+  }
+
   async replyToComment(
     commentId: string,
     pageAccessToken: string,
@@ -1150,6 +1413,11 @@ export class FacebookOAuthService {
   ): Promise<CreateCommentResponse> {
     if (!commentId?.trim()) {
       throw new BadRequestException('Missing commentId');
+    }
+    if (!isValidFacebookCommentId(commentId)) {
+      throw new BadRequestException(
+        'commentId không hợp lệ — cần định dạng Facebook (ví dụ: 123456_789012)',
+      );
     }
     if (!pageAccessToken?.trim()) {
       throw new BadRequestException('Missing pageAccessToken');

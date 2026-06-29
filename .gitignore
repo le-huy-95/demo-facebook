@@ -22,7 +22,7 @@ prisma/dev.db
 logs/
 *.log
 cloudflared/
-uploads/
+/uploads/
 
 # OS / IDE
 .DS_Store

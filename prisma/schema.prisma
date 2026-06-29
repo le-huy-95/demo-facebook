@@ -65,12 +65,14 @@ model WebhookEvent {
   msgType           String?  @map("msg_type")
   content        String?
   rawPayload     String   @map("raw_payload")
+  /// ACTIVE | HIDDEN | DELETED — ẩn/xóa trên Facebook thì không trả ra API list
+  status         String   @default("ACTIVE")
   createdAt      DateTime @default(now()) @map("created_at")
 
   @@index([pageId])
   @@index([eventType])
   @@index([createdAt])
-  @@index([parentCommentId])
+  @@index([status])
   @@map("webhook_events")
 }
 
@@ -85,4 +87,17 @@ model CustomerProfile {
   @@unique([pageId, senderId])
   @@index([pageId])
   @@map("customer_profiles")
+}
+
+model ConversationReadState {
+  id             String   @id @default(uuid())
+  organizationId String   @map("organization_id")
+  pageId         String   @map("page_id")
+  threadId       String   @map("thread_id")
+  lastReadAt     DateTime @map("last_read_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+
+  @@unique([organizationId, pageId, threadId])
+  @@index([pageId])
+  @@map("conversation_read_states")
 }

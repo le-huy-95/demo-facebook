@@ -30,7 +30,7 @@ export class FacebookWebhookController {
     private readonly logger: AppLogger,
     private readonly configService: ConfigService,
     private readonly webhookService: FacebookWebhookService,
-    private readonly facebookOAuthService: FacebookOAuthService,
+    private readonly facebookOAuth: FacebookOAuthService,
     private readonly facebookPageService: FacebookPageService,
   ) {
     this.verifyToken = this.configService.get<string>(
@@ -180,6 +180,32 @@ export class FacebookWebhookController {
       .get<string>('PUBLIC_BASE_URL', 'http://localhost:3000')
       .replace(/\/$/, '');
     const stats = await this.webhookService.getWebhookStats();
+    const appWebhookOk =
+      await this.facebookOAuth.ensureAppWebhookSubscription();
+
+    const orgId = this.facebookPageService.getDefaultOrgId();
+    const pages = await this.facebookPageService.listPages(orgId);
+    const pageWebhookChecks = await Promise.all(
+      pages
+        .filter((p) => p.pageAccessToken)
+        .map(async (p) => {
+          const inspection =
+            await this.facebookOAuth.inspectPageWebhookSubscription(
+              p.pageId,
+              p.pageAccessToken!,
+            );
+          return {
+            pageId: p.pageId,
+            name: p.name,
+            ...inspection,
+          };
+        }),
+    );
+
+    const feedCommentIn = await this.webhookService.countEventsByType(
+      'FEED_COMMENT',
+      'IN',
+    );
 
     return {
       statusCode: HttpStatus.OK,
@@ -187,11 +213,13 @@ export class FacebookWebhookController {
         webhookUrl: `${base}/webhook/facebook`,
         verifyToken: this.verifyToken,
         signatureEnabled: this.signatureEnabled,
-        stats,
+        appWebhookOk,
+        pageWebhookChecks,
+        stats: { ...stats, feedCommentIn },
         hint:
-          stats.inCount === 0
-            ? 'Chưa có tin IN từ Facebook. Kiểm tra Callback URL trên Facebook Developer và tunnel forward → localhost:3000'
-            : 'Webhook inbound đã nhận tin nhắn trước đó',
+          feedCommentIn === 0
+            ? 'Chưa nhận comment IN. Kiểm tra: (1) App subscription có include_values=true, (2) Page subscribed_apps có feed, (3) ngrok+frontend đang chạy (callback 502 = Meta không gửi được).'
+            : 'Webhook feed đã nhận comment từ Facebook',
       },
     };
   }

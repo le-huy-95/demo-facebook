@@ -1,6 +1,12 @@
 'use client';
 
-import { useCallback, useState } from 'react';
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type ReactNode,
+} from 'react';
 import { uploadFile } from '@/lib/api';
 import { sendMessage } from '@/lib/socket';
 import { UserAvatar } from '@/components/user-avatar';
@@ -10,11 +16,16 @@ interface MessageComposerProps {
   threadId: string;
   shopPictureUrl?: string | null;
   commentId?: string | null;
-  replyToMessageId?: string | null;
+  /** Nội dung rút gọn của bình luận đang trả lời. */
   replyPreview?: string | null;
-  replySenderName?: string | null;
-  onClearReplyTarget?: () => void;
+  /** Tag @tên khi trả lời bình luận. */
+  replyMentionName?: string | null;
+  /** Click vào preview để cuộn tới bình luận gốc. */
+  onReplyPreviewClick?: () => void;
+  /** Chỉ hiển thị icon cho các thao tác của composer, dùng cho màn hình comment. */
+  iconOnlyActions?: boolean;
   disabled?: boolean;
+  allowAttachments?: boolean;
   onSent?: (payload: {
     clientMessageId: string;
     text: string;
@@ -29,6 +40,106 @@ interface MessageComposerProps {
   }) => void;
 }
 
+function ReplyIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      className={className}
+      viewBox="0 0 20 20"
+      fill="currentColor"
+      aria-hidden
+    >
+      <path d="M6.5 4.5 3 8v1.5h3.25A4.75 4.75 0 0 1 11 14.25V16l3.5-3.5L11 9v1.75A3.25 3.25 0 0 0 6.5 4.5Z" />
+    </svg>
+  );
+}
+
+function SendIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      className={className}
+      viewBox="0 0 20 20"
+      fill="currentColor"
+      aria-hidden
+    >
+      <path d="M17.28 2.72a1 1 0 0 0-1.04-.23L3.64 7.54a1 1 0 0 0 .05 1.88l5.03 1.68 1.68 5.03a1 1 0 0 0 1.88.05l5.05-12.6a1 1 0 0 0-.05-1.04ZM10.03 9.96 5.9 8.58l8.76-3.5-4.63 4.88Zm1.39 4.14-1.38-4.13 4.88-4.63-3.5 8.76Z" />
+    </svg>
+  );
+}
+
+function PaperclipIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      className={className}
+      viewBox="0 0 20 20"
+      fill="currentColor"
+      aria-hidden
+    >
+      <path d="M7.25 17.5a4.75 4.75 0 0 1-3.36-8.11l5.8-5.8a3.25 3.25 0 1 1 4.6 4.6l-5.8 5.8a1.75 1.75 0 1 1-2.48-2.48l5.48-5.48a.75.75 0 1 1 1.06 1.06l-5.48 5.48a.25.25 0 0 0 .36.36l5.8-5.8a1.75 1.75 0 1 0-2.48-2.48l-5.8 5.8a3.25 3.25 0 1 0 4.6 4.6l5.8-5.8a.75.75 0 1 1 1.06 1.06l-5.8 5.8A4.73 4.73 0 0 1 7.25 17.5Z" />
+    </svg>
+  );
+}
+
+function EyeIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      className={className}
+      viewBox="0 0 20 20"
+      fill="currentColor"
+      aria-hidden
+    >
+      <path d="M10 4.5c4.15 0 6.48 3.08 7.25 4.35.42.7.42 1.6 0 2.3C16.48 12.42 14.15 15.5 10 15.5s-6.48-3.08-7.25-4.35a2.2 2.2 0 0 1 0-2.3C3.52 7.58 5.85 4.5 10 4.5Zm0 1.5C6.62 6 4.7 8.53 4.03 9.62a.72.72 0 0 0 0 .76C4.7 11.47 6.62 14 10 14s5.3-2.53 5.97-3.62a.72.72 0 0 0 0-.76C15.3 8.53 13.38 6 10 6Zm0 1.5a2.5 2.5 0 1 1 0 5 2.5 2.5 0 0 1 0-5Zm0 1.5a1 1 0 1 0 0 2 1 1 0 0 0 0-2Z" />
+    </svg>
+  );
+}
+
+function IconTooltip({
+  label,
+  children,
+}: {
+  label: string;
+  children: ReactNode;
+}) {
+  return (
+    <span className="group/tooltip relative inline-flex">
+      {children}
+      <span
+        role="tooltip"
+        className="pointer-events-none absolute bottom-full left-1/2 z-30 mb-2 hidden -translate-x-1/2 whitespace-nowrap rounded-md bg-[#111827] px-2 py-1 text-[11px] font-medium text-white shadow-lg group-hover/tooltip:block group-focus-within/tooltip:block"
+      >
+        {label}
+      </span>
+    </span>
+  );
+}
+
+function ComposerIconButton({
+  label,
+  icon,
+  onClick,
+  disabled = false,
+  type = 'button',
+}: {
+  label: string;
+  icon: ReactNode;
+  onClick?: () => void;
+  disabled?: boolean;
+  type?: 'button' | 'submit';
+}) {
+  return (
+    <IconTooltip label={label}>
+      <button
+        type={type}
+        aria-label={label}
+        onClick={onClick}
+        disabled={disabled}
+        className="inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-[#3b82f6] text-white transition hover:bg-[#2563eb] disabled:cursor-not-allowed disabled:bg-[#93c5fd]"
+      >
+        {icon}
+      </button>
+    </IconTooltip>
+  );
+}
+
 export function MessageComposer({
   pageId,
   threadId,
@@ -36,19 +147,49 @@ export function MessageComposer({
   commentId = null,
   replyToMessageId = null,
   replyPreview = null,
-  replySenderName = null,
-  onClearReplyTarget,
+  replyMentionName = null,
+  onReplyPreviewClick,
+  iconOnlyActions = false,
   disabled = false,
+  allowAttachments = true,
   onSent,
   onAck,
 }: MessageComposerProps) {
   const [text, setText] = useState('');
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const lastMentionKeyRef = useRef<string | null>(null);
 
   const [uploading, setUploading] = useState(false);
 
-  function inferAttachmentType(mime: string): 'image' | 'video' | 'audio' | 'file' {
+  // Prefill @tên khi chọn bình luận để trả lời
+  useEffect(() => {
+    if (!commentId || !replyMentionName?.trim()) return;
+
+    const mentionKey = `${commentId}:${replyMentionName.trim()}`;
+    if (lastMentionKeyRef.current === mentionKey) return;
+    lastMentionKeyRef.current = mentionKey;
+
+    const mention = `@${replyMentionName.trim()} `;
+    setText(mention);
+    requestAnimationFrame(() => {
+      const el = textareaRef.current;
+      if (!el) return;
+      el.focus();
+      el.setSelectionRange(mention.length, mention.length);
+    });
+  }, [commentId, replyMentionName]);
+
+  useEffect(() => {
+    if (!commentId) {
+      lastMentionKeyRef.current = null;
+    }
+  }, [commentId]);
+
+  function inferAttachmentType(
+    mime: string,
+  ): 'image' | 'video' | 'audio' | 'file' {
     if (mime.startsWith('image/')) return 'image';
     if (mime.startsWith('video/')) return 'video';
     if (mime.startsWith('audio/')) return 'audio';
@@ -74,6 +215,7 @@ export function MessageComposer({
         clientMessageId,
       },
       (ack) => {
+        clearTimeout(ackTimer);
         setSending(false);
         onAck?.({
           clientMessageId,
@@ -85,15 +227,30 @@ export function MessageComposer({
         if (ack.ok) {
           setText('');
         } else {
-          setError(ack.error ?? 'Gửi tin nhắn thất bại');
+          const msg = ack.error ?? 'Gửi tin nhắn thất bại';
+          setError(
+            msg.includes('kết nối') || msg.includes('Socket')
+              ? msg
+              : msg.includes('commentId')
+                ? 'Không tìm thấy comment để trả lời. Hãy chọn một bình luận trong thread trước.'
+                : msg,
+          );
         }
       },
     );
-  }, [text, sending, disabled, pageId, threadId, commentId, replyToMessageId, onSent, onAck]);
+
+    // Timeout nếu Socket không phản hồi (thường do mất kết nối realtime)
+    const ackTimer = setTimeout(() => {
+      setSending(false);
+      setError(
+        'Không nhận được phản hồi từ server. Kiểm tra kết nối Socket (thử tải lại trang).',
+      );
+    }, 15_000);
+  }, [text, sending, disabled, pageId, threadId, commentId, onSent, onAck]);
 
   const handleAttach = useCallback(
     async (file: File) => {
-      if (disabled || sending || uploading) return;
+      if (!allowAttachments || disabled || sending || uploading) return;
       setUploading(true);
       setError(null);
 
@@ -131,13 +288,24 @@ export function MessageComposer({
             }
           },
         );
-      } catch (e: any) {
-        setError(e?.message ?? 'Upload file thất bại');
+      } catch (e: unknown) {
+        setError(e instanceof Error ? e.message : 'Upload file thất bại');
       } finally {
         setUploading(false);
       }
     },
-    [disabled, sending, uploading, pageId, threadId, commentId, replyToMessageId, onSent, onAck, text],
+    [
+      allowAttachments,
+      disabled,
+      sending,
+      uploading,
+      pageId,
+      threadId,
+      commentId,
+      onSent,
+      onAck,
+      text,
+    ],
   );
 
   const isReplyingComment = Boolean(commentId);
@@ -146,27 +314,29 @@ export function MessageComposer({
 
   return (
     <div className="space-y-2">
-      {isReplying && (
-        <div className="flex items-start justify-between gap-3 rounded-xl border border-[#fde68a] bg-[#fffbeb] px-3 py-2 text-xs text-[#92400e]">
-          <div className="min-w-0">
-            <p className="font-semibold">
-              {isReplyingComment ? 'Đang trả lời bình luận' : 'Đang trả lời tin nhắn'}
-            </p>
-            {replySenderName ? <p className="mt-0.5 text-[#a16207]">cho {replySenderName}</p> : null}
-            {replyPreview ? (
-              <p className="mt-0.5 line-clamp-2 text-[#a16207]">{replyPreview}</p>
-            ) : null}
-          </div>
-          {onClearReplyTarget ? (
-            <button
-              type="button"
-              onClick={onClearReplyTarget}
-              className="shrink-0 rounded-lg border border-[#f59e0b]/30 bg-white/60 px-2 py-1 text-[#92400e] hover:bg-white"
-            >
-              Hủy
-            </button>
-          ) : null}
-        </div>
+      {commentId && (
+        <button
+          type="button"
+          onClick={onReplyPreviewClick}
+          className="flex w-full items-start gap-2 rounded-xl border border-[#fcd34d] bg-[#fffbeb] px-3 py-2 text-left transition hover:bg-[#fef3c7]"
+        >
+          <ReplyIcon className="mt-0.5 h-4 w-4 shrink-0 text-[#b45309]" />
+          <span className="min-w-0 flex-1">
+            <span className="block text-[10px] font-semibold uppercase tracking-wide text-[#b45309]">
+              Đang trả lời bình luận
+            </span>
+            <span className="block truncate text-sm text-[#78350f]">
+              {replyPreview?.trim() || 'Bình luận'}
+            </span>
+          </span>
+          {onReplyPreviewClick && (
+            <IconTooltip label="Xem bình luận gốc">
+              <span className="mt-0.5 inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-[#d97706] transition hover:bg-[#fde68a]">
+                <EyeIcon className="h-4 w-4" />
+              </span>
+            </IconTooltip>
+          )}
+        </button>
       )}
       <div className="rounded-2xl border border-[#e5e7eb] bg-white px-3 py-3">
         <div className="flex items-end gap-2">
@@ -177,6 +347,7 @@ export function MessageComposer({
             className="mt-1"
           />
           <textarea
+            ref={textareaRef}
             value={text}
             onChange={(e) => setText(e.target.value)}
             onKeyDown={(e) => {
@@ -187,40 +358,66 @@ export function MessageComposer({
             }}
             disabled={disabled || sending || uploading}
             rows={2}
-            placeholder="Nhập tin nhắn... (Enter để gửi, Shift+Enter xuống dòng)"
+            placeholder={
+              commentId
+                ? 'Trả lời bình luận... (Enter để gửi)'
+                : 'Nhập tin nhắn... (Enter để gửi, Shift+Enter xuống dòng)'
+            }
             className="min-h-[44px] flex-1 resize-none rounded-xl border border-[#e5e7eb] bg-white px-4 py-3 text-sm text-[#111827] outline-none ring-[#3b82f6] focus:ring-2 disabled:bg-[#f3f4f6]"
           />
-          <button
-            type="button"
-            onClick={handleSend}
-            disabled={disabled || sending || uploading || !text.trim()}
-            className="rounded-xl bg-[#3b82f6] px-4 py-3 text-sm font-medium text-white hover:bg-[#2563eb] disabled:cursor-not-allowed disabled:bg-[#93c5fd]"
-          >
-            {sending ? 'Đang gửi...' : uploading ? 'Đang upload...' : 'Gửi'}
-          </button>
+          {iconOnlyActions ? (
+            <ComposerIconButton
+              label={
+                sending
+                  ? 'Đang gửi'
+                  : uploading
+                    ? 'Đang upload'
+                    : 'Gửi bình luận'
+              }
+              icon={<SendIcon className="h-5 w-5" />}
+              onClick={handleSend}
+              disabled={disabled || sending || uploading || !text.trim()}
+            />
+          ) : (
+            <button
+              type="button"
+              onClick={handleSend}
+              disabled={disabled || sending || uploading || !text.trim()}
+              className="rounded-xl bg-[#3b82f6] px-4 py-3 text-sm font-medium text-white hover:bg-[#2563eb] disabled:cursor-not-allowed disabled:bg-[#93c5fd]"
+            >
+              {sending ? 'Đang gửi...' : uploading ? 'Đang upload...' : 'Gửi'}
+            </button>
+          )}
         </div>
         <div className="mt-2 flex items-center justify-between gap-2">
-          <label className="inline-flex cursor-pointer items-center gap-2 rounded-xl px-2 py-1 text-sm text-[#374151] hover:bg-[#f9fafb]">
-            <input
-              type="file"
-              className="hidden"
-              disabled={disabled || sending || uploading}
-              onChange={(e) => {
-                const f = e.target.files?.[0];
-                if (f) void handleAttach(f);
-                e.currentTarget.value = '';
-              }}
+          {allowAttachments ? (
+            <label className="inline-flex cursor-pointer items-center gap-2 rounded-xl px-2 py-1 text-sm text-[#374151] hover:bg-[#f9fafb]">
+              <input
+                type="file"
+                className="hidden"
+                disabled={disabled || sending || uploading}
+                onChange={(e) => {
+                  const f = e.target.files?.[0];
+                  if (f) void handleAttach(f);
+                  e.currentTarget.value = '';
+                }}
+              />
+              <span className="text-base">📎</span>
+              <span>
+                {uploading ? 'Đang upload...' : 'Đính kèm file / ảnh'}
+              </span>
+            </label>
+          ) : iconOnlyActions ? (
+            <ComposerIconButton
+              label="Bình luận chỉ hỗ trợ văn bản. Dùng Messenger để gửi ảnh/file."
+              icon={<PaperclipIcon className="h-4 w-4" />}
+              disabled
             />
-            <span className="text-base">📎</span>
-            <span>{uploading ? 'Đang upload...' : 'Đính kèm file / ảnh'}</span>
-          </label>
-          <p className="text-xs text-[#6b7280]">
-            {isReplyingComment
-              ? 'Trả lời bình luận'
-              : isReplyingMessage
-                ? 'Trả lời tin nhắn'
-                : 'Tin nhắn'}
-          </p>
+          ) : (
+            <p className="text-xs text-[#9ca3af]">
+              Bình luận chỉ hỗ trợ văn bản. Dùng Messenger để gửi ảnh/file.
+            </p>
+          )}
         </div>
       </div>
       {error && <p className="text-xs text-[#dc2626]">{error}</p>}

@@ -1,80 +1,100 @@
 import { io, type Socket } from 'socket.io-client';
 
-function resolveSocketConfig(): { url: string; transports: ('websocket' | 'polling')[] } {
-  const explicitUrl =
-    process.env.NEXT_PUBLIC_SOCKET_URL ?? process.env.NEXT_PUBLIC_API_URL ?? null;
-
-  if (typeof window !== 'undefined') {
-    if (explicitUrl) {
-      return { url: explicitUrl, transports: ['websocket', 'polling'] };
-    }
-    if (window.location.hostname === 'localhost') {
-      return { url: 'http://localhost:3000', transports: ['websocket', 'polling'] };
-    }
-    return { url: window.location.origin, transports: ['websocket', 'polling'] };
-  }
-
-  return {
-    url: explicitUrl ?? 'http://localhost:3000',
-    transports: ['websocket', 'polling'],
-  };
-}
+/** Kết nối thẳng Nest — Next.js dev proxy thường làm hỏng WebSocket/Socket.IO. */
+export const SOCKET_URL =
+  process.env.NEXT_PUBLIC_SOCKET_URL ??
+  process.env.NEXT_PUBLIC_API_URL ??
+  (typeof window !== 'undefined'
+    ? window.location.origin
+    : 'http://localhost:3000');
 
 let socket: Socket | null = null;
-const joinedPageRooms = new Set<string>();
-const joinedThreadRooms = new Set<string>();
+let joinedPageId: string | null = null;
+let joinedThreadId: string | null = null;
+let reconnectHandlerBound = false;
 
-function replayJoinedRooms(s: Socket): void {
-  for (const pageId of joinedPageRooms) {
-    s.emit('joinPage', { pageId });
-  }
-  for (const threadId of joinedThreadRooms) {
-    s.emit('joinThread', { threadId });
-  }
+function bindSocketReconnect(): void {
+  if (!socket || reconnectHandlerBound) return;
+  reconnectHandlerBound = true;
+
+  socket.on('connect', () => {
+    if (joinedPageId) {
+      socket?.emit('joinPage', { pageId: joinedPageId });
+    }
+    if (joinedThreadId) {
+      socket?.emit('joinThread', { threadId: joinedThreadId });
+    }
+  });
 }
 
 export function getSocket(): Socket {
   if (!socket) {
-    const config = resolveSocketConfig();
-    socket = io(config.url, {
-      transports: config.transports,
+    socket = io(SOCKET_URL, {
+      path: '/socket.io/',
+      // Chỉ polling — ổn định qua ngrok / proxy; websocket upgrade hay bị lỗi trong dev
+      transports: ['polling'],
+      upgrade: false,
       autoConnect: true,
+      withCredentials: true,
+      reconnection: true,
+      reconnectionAttempts: Infinity,
+      reconnectionDelay: 1000,
+      // Ngrok free tier hiển thị trang cảnh báo nếu thiếu header
       extraHeaders: {
         'ngrok-skip-browser-warning': 'true',
       },
     });
-    socket.on('connect', () => {
-      replayJoinedRooms(socket!);
-    });
+    bindSocketReconnect();
   }
   return socket;
 }
 
 export function joinPageRoom(pageId: string): void {
-  joinedPageRooms.add(pageId);
+  joinedPageId = pageId;
   const s = getSocket();
-  if (!s.connected) {
-    s.connect();
+
+  const emitJoin = () => {
+    if (joinedPageId) {
+      s.emit('joinPage', { pageId: joinedPageId });
+    }
+  };
+
+  if (s.connected) {
+    emitJoin();
+    return;
   }
-  s.emit('joinPage', { pageId });
+
+  // Đảm bảo join room sau khi connect (tránh race autoConnect)
+  s.once('connect', emitJoin);
+  s.connect();
 }
 
 export function leavePageRoom(pageId: string): void {
-  joinedPageRooms.delete(pageId);
+  if (joinedPageId === pageId) joinedPageId = null;
   getSocket().emit('leavePage', { pageId });
 }
 
 export function joinThreadRoom(threadId: string): void {
-  joinedThreadRooms.add(threadId);
+  joinedThreadId = threadId;
   const s = getSocket();
-  if (!s.connected) {
-    s.connect();
+
+  const emitJoin = () => {
+    if (joinedThreadId) {
+      s.emit('joinThread', { threadId: joinedThreadId });
+    }
+  };
+
+  if (s.connected) {
+    emitJoin();
+    return;
   }
-  s.emit('joinThread', { threadId });
+
+  s.once('connect', emitJoin);
+  s.connect();
 }
 
 export function leaveThreadRoom(threadId: string): void {
-  joinedThreadRooms.delete(threadId);
+  if (joinedThreadId === threadId) joinedThreadId = null;
   getSocket().emit('leaveThread', { threadId });
 }
 
@@ -133,5 +153,41 @@ export function onWebhookEvent(
   s.on('webhook:event', handler);
   return () => {
     s.off('webhook:event', handler);
+  };
+}
+
+export interface ContentRemovedPayload {
+  pageId: string;
+  threadId?: string;
+  messageId?: string;
+  commentId?: string;
+  postId?: string;
+  status: 'HIDDEN' | 'DELETED' | 'ACTIVE';
+}
+
+export function onContentRemoved(
+  handler: (payload: ContentRemovedPayload) => void,
+): () => void {
+  const s = getSocket();
+  s.on('content:removed', handler);
+  return () => {
+    s.off('content:removed', handler);
+  };
+}
+
+export interface FeedSyncedPayload {
+  pageId: string;
+  ingested: number;
+  threadIds: string[];
+  threadId?: string;
+}
+
+export function onFeedSynced(
+  handler: (payload: FeedSyncedPayload) => void,
+): () => void {
+  const s = getSocket();
+  s.on('feed:synced', handler);
+  return () => {
+    s.off('feed:synced', handler);
   };
 }

@@ -1,3 +1,4 @@
+import { AppLogger } from '../../common/logger.service';
 import {
   BadRequestException,
   Injectable,
@@ -13,7 +14,7 @@ import {
   type GraphPostComment,
 } from './facebook-oauth.service';
 import { FacebookRepoService } from './facebook-repo.service';
-import { RedisCacheService } from '../../redis/redis-cache.service';
+import { RedisCacheService, GRAPH_CACHE_TTL_SECONDS } from '../../redis/redis-cache.service';
 import {
   aggregateConversations,
   buildThreadEventWhere,
@@ -22,6 +23,8 @@ import {
   pickBetterSenderName,
   type ConversationThread,
 } from '../utils/conversation-thread.util';
+import { isValidFacebookCommentId } from '../utils/facebook-comment-id.util';
+import { EVENT_STATUS_DELETED } from '../utils/event-visibility.util';
 
 export interface FacebookPostPreview {
   id: string;
@@ -57,6 +60,13 @@ const MESSAGE_PAGE_SIZE = 15;
 const CONVERSATION_PAGE_SIZE = 30;
 const FEED_POSTS_SCAN_LIMIT = 50;
 
+function parseDateCursor(cursor: string | undefined): Date | null {
+  if (!cursor) return null;
+
+  const date = new Date(cursor);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
 @Injectable()
 export class ConversationsService {
   constructor(
@@ -64,7 +74,10 @@ export class ConversationsService {
     private readonly facebookRepo: FacebookRepoService,
     private readonly facebookOAuth: FacebookOAuthService,
     private readonly redisCache: RedisCacheService,
-  ) {}
+    private readonly logger: AppLogger,
+  ) {
+    this.logger.setContext(ConversationsService.name);
+  }
 
   async listByPage(
     pageId: string,
@@ -72,7 +85,8 @@ export class ConversationsService {
     options?: { limit?: number; before?: string; kind?: ConversationThread['kind'] },
   ): Promise<ConversationListPage> {
     const limit = options?.limit ?? CONVERSATION_PAGE_SIZE;
-    const merged = await this.fetchMergedThreads(pageId, orgId);
+    const readAtByThread = await this.getReadAtByThread(pageId, orgId);
+    const merged = await this.fetchMergedThreads(pageId, orgId, readAtByThread);
     const withPictures = await this.enrichThreadPictures(merged, pageId);
     const enriched = await this.enrichThreadNames(withPictures, pageId, orgId);
 
@@ -82,20 +96,14 @@ export class ConversationsService {
         new Date(a.lastMessageAt).getTime(),
     );
 
-    const filtered = options?.kind
-      ? allSorted.filter((t) => t.kind === options.kind)
-      : allSorted;
-
-    let eligible: ConversationThread[];
-    if (options?.before) {
-      eligible = filtered.filter(
-        (t) =>
-          new Date(t.lastMessageAt).getTime() <
-          new Date(options.before!).getTime(),
-      );
-    } else {
-      eligible = filtered;
-    }
+    const beforeDate = parseDateCursor(options?.before);
+    const eligible = beforeDate
+      ? sorted.filter(
+          (t) =>
+            new Date(t.lastMessageAt).getTime() <
+            beforeDate.getTime(),
+        )
+      : sorted;
 
     const hasMore = eligible.length > limit;
     const page = eligible.slice(0, limit);
@@ -113,8 +121,22 @@ export class ConversationsService {
   private async fetchMergedThreads(
     pageId: string,
     orgId: string,
+    readAtByThread: ReadonlyMap<string, Date>,
   ): Promise<ConversationThread[]> {
     await this.assertPageBelongsToOrg(pageId, orgId);
+
+    // Cập nhật status DELETED/HIDDEN nhưng vẫn trả tất cả qua API
+    await this.pruneStaleCommentsForPage(pageId, orgId);
+
+    const pageRev = await this.redisCache.getPageRevision(orgId, pageId);
+    const cacheKey = this.redisCache.pageThreadsKey(orgId, pageId, pageRev);
+    const cached = await this.redisCache.get<ConversationThread[]>(cacheKey);
+    if (cached) {
+      this.logger.debug(
+        `[Conversations] cache HIT page threads pageId=${pageId} rev=${pageRev}`,
+      );
+      return cached.filter((thread) => thread.pageId === pageId);
+    }
 
     const events = await this.prisma.webhookEvent.findMany({
       where: {
@@ -126,23 +148,66 @@ export class ConversationsService {
       take: 2000,
     });
 
-    const fromWebhook = aggregateConversations(events);
+    const fromWebhook = aggregateConversations(events, readAtByThread);
 
     const [fromMessengerGraph, fromCommentGraph] = await Promise.all([
-      this.listMessengerThreadsFromGraph(pageId, orgId).catch(
-        () => [] as ConversationThread[],
-      ),
-      this.listCommentThreadsFromGraph(pageId, orgId).catch(
-        () => [] as ConversationThread[],
-      ),
+      this.getCachedMessengerThreads(pageId, orgId, pageRev),
+      this.getCachedCommentThreads(pageId, orgId, pageRev),
     ]);
+
+    this.logger.log(
+      `[Conversations] Merged threads: webhook=${fromWebhook.length}, messenger=${fromMessengerGraph.length}, comments=${fromCommentGraph.length} (Graph từ cache hoặc quét 1 lần)`,
+    );
 
     const merged = this.mergeConversationThreads(
       this.mergeConversationThreads(fromWebhook, fromMessengerGraph),
       fromCommentGraph,
     );
 
-    return merged.filter((thread) => thread.pageId === pageId);
+    const filtered = merged.filter((thread) => thread.pageId === pageId);
+    await this.redisCache.set(
+      cacheKey,
+      filtered,
+      GRAPH_CACHE_TTL_SECONDS,
+    );
+    return filtered;
+  }
+
+  /** Graph API messenger threads — cache theo page revision, chỉ gọi Facebook khi miss. */
+  private async getCachedMessengerThreads(
+    pageId: string,
+    orgId: string,
+    pageRev: number,
+  ): Promise<ConversationThread[]> {
+    const key = this.redisCache.graphMessengerThreadsKey(pageId, pageRev);
+    const hit = await this.redisCache.get<ConversationThread[]>(key);
+    if (hit) return hit;
+
+    const data = await this.listMessengerThreadsFromGraph(pageId, orgId).catch(
+      () => [] as ConversationThread[],
+    );
+    await this.redisCache.set(key, data, GRAPH_CACHE_TTL_SECONDS);
+    return data;
+  }
+
+  /** Graph API comment threads — cache theo page revision, chỉ gọi Facebook khi miss. */
+  private async getCachedCommentThreads(
+    pageId: string,
+    orgId: string,
+    pageRev: number,
+  ): Promise<ConversationThread[]> {
+    const key = this.redisCache.graphCommentThreadsKey(pageId, pageRev);
+    const hit = await this.redisCache.get<ConversationThread[]>(key);
+    if (hit) return hit;
+
+    const data = await this.listCommentThreadsFromGraph(pageId, orgId).catch(
+      (err) => {
+        this.logger.error(`listCommentThreadsFromGraph failed: ${err.message}`);
+        return [] as ConversationThread[];
+      },
+    );
+    await this.redisCache.set(key, data, GRAPH_CACHE_TTL_SECONDS);
+    return data;
   }
 
   async getThreadMessages(
@@ -168,7 +233,10 @@ export class ConversationsService {
       options?.before,
     );
     const cached = await this.redisCache.get<ThreadMessagesPage>(cacheKey);
-    if (cached) return cached;
+    if (cached) {
+      await this.markThreadRead(pageId, orgId, threadId);
+      return cached;
+    }
 
     let result: ThreadMessagesPage;
     if (parsed.kind === 'MESSENGER') {
@@ -193,7 +261,8 @@ export class ConversationsService {
       );
     }
 
-    await this.redisCache.set(cacheKey, result);
+    await this.redisCache.set(cacheKey, result, GRAPH_CACHE_TTL_SECONDS);
+    await this.markThreadRead(pageId, orgId, threadId);
     return result;
   }
 
@@ -227,7 +296,7 @@ export class ConversationsService {
       fromName: graphPost.from?.name,
     };
 
-    await this.redisCache.set(cacheKey, preview);
+    await this.redisCache.set(cacheKey, preview, GRAPH_CACHE_TTL_SECONDS);
     return preview;
   }
 
@@ -281,18 +350,31 @@ export class ConversationsService {
     const posts = await this.facebookOAuth.listPageFeedWithComments(
       pageId,
       token,
-      FEED_POSTS_SCAN_LIMIT,
+      50,
     );
+    this.logger.log(
+      `[Conversations] listCommentThreadsFromGraph: found ${posts.length} posts from feed`,
+    );
+
+    // Fallback: nếu Graph API không trả post (thiếu quyền), dùng postId đã biết từ webhook
+    const postIds =
+      posts.length > 0
+        ? posts.map((p) => p.id).filter(Boolean)
+        : await this.listKnownCommentPostIds(pageId, orgId);
+
+    if (posts.length === 0 && postIds.length > 0) {
+      this.logger.warn(
+        `[Conversations] Feed API trả rỗng, thử lấy comment từ ${postIds.length} bài đã biết qua webhook`,
+      );
+    }
+
     const map = new Map<string, ConversationThread & { _latest: number }>();
 
-    for (const post of posts) {
-      const postId = post.id;
-      if (!postId) continue;
-
-      const allComments = post.comments?.data ?? [];
-      const commentById = new Map(allComments.map((c) => [c.id, c]));
-
-      for (const comment of allComments) {
+    const ingestPost = (postId: string, comments: GraphPostComment[]) => {
+      this.logger.log(
+        `[Conversations] Processing post ${postId} with ${comments.length} comments`,
+      );
+      for (const comment of comments) {
         const senderId = comment.from?.id;
         if (!senderId || senderId === pageId || !comment.created_time) continue;
 
@@ -316,6 +398,7 @@ export class ConversationsService {
             postId,
             commentId: rootCommentId,
             messageCount: 1,
+            unreadCount: 0,
             _latest: ts,
           });
           continue;
@@ -326,40 +409,54 @@ export class ConversationsService {
           existing._latest = ts;
           existing.lastMessageAt = comment.created_time;
           existing.preview = comment.message ?? existing.preview;
-          if (comment.from?.name) existing.senderName = comment.from.name;
-          const picture = extractGraphPictureUrl(comment.from);
-          if (picture) existing.senderPictureUrl = picture;
+          existing.commentId = comment.id;
+          if (comment.from?.name && !isGenericSenderName(comment.from.name)) {
+            existing.senderName = comment.from.name;
+          }
         }
       }
+    };
 
-      // Also create threads for page replies to customer comments
-      for (const comment of allComments) {
-        if (comment.from?.id !== pageId || !comment.parent?.id) continue;
-        const parentComment = commentById.get(comment.parent.id);
-        if (!parentComment?.from?.id || parentComment.from.id === pageId) continue;
+    for (const post of posts) {
+      if (post.id) {
+        ingestPost(post.id, post.comments?.data ?? []);
+      }
+    }
 
-        const customerId = parentComment.from.id;
-        const rootCommentId = comment.parent.id;
-        const threadId = `comment:${pageId}:${postId}:${customerId}:${rootCommentId}`;
-        const existing = map.get(threadId);
-
-        if (!existing) continue;
-
-        const ts = new Date(comment.created_time).getTime();
-        if (!Number.isFinite(ts)) continue;
-
-        existing.messageCount += 1;
-        if (ts >= existing._latest) {
-          existing._latest = ts;
-          existing.lastMessageAt = comment.created_time;
-          existing.preview = comment.message ?? existing.preview;
-        }
+    if (posts.length === 0) {
+      for (const postId of postIds) {
+        const { comments } = await this.facebookOAuth.getPostComments(
+          postId,
+          token,
+          { limit: 100 },
+        );
+        ingestPost(postId, comments);
       }
     }
 
     return [...map.values()]
       .sort((a, b) => b._latest - a._latest)
       .map(({ _latest, ...thread }) => thread);
+  }
+
+  /** Lấy danh sách postId đã có sự kiện bình luận trong webhook (fallback khi Graph feed lỗi). */
+  private async listKnownCommentPostIds(
+    pageId: string,
+    orgId: string,
+  ): Promise<string[]> {
+    const rows = await this.prisma.webhookEvent.findMany({
+      where: {
+        pageId,
+        eventType: 'FEED_COMMENT',
+        postId: { not: null },
+        OR: [{ organizationId: orgId }, { organizationId: null }],
+      },
+      select: { postId: true },
+      distinct: ['postId'],
+      take: 100,
+    });
+
+    return rows.map((r) => r.postId!).filter(Boolean);
   }
 
   private graphConversationToThread(
@@ -400,6 +497,7 @@ export class ConversationsService {
       postId: null,
       commentId: null,
       messageCount: conv.message_count ?? 0,
+      unreadCount: 0,
     };
   }
 
@@ -432,6 +530,7 @@ export class ConversationsService {
         lastMessageAt:
           webhookTs >= graphTs ? thread.lastMessageAt : existing.lastMessageAt,
         messageCount: Math.max(thread.messageCount, existing.messageCount),
+        unreadCount: Math.max(thread.unreadCount, existing.unreadCount),
         postId: thread.postId ?? existing.postId,
         commentId: thread.commentId ?? existing.commentId,
         kind: thread.kind,
@@ -443,6 +542,60 @@ export class ConversationsService {
         new Date(b.lastMessageAt).getTime() -
         new Date(a.lastMessageAt).getTime(),
     );
+  }
+
+  private async getReadAtByThread(
+    pageId: string,
+    orgId: string,
+  ): Promise<Map<string, Date>> {
+    try {
+      const rows = await this.prisma.$queryRaw<
+        Array<{ thread_id: string; last_read_at: Date | string }>
+      >`
+        SELECT thread_id, last_read_at
+        FROM conversation_read_states
+        WHERE page_id = ${pageId} AND organization_id = ${orgId}
+      `;
+
+      return new Map(
+        rows.map((row) => [row.thread_id, new Date(row.last_read_at)]),
+      );
+    } catch {
+      return new Map();
+    }
+  }
+
+  private async markThreadRead(
+    pageId: string,
+    orgId: string,
+    threadId: string,
+  ): Promise<void> {
+    try {
+      await this.prisma.$executeRaw`
+        INSERT INTO conversation_read_states (
+          id,
+          organization_id,
+          page_id,
+          thread_id,
+          last_read_at,
+          updated_at
+        )
+        VALUES (
+          lower(hex(randomblob(16))),
+          ${orgId},
+          ${pageId},
+          ${threadId},
+          CURRENT_TIMESTAMP,
+          CURRENT_TIMESTAMP
+        )
+        ON CONFLICT(organization_id, page_id, thread_id)
+        DO UPDATE SET
+          last_read_at = excluded.last_read_at,
+          updated_at = excluded.updated_at
+      `;
+    } catch {
+      // Bỏ qua khi database local chưa chạy migration read-state.
+    }
   }
 
   private async getMessengerThreadMessages(
@@ -498,8 +651,9 @@ export class ConversationsService {
       (a, b) => a.createdAt.getTime() - b.createdAt.getTime(),
     );
 
-    const eligible = before
-      ? sorted.filter((m) => m.createdAt.getTime() < new Date(before).getTime())
+    const beforeDate = parseDateCursor(before);
+    const eligible = beforeDate
+      ? sorted.filter((m) => m.createdAt.getTime() < beforeDate.getTime())
       : sorted;
     const hasMore = eligible.length > limit || graphPaging.hasMore;
     const pageMessages = eligible.slice(-limit);
@@ -530,6 +684,22 @@ export class ConversationsService {
     };
   }
 
+  private commentBelongsToThread(
+    comment: GraphPostComment,
+    pageId: string,
+    customerId: string,
+    byId: Map<string, GraphPostComment>,
+  ): boolean {
+    const senderId = comment.from?.id;
+    if (!senderId) return false;
+    if (senderId === customerId) return true;
+    if (senderId !== pageId || !comment.parent?.id) return false;
+
+    const parent = byId.get(comment.parent.id);
+    if (!parent) return false;
+    return this.commentBelongsToThread(parent, pageId, customerId, byId);
+  }
+
   private async getCommentThreadMessages(
     pageId: string,
     orgId: string,
@@ -541,44 +711,28 @@ export class ConversationsService {
     rootCommentId?: string,
   ): Promise<ThreadMessagesPage> {
     const token = await this.getPageAccessToken(pageId, orgId);
+
     let graphEvents: ConversationMessage[] = [];
     if (token) {
-      const comments = await this.facebookOAuth.getAllPostComments(
+      const comments = await this.getCachedPostComments(
+        pageId,
+        orgId,
         postId,
         token,
       );
-
-      const relevantIds = new Set<string>();
-
-      if (rootCommentId) {
-        for (const comment of comments) {
-          if (comment.id === rootCommentId || comment.parent?.id === rootCommentId) {
-            relevantIds.add(comment.id);
-          }
-        }
-      } else {
-        for (const comment of comments) {
-          if (comment.from?.id === customerId) {
-            relevantIds.add(comment.id);
-          }
-        }
-
-        let changed = true;
-        while (changed) {
-          changed = false;
-          for (const comment of comments) {
-            if (relevantIds.has(comment.id)) continue;
-            if (!comment.parent?.id || !relevantIds.has(comment.parent.id)) continue;
-            if (comment.from?.id === pageId || comment.from?.id === customerId) {
-              relevantIds.add(comment.id);
-              changed = true;
-            }
-          }
-        }
-      }
+      await this.reconcileStaleCommentsForPost(
+        pageId,
+        orgId,
+        postId,
+        comments,
+        token,
+      );
+      const byId = new Map(comments.map((c) => [c.id, c]));
 
       graphEvents = comments
-        .filter((comment) => relevantIds.has(comment.id))
+        .filter((comment) =>
+          this.commentBelongsToThread(comment, pageId, customerId, byId),
+        )
         .map((comment) =>
           this.graphCommentToEvent(comment, pageId, postId, customerId, orgId),
         );
@@ -601,8 +755,9 @@ export class ConversationsService {
       (a, b) => a.createdAt.getTime() - b.createdAt.getTime(),
     );
 
-    const eligible = before
-      ? sorted.filter((m) => m.createdAt.getTime() < new Date(before).getTime())
+    const beforeDate = parseDateCursor(before);
+    const eligible = beforeDate
+      ? sorted.filter((m) => m.createdAt.getTime() < beforeDate.getTime())
       : sorted;
     const hasMore = eligible.length > limit;
     const pageMessages = eligible.slice(-limit);
@@ -614,14 +769,135 @@ export class ConversationsService {
       orgId,
       customerId,
     );
+    const withNames = await this.enrichMessageSenderNames(
+      enriched,
+      pageId,
+      orgId,
+      customerId,
+    );
 
     return {
-      messages: enriched,
+      messages: withNames,
       paging: {
         hasMore,
         nextBefore: hasMore && oldest ? oldest.createdAt.toISOString() : null,
       },
     };
+  }
+
+  /**
+   * Đối chiếu DB với Graph: comment không còn trên Facebook → đánh dấu DELETED.
+   * Trả về tập comment id còn hợp lệ.
+   */
+  private async pruneStaleCommentsForPage(
+    pageId: string,
+    orgId: string,
+  ): Promise<void> {
+    const token = await this.getPageAccessToken(pageId, orgId);
+    if (!token) return;
+
+    const rows = await this.prisma.webhookEvent.findMany({
+      where: {
+        pageId,
+        eventType: 'FEED_COMMENT',
+        status: { not: EVENT_STATUS_DELETED },
+        postId: { not: null },
+      },
+      select: { postId: true },
+      distinct: ['postId'],
+      take: 20,
+    });
+
+    for (const row of rows) {
+      if (!row.postId) continue;
+      const comments = await this.getCachedPostComments(
+        pageId,
+        orgId,
+        row.postId,
+        token,
+      );
+      await this.reconcileStaleCommentsForPost(
+        pageId,
+        orgId,
+        row.postId,
+        comments,
+        token,
+      );
+    }
+  }
+
+  private async reconcileStaleCommentsForPost(
+    pageId: string,
+    orgId: string,
+    postId: string,
+    graphComments: GraphPostComment[],
+    token: string,
+  ): Promise<Set<string>> {
+    const validIds = new Set(
+      graphComments.map((c) => c.id).filter((id): id is string => !!id),
+    );
+
+    const staleCandidates = await this.prisma.webhookEvent.findMany({
+      where: {
+        pageId,
+        postId,
+        eventType: 'FEED_COMMENT',
+        status: { not: EVENT_STATUS_DELETED },
+      },
+      select: { id: true, commentId: true, messageId: true },
+    });
+
+    const staleRowIds: string[] = [];
+
+    for (const row of staleCandidates) {
+      const key = row.commentId ?? row.messageId;
+      if (!key || !isValidFacebookCommentId(key)) {
+        staleRowIds.push(row.id);
+        continue;
+      }
+      if (validIds.has(key)) continue;
+
+      const meta = await this.facebookOAuth.getCommentMeta(key, token);
+      if (meta?.id) {
+        validIds.add(meta.id);
+        continue;
+      }
+
+      staleRowIds.push(row.id);
+    }
+
+    if (staleRowIds.length > 0) {
+      await this.prisma.webhookEvent.updateMany({
+        where: { id: { in: staleRowIds } },
+        data: { status: EVENT_STATUS_DELETED },
+      });
+      await this.redisCache.bumpPageRevision(orgId, pageId);
+      this.logger.log(
+        `[Conversations] Đã ẩn ${staleRowIds.length} comment không còn trên Facebook (post ${postId})`,
+      );
+    }
+
+    return validIds;
+  }
+
+  private async getCachedPostComments(
+    pageId: string,
+    orgId: string,
+    postId: string,
+    token: string,
+  ): Promise<GraphPostComment[]> {
+    const pageRev = await this.redisCache.getPageRevision(orgId, pageId);
+    const key = this.redisCache.postCommentsKey(pageId, postId, pageRev);
+    const hit = await this.redisCache.get<GraphPostComment[]>(key);
+    if (hit) return hit;
+
+    const comments = await this.facebookOAuth.listAllPostComments(
+      postId,
+      token,
+      { pageSize: 100, maxComments: 500 },
+    );
+    await this.redisCache.set(key, comments, GRAPH_CACHE_TTL_SECONDS);
+    return comments;
   }
 
   private async getWebhookThreadMessages(
@@ -637,9 +913,10 @@ export class ConversationsService {
       throw new NotFoundException('Cuộc trò chuyện không hợp lệ');
     }
 
+    const beforeDate = parseDateCursor(before);
     const where = {
       ...threadWhere,
-      ...(before ? { createdAt: { lt: new Date(before) } } : {}),
+      ...(beforeDate ? { createdAt: { lt: beforeDate } } : {}),
     };
 
     const events = await this.prisma.webhookEvent.findMany({
@@ -955,7 +1232,69 @@ export class ConversationsService {
       msgType: 'text',
       content: msg.message ?? '',
       rawPayload: JSON.stringify(msg),
+      status: 'ACTIVE',
       createdAt: new Date(msg.created_time),
+    };
+  }
+
+  private serializeGraphCommentContent(comment: GraphPostComment): {
+    content: string;
+    msgType: string;
+  } {
+    const att = comment.attachment;
+    const imageUrl = att?.media?.image?.src;
+    const videoUrl = att?.media?.source;
+    const isReply = !!comment.parent?.id;
+    const text = comment.message?.trim() ?? '';
+
+    if (imageUrl) {
+      if (text) {
+        return {
+          content: JSON.stringify({
+            text,
+            href: imageUrl,
+            type: 'image',
+            title: att?.title ?? 'Ảnh',
+          }),
+          msgType: isReply ? 'feed.comment.reply.photo' : 'feed.comment.photo',
+        };
+      }
+      return {
+        content: JSON.stringify({
+          href: imageUrl,
+          type: 'image',
+          title: att?.title ?? 'Ảnh',
+        }),
+        msgType: isReply ? 'feed.comment.reply.photo' : 'feed.comment.photo',
+      };
+    }
+
+    if (att?.type === 'sticker' && att.url) {
+      return {
+        content: JSON.stringify({
+          href: att.url,
+          type: 'sticker',
+          title: 'Sticker',
+        }),
+        msgType: isReply ? 'feed.comment.reply.sticker' : 'feed.comment.sticker',
+      };
+    }
+
+    if (videoUrl || att?.type === 'video') {
+      const href = videoUrl ?? att?.url ?? '';
+      return {
+        content: JSON.stringify({
+          href,
+          type: 'video',
+          title: att?.title ?? 'Video',
+        }),
+        msgType: isReply ? 'feed.comment.reply.video' : 'feed.comment.video',
+      };
+    }
+
+    return {
+      content: text,
+      msgType: isReply ? 'feed.comment.reply' : 'feed.comment',
     };
   }
 
@@ -968,6 +1307,8 @@ export class ConversationsService {
   ): ConversationMessage {
     const senderId = comment.from?.id ?? '';
     const isFromPage = senderId === pageId;
+    const { content, msgType } = this.serializeGraphCommentContent(comment);
+    const threadCustomerId = isFromPage ? customerPsid : senderId;
 
     return {
       id: `graph-comment-${comment.id}`,
@@ -975,19 +1316,34 @@ export class ConversationsService {
       pageId,
       eventType: 'FEED_COMMENT',
       direction: isFromPage ? 'OUT' : 'IN',
-      senderId,
+      senderId: threadCustomerId,
       senderName: comment.from?.name ?? (isFromPage ? 'Page' : 'Khách hàng'),
       senderPictureUrl: extractGraphPictureUrl(comment.from),
-      recipientId: isFromPage ? customerPsid : pageId,
+      recipientId: isFromPage ? pageId : threadCustomerId,
       messageId: comment.id,
       postId,
       commentId: comment.id,
-      msgType: 'feed.comment',
-      content: comment.message ?? '',
+      msgType,
+      content,
       rawPayload: JSON.stringify(comment),
+      status: comment.is_hidden === true ? 'HIDDEN' : 'ACTIVE',
       createdAt: new Date(comment.created_time),
       parentCommentId: comment.parent?.id ?? null,
     };
+  }
+
+  private pickMergedContentStatus(
+    a?: string | null,
+    b?: string | null,
+  ): string {
+    const rank: Record<string, number> = {
+      ACTIVE: 0,
+      HIDDEN: 1,
+      DELETED: 2,
+    };
+    const sa = a ?? 'ACTIVE';
+    const sb = b ?? 'ACTIVE';
+    return (rank[sa] ?? 0) >= (rank[sb] ?? 0) ? sa : sb;
   }
 
   private mergeThreadMessages(
@@ -1012,7 +1368,7 @@ export class ConversationsService {
           event.senderName,
         ),
         senderPictureUrl: existing?.senderPictureUrl ?? null,
-        parentCommentId,
+        status: this.pickMergedContentStatus(existing?.status, event.status),
       } as ConversationMessage;
       byMessageId.set(key, merged);
     }

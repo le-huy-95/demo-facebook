@@ -71,14 +71,36 @@ export class MessagesController {
     return new Observable<MessageEvent>((subscriber) => {
       const handler = (event: WebhookEvent) => {
         subscriber.next({
-          data: JSON.stringify(event),
+          data: JSON.stringify({
+            type: 'message',
+            ...event,
+            createdAt:
+              event.createdAt instanceof Date
+                ? event.createdAt.toISOString()
+                : event.createdAt,
+          }),
+        } as MessageEvent);
+      };
+
+      const feedHandler = (payload: {
+        pageId: string;
+        ingested: number;
+        threadIds: string[];
+      }) => {
+        subscriber.next({
+          data: JSON.stringify({
+            type: 'feed:synced',
+            ...payload,
+          }),
         } as MessageEvent);
       };
 
       this.eventsService.onMessage(handler);
+      this.eventsService.onFeedSynced(feedHandler);
 
       return () => {
         this.eventsService.offMessage(handler);
+        this.eventsService.offFeedSynced(feedHandler);
       };
     }).pipe(map((event) => event));
   }
