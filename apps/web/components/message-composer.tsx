@@ -7,8 +7,7 @@ import {
   useState,
   type ReactNode,
 } from 'react';
-import { uploadFile } from '@/lib/api';
-import { sendMessage } from '@/lib/socket';
+import { uploadFile, sendThreadMessage } from '@/lib/api';
 import { UserAvatar } from '@/components/user-avatar';
 
 interface MessageComposerProps {
@@ -16,12 +15,16 @@ interface MessageComposerProps {
   threadId: string;
   shopPictureUrl?: string | null;
   commentId?: string | null;
+  /** Messenger: mid của tin nhắn đang reply (không dùng cho thread comment). */
+  replyToMessageId?: string | null;
   /** Nội dung rút gọn của bình luận đang trả lời. */
   replyPreview?: string | null;
   /** Tag @tên khi trả lời bình luận. */
   replyMentionName?: string | null;
   /** Click vào preview để cuộn tới bình luận gốc. */
   onReplyPreviewClick?: () => void;
+  /** Bỏ chọn bình luận đang trả lời. */
+  onClearReply?: () => void;
   /** Chỉ hiển thị icon cho các thao tác của composer, dùng cho màn hình comment. */
   iconOnlyActions?: boolean;
   disabled?: boolean;
@@ -87,7 +90,20 @@ function EyeIcon({ className }: { className?: string }) {
       fill="currentColor"
       aria-hidden
     >
-      <path d="M10 4.5c4.15 0 6.48 3.08 7.25 4.35.42.7.42 1.6 0 2.3C16.48 12.42 14.15 15.5 10 15.5s-6.48-3.08-7.25-4.35a2.2 2.2 0 0 1 0-2.3C3.52 7.58 5.85 4.5 10 4.5Zm0 1.5C6.62 6 4.7 8.53 4.03 9.62a.72.72 0 0 0 0 .76C4.7 11.47 6.62 14 10 14s5.3-2.53 5.97-3.62a.72.72 0 0 0 0-.76C15.3 8.53 13.38 6 10 6Zm0 1.5a2.5 2.5 0 1 1 0 5 2.5 2.5 0 0 1 0-5Zm0 1.5a1 1 0 1 0 0 2 1 1 0 0 0 0-2Z" />
+      <path d="M10 4.5C5.5 4.5 2 10 2 10s3.5 5.5 8 5.5 8-5.5 8-5.5-3.5-5.5-8-5.5Zm0 9a3.5 3.5 0 1 1 0-7 3.5 3.5 0 0 1 0 7Z" />
+    </svg>
+  );
+}
+
+function CloseIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      className={className}
+      viewBox="0 0 20 20"
+      fill="currentColor"
+      aria-hidden
+    >
+      <path d="M6.28 5.22a.75.75 0 0 0-1.06 1.06L8.94 10l-3.72 3.72a.75.75 0 1 0 1.06 1.06L10 11.06l3.72 3.72a.75.75 0 1 0 1.06-1.06L11.06 10l3.72-3.72a.75.75 0 0 0-1.06-1.06L10 8.94 6.28 5.22Z" />
     </svg>
   );
 }
@@ -149,6 +165,7 @@ export function MessageComposer({
   replyPreview = null,
   replyMentionName = null,
   onReplyPreviewClick,
+  onClearReply,
   iconOnlyActions = false,
   disabled = false,
   allowAttachments = true,
@@ -184,6 +201,7 @@ export function MessageComposer({
   useEffect(() => {
     if (!commentId) {
       lastMentionKeyRef.current = null;
+      setText('');
     }
   }, [commentId]);
 
@@ -200,22 +218,25 @@ export function MessageComposer({
     const trimmed = text.trim();
     if (!trimmed || sending || disabled) return;
 
+    const isCommentThread = threadId.startsWith('comment:');
+    if (isCommentThread && !commentId) return;
+
     const clientMessageId = `client-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     setSending(true);
     setError(null);
     onSent?.({ clientMessageId, text: trimmed, pending: true });
 
-    sendMessage(
-      {
-        pageId,
-        threadId,
-        commentId: commentId ?? undefined,
-        replyToMessageId: replyToMessageId ?? undefined,
-        text: trimmed,
-        clientMessageId,
-      },
-      (ack) => {
-        clearTimeout(ackTimer);
+    void sendThreadMessage({
+      pageId,
+      threadId,
+      commentId: commentId ?? undefined,
+      ...(isCommentThread || commentId
+        ? {}
+        : { replyToMessageId: replyToMessageId ?? undefined }),
+      text: trimmed,
+      clientMessageId,
+    })
+      .then((ack) => {
         setSending(false);
         onAck?.({
           clientMessageId,
@@ -229,24 +250,27 @@ export function MessageComposer({
         } else {
           const msg = ack.error ?? 'Gửi tin nhắn thất bại';
           setError(
-            msg.includes('kết nối') || msg.includes('Socket')
-              ? msg
-              : msg.includes('commentId')
-                ? 'Không tìm thấy comment để trả lời. Hãy chọn một bình luận trong thread trước.'
-                : msg,
+            msg.includes('commentId')
+              ? 'Không tìm thấy comment để trả lời. Hãy chọn một bình luận trong thread trước.'
+              : msg,
           );
         }
-      },
-    );
-
-    // Timeout nếu Socket không phản hồi (thường do mất kết nối realtime)
-    const ackTimer = setTimeout(() => {
-      setSending(false);
-      setError(
-        'Không nhận được phản hồi từ server. Kiểm tra kết nối Socket (thử tải lại trang).',
-      );
-    }, 15_000);
-  }, [text, sending, disabled, pageId, threadId, commentId, onSent, onAck]);
+      })
+      .catch((e: unknown) => {
+        setSending(false);
+        setError(e instanceof Error ? e.message : 'Gửi tin nhắn thất bại');
+      });
+  }, [
+    text,
+    sending,
+    disabled,
+    pageId,
+    threadId,
+    commentId,
+    replyToMessageId,
+    onSent,
+    onAck,
+  ]);
 
   const handleAttach = useCallback(
     async (file: File) => {
@@ -265,29 +289,27 @@ export function MessageComposer({
 
       try {
         const { data } = await uploadFile(file);
-        sendMessage(
-          {
-            pageId,
-            threadId,
-            commentId: commentId ?? undefined,
-            replyToMessageId: replyToMessageId ?? undefined,
-            text: text.trim() || '',
-            clientMessageId,
-            attachment: { type, url: data.url },
-          },
-          (ack) => {
-            onAck?.({
-              clientMessageId,
-              ok: ack.ok,
-              fbMessageId: ack.fbMessageId,
-              savedEventId: ack.savedEventId,
-              error: ack.error,
-            });
-            if (!ack.ok) {
-              setError(ack.error ?? 'Gửi file thất bại');
-            }
-          },
-        );
+        const ack = await sendThreadMessage({
+          pageId,
+          threadId,
+          commentId: commentId ?? undefined,
+          ...(threadId.startsWith('comment:') || commentId
+            ? {}
+            : { replyToMessageId: replyToMessageId ?? undefined }),
+          text: text.trim() || '',
+          clientMessageId,
+          attachment: { type, url: data.url },
+        });
+        onAck?.({
+          clientMessageId,
+          ok: ack.ok,
+          fbMessageId: ack.fbMessageId,
+          savedEventId: ack.savedEventId,
+          error: ack.error,
+        });
+        if (!ack.ok) {
+          setError(ack.error ?? 'Gửi file thất bại');
+        }
       } catch (e: unknown) {
         setError(e instanceof Error ? e.message : 'Upload file thất bại');
       } finally {
@@ -302,6 +324,7 @@ export function MessageComposer({
       pageId,
       threadId,
       commentId,
+      replyToMessageId,
       onSent,
       onAck,
       text,
@@ -311,32 +334,52 @@ export function MessageComposer({
   const isReplyingComment = Boolean(commentId);
   const isReplyingMessage = Boolean(replyToMessageId);
   const isReplying = isReplyingComment || isReplyingMessage;
+  const isCommentThread = threadId.startsWith('comment:');
+  const needsCommentSelection = isCommentThread && !commentId;
+  const canSend = Boolean(text.trim()) && !needsCommentSelection;
 
   return (
     <div className="space-y-2">
       {commentId && (
-        <button
-          type="button"
-          onClick={onReplyPreviewClick}
-          className="flex w-full items-start gap-2 rounded-xl border border-[#fcd34d] bg-[#fffbeb] px-3 py-2 text-left transition hover:bg-[#fef3c7]"
-        >
-          <ReplyIcon className="mt-0.5 h-4 w-4 shrink-0 text-[#b45309]" />
-          <span className="min-w-0 flex-1">
-            <span className="block text-[10px] font-semibold uppercase tracking-wide text-[#b45309]">
-              Đang trả lời bình luận
+        <div className="flex w-full items-start gap-2 rounded-xl border border-[#fcd34d] bg-[#fffbeb] px-3 py-2">
+          <button
+            type="button"
+            onClick={onReplyPreviewClick}
+            className="flex min-w-0 flex-1 items-start gap-2 text-left transition hover:opacity-90"
+          >
+            <ReplyIcon className="mt-0.5 h-4 w-4 shrink-0 text-[#b45309]" />
+            <span className="min-w-0 flex-1">
+              <span className="block text-[10px] font-semibold uppercase tracking-wide text-[#b45309]">
+                Đang trả lời bình luận
+              </span>
+              <span className="block truncate text-sm text-[#78350f]">
+                {replyPreview?.trim() || 'Bình luận'}
+              </span>
             </span>
-            <span className="block truncate text-sm text-[#78350f]">
-              {replyPreview?.trim() || 'Bình luận'}
-            </span>
-          </span>
+          </button>
           {onReplyPreviewClick && (
             <IconTooltip label="Xem bình luận gốc">
-              <span className="mt-0.5 inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-[#d97706] transition hover:bg-[#fde68a]">
+              <button
+                type="button"
+                onClick={onReplyPreviewClick}
+                className="mt-0.5 inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-[#d97706] transition hover:bg-[#fde68a]"
+              >
                 <EyeIcon className="h-4 w-4" />
-              </span>
+              </button>
             </IconTooltip>
           )}
-        </button>
+          {onClearReply && (
+            <IconTooltip label="Bỏ chọn">
+              <button
+                type="button"
+                onClick={onClearReply}
+                className="mt-0.5 inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-[#b45309] transition hover:bg-[#fde68a]"
+              >
+                <CloseIcon className="h-4 w-4" />
+              </button>
+            </IconTooltip>
+          )}
+        </div>
       )}
       <div className="rounded-2xl border border-[#e5e7eb] bg-white px-3 py-3">
         <div className="flex items-end gap-2">
@@ -361,7 +404,9 @@ export function MessageComposer({
             placeholder={
               commentId
                 ? 'Trả lời bình luận... (Enter để gửi)'
-                : 'Nhập tin nhắn... (Enter để gửi, Shift+Enter xuống dòng)'
+                : isCommentThread
+                  ? 'Chọn bình luận để trả lời...'
+                  : 'Nhập tin nhắn... (Enter để gửi, Shift+Enter xuống dòng)'
             }
             className="min-h-[44px] flex-1 resize-none rounded-xl border border-[#e5e7eb] bg-white px-4 py-3 text-sm text-[#111827] outline-none ring-[#3b82f6] focus:ring-2 disabled:bg-[#f3f4f6]"
           />
@@ -376,13 +421,13 @@ export function MessageComposer({
               }
               icon={<SendIcon className="h-5 w-5" />}
               onClick={handleSend}
-              disabled={disabled || sending || uploading || !text.trim()}
+              disabled={disabled || sending || uploading || !canSend}
             />
           ) : (
             <button
               type="button"
               onClick={handleSend}
-              disabled={disabled || sending || uploading || !text.trim()}
+              disabled={disabled || sending || uploading || !canSend}
               className="rounded-xl bg-[#3b82f6] px-4 py-3 text-sm font-medium text-white hover:bg-[#2563eb] disabled:cursor-not-allowed disabled:bg-[#93c5fd]"
             >
               {sending ? 'Đang gửi...' : uploading ? 'Đang upload...' : 'Gửi'}

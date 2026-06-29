@@ -421,7 +421,7 @@ export class FacebookPageService implements OnModuleInit {
       }
       try {
         await this.delay(300);
-        const status = await this.facebookOAuthService.getPageSubscriptionStatus(
+        const status = await this.facebookOAuthService.inspectPageWebhookSubscription(
           page.pageId,
           page.pageAccessToken,
         );

@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  Body,
   Controller,
   Get,
   Param,
@@ -7,11 +8,13 @@ import {
   Query,
   Res,
 } from '@nestjs/common';
-import { ApiOperation, ApiQuery, ApiTags } from '@nestjs/swagger';
 import type { Response } from 'express';
+import { ApiOperation, ApiQuery, ApiTags } from '@nestjs/swagger';
 import { FacebookPageService } from '../services/facebook-page.service';
 import { ConversationsService } from '../services/conversations.service';
 import { FacebookWebhookService } from '../services/facebook-webhook.service';
+import { FacebookMessagingService } from '../services/facebook-messaging.service';
+import { EventsService } from '../services/events.service';
 import { EventsGateway } from '../gateways/events.gateway';
 
 @ApiTags('conversations')
@@ -21,6 +24,8 @@ export class ConversationsController {
     private readonly facebookPageService: FacebookPageService,
     private readonly conversationsService: ConversationsService,
     private readonly webhookService: FacebookWebhookService,
+    private readonly facebookMessaging: FacebookMessagingService,
+    private readonly eventsService: EventsService,
     private readonly eventsGateway: EventsGateway,
   ) {}
 
@@ -64,12 +69,17 @@ export class ConversationsController {
       'Đồng bộ bình luận mới từ Facebook Graph (fallback khi webhook Meta chậm/thiếu)',
   })
   @ApiQuery({ name: 'pageId', required: true })
-  async syncComments(@Query('pageId') pageId: string) {
+  @ApiQuery({ name: 'force', required: false, description: 'Bỏ qua cooldown 30s — dùng khi mở tab lần đầu' })
+  async syncComments(
+    @Query('pageId') pageId: string,
+    @Query('force') force?: string,
+  ) {
     if (!pageId?.trim()) {
       throw new BadRequestException('Thiếu tham số pageId');
     }
 
-    const result = await this.webhookService.syncCommentsForPage(pageId);
+    const forceSync = force === 'true' || force === '1';
+    const result = await this.webhookService.syncCommentsForPage(pageId, forceSync);
     this.eventsGateway.emitFeedSynced(pageId, result);
 
     return { statusCode: 200, data: result };
@@ -173,6 +183,57 @@ export class ConversationsController {
     }));
 
     return { statusCode: 200, data, paging: result.paging };
+  }
+
+  @Post(':threadId/send')
+  @ApiOperation({ summary: 'Gửi tin nhắn Messenger hoặc trả lời bình luận' })
+  async sendInThread(
+    @Param('threadId') threadId: string,
+    @Body()
+    body: {
+      pageId: string;
+      text?: string;
+      commentId?: string;
+      replyToMessageId?: string;
+      clientMessageId?: string;
+      attachment?: {
+        type: 'image' | 'video' | 'audio' | 'file';
+        url: string;
+      };
+    },
+  ) {
+    if (!body.pageId?.trim()) {
+      throw new BadRequestException('Thiếu pageId');
+    }
+
+    try {
+      const result = await this.facebookMessaging.sendToThread({
+        pageId: body.pageId,
+        threadId,
+        text: body.text,
+        attachment: body.attachment,
+        commentId: body.commentId,
+        replyToMessageId: body.replyToMessageId,
+        clientMessageId: body.clientMessageId,
+      });
+
+      this.eventsGateway.emitWebhookEvent(result.savedEvent);
+      this.eventsService.emitNewMessage(result.savedEvent);
+
+      return {
+        statusCode: 200,
+        data: {
+          ok: true,
+          clientMessageId: body.clientMessageId ?? null,
+          fbMessageId: result.fb.messageId ?? null,
+          savedEventId: result.savedEvent.id,
+        },
+      };
+    } catch (err: unknown) {
+      const message =
+        err instanceof Error ? err.message : 'Gửi tin nhắn thất bại';
+      throw new BadRequestException(message);
+    }
   }
 
   @Post('comments/:commentId/action')

@@ -1,12 +1,29 @@
 import { io, type Socket } from 'socket.io-client';
 
-/** Kết nối thẳng Nest — Next.js dev proxy thường làm hỏng WebSocket/Socket.IO. */
-export const SOCKET_URL =
-  process.env.NEXT_PUBLIC_SOCKET_URL ??
-  process.env.NEXT_PUBLIC_API_URL ??
-  (typeof window !== 'undefined'
-    ? window.location.origin
-    : 'http://localhost:3000');
+/**
+ * Socket.IO backend URL.
+ * - localhost: kết nối thẳng Nest (3000) — tránh lỗi proxy Next dev.
+ * - ngrok HTTPS: same-origin → Next rewrite `/socket.io` → Nest.
+ */
+function getSocketUrl(): string {
+  if (typeof window === 'undefined') {
+    return (
+      process.env.NEXT_PUBLIC_SOCKET_URL ??
+      process.env.NEXT_PUBLIC_API_URL ??
+      'http://localhost:3000'
+    );
+  }
+
+  const { hostname, origin } = window.location;
+  if (hostname === 'localhost' || hostname === '127.0.0.1') {
+    return process.env.NEXT_PUBLIC_SOCKET_URL ?? 'http://localhost:3000';
+  }
+
+  return origin;
+}
+
+/** @deprecated Dùng getSocketUrl() — giữ export cho debug */
+export const SOCKET_URL = getSocketUrl();
 
 let socket: Socket | null = null;
 let joinedPageId: string | null = null;
@@ -29,16 +46,17 @@ function bindSocketReconnect(): void {
 
 export function getSocket(): Socket {
   if (!socket) {
-    socket = io(SOCKET_URL, {
+    socket = io(getSocketUrl(), {
       path: '/socket.io/',
-      // Chỉ polling — ổn định qua ngrok / proxy; websocket upgrade hay bị lỗi trong dev
-      transports: ['polling'],
-      upgrade: false,
+      // Polling trước — ổn định qua Next.js/ngrok proxy; WS upgrade khi proxy hỗ trợ.
+      transports: ['polling', 'websocket'],
+      upgrade: true,
       autoConnect: true,
       withCredentials: true,
       reconnection: true,
       reconnectionAttempts: Infinity,
-      reconnectionDelay: 1000,
+      reconnectionDelay: 2000,
+      reconnectionDelayMax: 10000,
       // Ngrok free tier hiển thị trang cảnh báo nếu thiếu header
       extraHeaders: {
         'ngrok-skip-browser-warning': 'true',

@@ -240,6 +240,7 @@ export function aggregateConversations(
       isVisibleEvent(event) && event.direction === 'IN' && ts > unreadCutoff;
 
     if (!existing) {
+      const rootCommentId = resolveRootCommentId(event);
       const inboundName =
         event.direction === 'IN' &&
         event.senderName &&

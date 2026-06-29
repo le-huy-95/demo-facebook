@@ -8,9 +8,6 @@ const nextConfig: NextConfig = {
   eslint: {
     ignoreDuringBuilds: true,
   },
-  // Tránh redirect 308 /socket.io/ → /socket.io (làm hỏng Socket.IO handshake)
-  skipTrailingSlashRedirect: true,
-  // Cho phép HMR/_next khi truy cập qua ngrok domain
   allowedDevOrigins: ['even-spindle-collie.ngrok-free.dev', '*.ngrok-free.dev'],
   async rewrites() {
     return [
@@ -18,7 +15,6 @@ const nextConfig: NextConfig = {
         source: '/facebook-page/:path*',
         destination: `${backendUrl}/facebook-page/:path*`,
       },
-      // API only — không rewrite /conversations/[pageId] (trang Next.js)
       {
         source: '/conversations/post',
         destination: `${backendUrl}/conversations/post`,
@@ -30,6 +26,10 @@ const nextConfig: NextConfig = {
       {
         source: '/conversations/:threadId/messages',
         destination: `${backendUrl}/conversations/:threadId/messages`,
+      },
+      {
+        source: '/conversations/:threadId/send',
+        destination: `${backendUrl}/conversations/:threadId/send`,
       },
       { source: '/conversations', destination: `${backendUrl}/conversations` },
       {
@@ -47,24 +47,9 @@ const nextConfig: NextConfig = {
       },
       { source: '/config/:path*', destination: `${backendUrl}/config/:path*` },
       { source: '/setup/:path*', destination: `${backendUrl}/setup/:path*` },
-      {
-        source: '/socket.io/',
-        destination: `${backendUrl}/socket.io/`,
-      },
-      {
-        source: '/socket.io/:path*',
-        destination: `${backendUrl}/socket.io/:path*`,
-      },
       { source: '/health', destination: `${backendUrl}/health` },
       { source: '/uploads', destination: `${backendUrl}/uploads` },
       { source: '/uploads/:path*', destination: `${backendUrl}/uploads/:path*` },
-      // Socket.IO: backend yêu cầu path có dấu / cuối (/socket.io/)
-      { source: '/socket.io', destination: `${backendUrl}/socket.io/` },
-      { source: '/socket.io/', destination: `${backendUrl}/socket.io/` },
-      {
-        source: '/socket.io/:path*',
-        destination: `${backendUrl}/socket.io/:path*`,
-      },
       { source: '/api-docs', destination: `${backendUrl}/api-docs` },
       {
         source: '/api-docs/:path*',

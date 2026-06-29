@@ -7,6 +7,7 @@ export interface FeedEventTransform {
   postId: string;
   commentId: string;
   parentId: string;
+  parentCommentId: string | null;
   messageId: string;
   verb: string;
 }
@@ -85,6 +86,7 @@ export function transformFeedChange(
     postId,
     commentId,
     parentId,
+    parentCommentId,
     messageId: commentId || postId || `${item}-${Date.now()}`,
     verb,
   };
@@ -112,7 +114,7 @@ export function extractFeedCommentKey(
   value: Record<string, unknown>,
 ): string | null {
   const raw = String(value.comment_id ?? value.id ?? '').trim();
-  return /^\d+_\d+$/.test(raw) ? raw : null;
+  return /^\d+(?:_\d+)+$/.test(raw) ? raw : null;
 }
 
 export function extractFeedPostKey(

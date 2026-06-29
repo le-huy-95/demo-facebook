@@ -3,7 +3,10 @@ import { BadRequestException, Injectable } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import * as crypto from 'crypto';
 import got from 'got';
-import { isValidFacebookCommentId } from '../utils/facebook-comment-id.util';
+import {
+  facebookCommentIdsMatch,
+  isValidFacebookCommentId,
+} from '../utils/facebook-comment-id.util';
 
 export interface OAuthStateData {
   orgId: string;
@@ -73,6 +76,9 @@ export interface GraphPostComment {
   from?: GraphConversationParticipant;
   parent?: { id?: string };
   attachment?: GraphCommentAttachment;
+  comments?: {
+    data?: GraphPostComment[];
+  };
 }
 
 /** Fields Graph API cho comment — gồm ảnh/sticker đính kèm. */
@@ -106,6 +112,18 @@ export function extractGraphPictureUrl(
 
 @Injectable()
 export class FacebookOAuthService {
+  /** Cache inspectPageTokenScopes — key=token (first 16 chars), value+expiry */
+  private readonly tokenScopeCache = new Map<
+    string,
+    { data: { scopes: string[]; missingCommentScopes: string[]; commentPermissionsOk: boolean }; expiresAt: number }
+  >();
+  /** Cache inspectPageWebhookSubscription — key=pageId */
+  private readonly webhookSubCache = new Map<
+    string,
+    { data: { installed: boolean; subscribedFields: string[]; feedSubscribed: boolean; missingFields: string[] }; expiresAt: number }
+  >();
+  private static readonly INSPECT_CACHE_TTL_MS = 5 * 60_000; // 5 phút
+
   /** Quyền tối thiểu để đọc/trả lời bình luận trên bài viết fanpage. */
   static readonly COMMENT_SCOPES = [
     'pages_read_user_content',
@@ -730,6 +748,24 @@ export class FacebookOAuthService {
     }
   }
 
+  private flattenComments(comments: GraphPostComment[]): GraphPostComment[] {
+    const flat: GraphPostComment[] = [];
+    const stack = [...comments];
+
+    while (stack.length > 0) {
+      const current = stack.shift();
+      if (!current?.id) continue;
+      flat.push(current);
+
+      const children = current.comments?.data ?? [];
+      if (children.length > 0) {
+        stack.push(...children);
+      }
+    }
+
+    return flat;
+  }
+
   /** Lấy comment của bài viết qua phân trang (tối đa maxComments). */
   async listAllPostComments(
     postId: string,
@@ -768,6 +804,7 @@ export class FacebookOAuthService {
   async getCommentMeta(
     commentId: string,
     accessToken: string,
+    options?: { postId?: string; silent?: boolean },
   ): Promise<{
     id: string;
     message?: string;
@@ -780,6 +817,38 @@ export class FacebookOAuthService {
       return null;
     }
 
+    const direct = await this.fetchCommentMetaDirect(commentId, accessToken);
+    if (direct) return direct;
+
+    const postId = options?.postId?.trim();
+    if (postId) {
+      const fromPost = await this.resolveCommentMetaFromPost(
+        postId,
+        commentId,
+        accessToken,
+      );
+      if (fromPost) return fromPost;
+    }
+
+    if (!options?.silent) {
+      this.logger.warn(
+        `Failed to fetch comment meta ${commentId} (direct GET và fallback post ${postId ?? 'none'} đều thất bại)`,
+      );
+    }
+    return null;
+  }
+
+  private async fetchCommentMetaDirect(
+    commentId: string,
+    accessToken: string,
+  ): Promise<{
+    id: string;
+    message?: string;
+    postId?: string;
+    fromId?: string;
+    fromName?: string;
+    parentId?: string;
+  } | null> {
     try {
       const data = await got
         .get(
@@ -808,14 +877,41 @@ export class FacebookOAuthService {
         fromName: data.from?.name,
         parentId: data.parent?.id,
       };
-    } catch (err: any) {
-      const body = err?.response?.body;
-      this.logger.warn(
-        `Failed to fetch comment meta ${commentId}`,
-        typeof body === 'string' ? body : err.message,
-      );
+    } catch {
       return null;
     }
+  }
+
+  /** Tìm comment trên bài viết khi GET trực tiếp thất bại (id sai format / đã đổi). */
+  private async resolveCommentMetaFromPost(
+    postId: string,
+    commentId: string,
+    accessToken: string,
+  ): Promise<{
+    id: string;
+    message?: string;
+    postId?: string;
+    fromId?: string;
+    fromName?: string;
+    parentId?: string;
+  } | null> {
+    const { comments } = await this.getPostComments(postId, accessToken, {
+      limit: 100,
+      order: 'reverse_chronological',
+    });
+    if (!comments.length) return null;
+
+    const hit = comments.find((c) => facebookCommentIdsMatch(c.id, commentId));
+    if (!hit?.id) return null;
+
+    return {
+      id: hit.id,
+      message: hit.message,
+      postId,
+      fromId: hit.from?.id,
+      fromName: hit.from?.name,
+      parentId: hit.parent?.id,
+    };
   }
 
   async getMe(accessToken: string): Promise<{ id: string; name: string }> {
@@ -878,6 +974,12 @@ export class FacebookOAuthService {
       };
     }
 
+    const cacheKey = pageAccessToken.slice(0, 20);
+    const cached = this.tokenScopeCache.get(cacheKey);
+    if (cached && Date.now() < cached.expiresAt) {
+      return cached.data;
+    }
+
     try {
       const appToken = `${this.appId}|${this.appSecret}`;
       const response = await got
@@ -898,21 +1000,32 @@ export class FacebookOAuthService {
         (scope) => !scopes.includes(scope),
       );
 
-      return {
+      const result = {
         scopes,
         missingCommentScopes: [...missingCommentScopes],
         commentPermissionsOk:
           Boolean(response.data?.is_valid) && missingCommentScopes.length === 0,
       };
+      this.tokenScopeCache.set(cacheKey, {
+        data: result,
+        expiresAt: Date.now() + FacebookOAuthService.INSPECT_CACHE_TTL_MS,
+      });
+      return result;
     } catch (err: any) {
       this.logger.warn(
         `inspectPageTokenScopes failed: ${err?.message ?? err}`,
       );
-      return {
+      const fallback = {
         scopes: [],
         missingCommentScopes: [...FacebookOAuthService.COMMENT_SCOPES],
         commentPermissionsOk: false,
       };
+      // Cache ngắn 60s khi lỗi để không retry liên tục
+      this.tokenScopeCache.set(cacheKey, {
+        data: fallback,
+        expiresAt: Date.now() + 60_000,
+      });
+      return fallback;
     }
   }
 
@@ -988,6 +1101,9 @@ export class FacebookOAuthService {
               callback_url: callbackUrl,
               verify_token: verifyToken,
               fields,
+              // Bắt buộc: không có flag này Meta chỉ gửi changed_fields (changes=[] rỗng)
+              // → processFeedChange không chạy được → không realtime cho FEED_COMMENT
+              include_values: 'true',
               access_token: appAccessToken,
             },
             timeout: { request: 20_000 },
@@ -1032,6 +1148,7 @@ export class FacebookOAuthService {
     await this.ensureAppWebhookSubscription();
 
     try {
+      const fields = this.webhookFields.join(',');
       const response = await got
         .post(
           `https://graph.facebook.com/${this.graphApiVersion}/${pageId}/subscribed_apps`,
@@ -1135,6 +1252,27 @@ export class FacebookOAuthService {
     }
   }
 
+  async getAppSubscriptions(): Promise<any[]> {
+    try {
+      const response = await got
+        .get(
+          `https://graph.facebook.com/${this.graphApiVersion}/${this.appId}/subscriptions`,
+          {
+            searchParams: { access_token: this.getAppAccessToken() },
+            timeout: { request: 10_000 },
+          },
+        )
+        .json<{ data?: any[] }>();
+      return response.data ?? [];
+    } catch (err: any) {
+      const body = err?.response?.body;
+      this.logger.warn(
+        `[FacebookOAuth] getAppSubscriptions failed: ${typeof body === 'string' ? body : err?.message}`,
+      );
+      return [];
+    }
+  }
+
   /** Kiểm tra app đã cài trên page và có field feed chưa. */
   async inspectPageWebhookSubscription(
     pageId: string,
@@ -1155,6 +1293,11 @@ export class FacebookOAuthService {
       };
     }
 
+    const cached = this.webhookSubCache.get(pageId);
+    if (cached && Date.now() < cached.expiresAt) {
+      return cached.data;
+    }
+
     try {
       const response = await got
         .get(
@@ -1172,22 +1315,33 @@ export class FacebookOAuthService {
       const fields = app?.subscribed_fields ?? [];
       const missingFields = required.filter((f) => !fields.includes(f));
 
-      return {
+      const result = {
         installed: !!app,
         subscribedFields: fields,
         feedSubscribed: missingFields.length === 0,
         missingFields,
       };
+      this.webhookSubCache.set(pageId, {
+        data: result,
+        expiresAt: Date.now() + FacebookOAuthService.INSPECT_CACHE_TTL_MS,
+      });
+      return result;
     } catch (err: any) {
       this.logger.warn(
         `inspectPageWebhookSubscription failed for page ${pageId}: ${err?.message ?? err}`,
       );
-      return {
+      const fallback = {
         installed: false,
         subscribedFields: [],
         feedSubscribed: false,
         missingFields: required,
       };
+      // Cache ngắn 60s khi lỗi
+      this.webhookSubCache.set(pageId, {
+        data: fallback,
+        expiresAt: Date.now() + 60_000,
+      });
+      return fallback;
     }
   }
 

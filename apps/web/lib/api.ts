@@ -203,8 +203,9 @@ export async function getMessages(type?: string) {
   return res.json() as Promise<{ data: WebhookMessage[] }>;
 }
 
-export async function syncComments(pageId: string) {
+export async function syncComments(pageId: string, force = false) {
   const qs = new URLSearchParams({ pageId });
+  if (force) qs.set('force', 'true');
   const res = await apiFetch(`${API_BASE}/conversations/sync-comments?${qs}`, {
     method: 'POST',
     cache: 'no-store',
@@ -235,6 +236,61 @@ export async function performCommentAction(
     );
   }
   return res.json() as Promise<{ data: { success: boolean } }>;
+}
+
+export interface SendThreadMessagePayload {
+  pageId: string;
+  threadId: string;
+  text?: string;
+  clientMessageId?: string;
+  commentId?: string;
+  replyToMessageId?: string;
+  attachment?: {
+    type: 'image' | 'video' | 'audio' | 'file';
+    url: string;
+  };
+}
+
+export interface SendThreadMessageAck {
+  ok: boolean;
+  clientMessageId: string | null;
+  fbMessageId?: string | null;
+  savedEventId?: string;
+  error?: string;
+}
+
+/** Gửi tin nhắn / bình luận qua HTTP (ổn định qua ngrok; không phụ thuộc Socket.IO). */
+export async function sendThreadMessage(
+  payload: SendThreadMessagePayload,
+): Promise<SendThreadMessageAck> {
+  const { threadId, ...body } = payload;
+  const res = await apiFetch(
+    `${API_BASE}/conversations/${encodeURIComponent(threadId)}/send`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+      cache: 'no-store',
+    },
+  );
+
+  if (!res.ok) {
+    const errBody = await res.json().catch(() => null);
+    const raw = (errBody as { message?: string | string[] })?.message;
+    const message = Array.isArray(raw)
+      ? raw.join(', ')
+      : (raw ?? 'Gửi tin nhắn thất bại');
+    return {
+      ok: false,
+      clientMessageId: payload.clientMessageId ?? null,
+      error: message,
+    };
+  }
+
+  const json = (await res.json()) as {
+    data: SendThreadMessageAck;
+  };
+  return json.data;
 }
 
 export interface FeedSyncedPayload {

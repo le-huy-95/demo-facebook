@@ -165,6 +165,7 @@ export class FacebookMessagingService {
         postId: parsed.postId!,
         customerId: parsed.senderId,
         requestedCommentId: input.commentId?.trim(),
+        threadRootCommentId: parsed.commentId,
         pageAccessToken,
       });
 
@@ -189,7 +190,7 @@ export class FacebookMessagingService {
           messageId: fbResp.id ?? null,
           postId: parsed.postId ?? null,
           commentId: fbResp.id ?? null,
-          parentCommentId: rootCommentId,
+          parentCommentId: parsed.commentId ?? targetCommentId ?? null,
           msgType: 'feed.comment.reply',
           content: replyText,
           rawPayload: JSON.stringify({
@@ -286,16 +287,39 @@ export class FacebookMessagingService {
     postId: string;
     customerId: string;
     requestedCommentId?: string;
+    threadRootCommentId?: string;
     pageAccessToken: string;
   }): Promise<string> {
     const candidates: string[] = [];
+    const trustedInboundIds = new Set<string>();
+
+    const pushCandidate = (id: string | null | undefined) => {
+      if (!id || !isValidFacebookCommentId(id)) return;
+      if (!candidates.includes(id)) candidates.push(id);
+    };
 
     if (
       input.requestedCommentId &&
       isValidFacebookCommentId(input.requestedCommentId)
     ) {
-      candidates.push(input.requestedCommentId);
+      const pageOwned = await this.prisma.webhookEvent.findFirst({
+        where: {
+          pageId: input.pageId,
+          eventType: 'FEED_COMMENT',
+          direction: 'OUT',
+          OR: [
+            { commentId: input.requestedCommentId },
+            { messageId: input.requestedCommentId },
+          ],
+        },
+        select: { id: true },
+      });
+      if (!pageOwned) {
+        pushCandidate(input.requestedCommentId);
+      }
     }
+
+    pushCandidate(input.threadRootCommentId);
 
     const inboundRows = await this.prisma.webhookEvent.findMany({
       where: {
@@ -312,7 +336,8 @@ export class FacebookMessagingService {
     });
     for (const row of inboundRows) {
       if (row.commentId && isValidFacebookCommentId(row.commentId)) {
-        candidates.push(row.commentId);
+        trustedInboundIds.add(row.commentId);
+        pushCandidate(row.commentId);
       }
     }
 
@@ -323,7 +348,7 @@ export class FacebookMessagingService {
       pageAccessToken: input.pageAccessToken,
     });
     if (graphFallback) {
-      candidates.push(graphFallback);
+      pushCandidate(graphFallback);
     }
 
     const seen = new Set<string>();
@@ -334,14 +359,28 @@ export class FacebookMessagingService {
       const meta = await this.facebookOAuth.getCommentMeta(
         id,
         input.pageAccessToken,
+        { postId: input.postId, silent: true },
       );
-      if (meta?.id) {
+      if (meta?.id && meta.fromId !== input.pageId) {
         if (id !== input.requestedCommentId) {
           this.logger.warn(
             `[Messaging] commentId ${input.requestedCommentId ?? 'none'} không hợp lệ, dùng ${meta.id}`,
           );
         }
         return meta.id;
+      }
+    }
+
+    for (const id of candidates) {
+      if (
+        trustedInboundIds.has(id) ||
+        id === input.threadRootCommentId ||
+        id === input.requestedCommentId
+      ) {
+        this.logger.warn(
+          `[Messaging] getCommentMeta thất bại, thử reply trực tiếp commentId=${id}`,
+        );
+        return id;
       }
     }
 

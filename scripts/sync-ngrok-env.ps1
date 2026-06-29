@@ -31,11 +31,11 @@ function Set-EnvLine {
 }
 
 # Cung 1 domain ngrok cho frontend UI + API (proxy) + Facebook OAuth/webhook
+# Socket.IO: trình duyệt dùng same-origin + Next rewrite /socket.io → Nest
 Set-EnvLine $envFile 'PUBLIC_BASE_URL' $baseUrl
 Set-EnvLine $envFile 'FRONTEND_URL' $baseUrl
 Set-EnvLine $envFile 'FACEBOOK_OAUTH_REDIRECT_URI' "$baseUrl/facebook-page/oauth/callback"
 Set-EnvLine $webEnvFile 'NEXT_PUBLIC_API_URL' $baseUrl
-Set-EnvLine $webEnvFile 'NEXT_PUBLIC_SOCKET_URL' $baseUrl
 
 Write-Host "Ngrok HTTPS (frontend + API): $baseUrl"
 Write-Host "Mo app: $baseUrl/login"

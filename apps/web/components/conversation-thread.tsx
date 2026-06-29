@@ -792,6 +792,7 @@ export const ThreadMessages = forwardRef<
     pageName,
     pagePictureUrl = null,
     selectedCommentId = null,
+    loading = false,
     hasMore = false,
     loadingMore = false,
     onLoadMore,

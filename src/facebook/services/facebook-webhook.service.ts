@@ -1,4 +1,4 @@
-import { BadRequestException, Injectable } from '@nestjs/common';
+import { BadRequestException, Injectable, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import type { WebhookEvent } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
@@ -30,6 +30,12 @@ type WebhookEventCreateData = Parameters<
 
 @Injectable()
 export class FacebookWebhookService implements OnModuleInit {
+  /** Cooldown map: pageId → timestamp khi sync cuối cùng kết thúc */
+  private readonly syncLastAt = new Map<string, number>();
+  /** Lock map: ngăn 2 sync cùng pageId chạy song song */
+  private readonly syncInProgress = new Set<string>();
+  private static readonly SYNC_COOLDOWN_MS = 30_000;
+
   constructor(
     private readonly logger: AppLogger,
     private readonly prisma: PrismaService,
@@ -111,16 +117,35 @@ export class FacebookWebhookService implements OnModuleInit {
 
       const changes = entry.changes ?? [];
       const changedFields = (entry.changed_fields ?? []) as string[];
-      let hasFeedActivity = changedFields.includes('feed');
+
+      // needsGraphFallback=true khi Meta chỉ báo changed_fields=feed mà không kèm payload
+      // (xảy ra khi include_values=true chưa được đặt hoặc Meta gửi summary-only notification).
+      // Khi có changes[].field='feed' với payload đầy đủ → xử lý inline, không cần gọi Graph API.
+      let needsGraphFallback = changedFields.includes('feed');
+
+      if (changes.length > 0) {
+        this.logger.log(
+          `[Webhook] entry.changes raw: ${JSON.stringify(changes)}`,
+        );
+      }
+      if (changedFields.length > 0) {
+        this.logger.log(
+          `[Webhook] entry.changed_fields: [${changedFields.join(',')}] changes.length=${changes.length}`,
+        );
+      }
 
       for (const change of changes) {
         const field = String(change.field ?? '');
         const value = (change.value ?? {}) as Record<string, unknown>;
 
         if (field === 'feed') {
-          hasFeedActivity = true;
+          // Có payload đầy đủ → xử lý inline, không cần Graph API fallback
+          needsGraphFallback = false;
           this.logger.log(
-            `[Webhook] feed change item=${String(value?.item ?? '')} verb=${String(value?.verb ?? '')} pageId=${pageId}`,
+            `[Webhook] feed change inline item=${String(value?.item ?? '')} verb=${String(value?.verb ?? '')} pageId=${pageId}`,
+          );
+          this.logger.log(
+            `[Webhook] feed change value: ${JSON.stringify(value)}`,
           );
           await this.processFeedChange(pageId, value);
           continue;
@@ -139,9 +164,16 @@ export class FacebookWebhookService implements OnModuleInit {
         );
       }
 
-      // Meta thường gửi changed_fields=feed không kèm changes[] — đồng bộ Graph làm lưới an toàn
-      if (hasFeedActivity) {
-        const syncResult = await this.syncFeedCommentsFromGraph(pageId);
+      // Fallback Graph API: chỉ gọi khi Meta báo feed activity nhưng KHÔNG có payload inline.
+      // Đây là cơ chế dự phòng (không phải polling) — chỉ chạy khi include_values chưa hoạt động.
+      if (needsGraphFallback) {
+        this.logger.log(
+          `[Webhook] changed_fields=feed nhưng không có changes[] payload → Graph API fallback pageId=${pageId}`,
+        );
+        const syncResult = await this.syncFeedCommentsFromGraph(pageId, true);
+        this.logger.log(
+          `[Webhook] Graph fallback done: ingested=${syncResult.ingested} threadIds=${JSON.stringify(syncResult.threadIds)}`,
+        );
         this.eventsGateway.emitFeedSynced(pageId, syncResult);
       }
     }
@@ -197,6 +229,9 @@ export class FacebookWebhookService implements OnModuleInit {
       this.logger.debug(
         `[Webhook] Duplicate skipped pageId=${data.pageId} messageId=${data.messageId} msgType=${data.msgType}`,
       );
+      this.logger.log(
+        `[DEBUG] saveAndBroadcast: DUPLICATE → vẫn emit socket. eventType=${data.eventType} id=${duplicate.id}`,
+      );
       // Vẫn broadcast để client không bỏ lỡ realtime (socket reconnect, tab mới, v.v.)
       this.eventsService.emitNewMessage(duplicate);
       this.eventsGateway.emitWebhookEvent(duplicate);
@@ -204,6 +239,9 @@ export class FacebookWebhookService implements OnModuleInit {
     }
 
     const saved = await this.prisma.webhookEvent.create({ data });
+    this.logger.log(
+      `[DEBUG] saveAndBroadcast: SAVED id=${saved.id} eventType=${saved.eventType} pageId=${saved.pageId} postId=${saved.postId} commentId=${saved.commentId} → emitting socket webhook:event`,
+    );
     await this.invalidateCachesForEvent(saved.pageId ?? '', saved);
     this.eventsService.emitNewMessage(saved);
     this.eventsGateway.emitWebhookEvent(saved);
@@ -545,11 +583,15 @@ export class FacebookWebhookService implements OnModuleInit {
 
     const parsed = transformFeedChange(value);
     if (!parsed) {
-      this.logger.debug(
-        `[Webhook] feed value bỏ qua item=${String(value?.item ?? '')} verb=${String(value?.verb ?? '')}`,
+      this.logger.warn(
+        `[DEBUG] processFeedChange: transformFeedChange trả null → DROP. item=${String(value?.item ?? '')} verb=${String(value?.verb ?? '')} value=${JSON.stringify(value)}`,
       );
       return;
     }
+
+    this.logger.log(
+      `[DEBUG] processFeedChange parsed OK: eventType=${parsed.eventType} item=${String(value?.item ?? '')} verb=${parsed.verb} senderId=${parsed.senderId} postId=${parsed.postId} commentId=${parsed.commentId} parentCommentId=${parsed.parentCommentId}`,
+    );
 
     const orgId = await this.resolveOrgId(pageId);
     const isPageAction = parsed.senderId === pageId;
@@ -588,27 +630,39 @@ export class FacebookWebhookService implements OnModuleInit {
     }
 
     let postId = parsed.postId;
+    this.logger.log(`[DEBUG] FEED_COMMENT: postId từ payload="${postId}" commentId="${parsed.commentId}" senderId="${parsed.senderId}" pageId="${pageId}"`);
+
     if (!postId && parsed.commentId && isValidFacebookCommentId(parsed.commentId)) {
+      this.logger.log(`[DEBUG] postId rỗng → gọi resolvePostIdFromComment commentId=${parsed.commentId}`);
       postId = await this.resolvePostIdFromComment(
         pageId,
         parsed.commentId,
         orgId,
       );
+      this.logger.log(`[DEBUG] resolvePostIdFromComment kết quả: postId="${postId}"`);
     }
 
     if (parsed.senderId === pageId) {
+      this.logger.log(`[DEBUG] senderId===pageId → processPageCommentReply`);
       await this.processPageCommentReply(pageId, parsed, postId, orgId, value);
       return;
     }
 
-    if (!parsed.senderId) return;
+    if (!parsed.senderId) {
+      this.logger.warn(`[DEBUG] DROP: parsed.senderId rỗng`);
+      return;
+    }
 
     if (!postId) {
       this.logger.warn(
-        `[Webhook] FEED_COMMENT thiếu postId, bỏ qua commentId=${parsed.commentId}`,
+        `[DEBUG] DROP: FEED_COMMENT thiếu postId, bỏ qua commentId=${parsed.commentId}. Payload: ${JSON.stringify(value)}`,
       );
       return;
     }
+
+    this.logger.log(
+      `[DEBUG] → saveAndBroadcast FEED_COMMENT IN pageId=${pageId} postId=${postId} senderId=${parsed.senderId} commentId=${parsed.commentId}`,
+    );
 
     await this.saveAndBroadcast({
       organizationId: orgId,
@@ -779,14 +833,48 @@ export class FacebookWebhookService implements OnModuleInit {
    * đồng bộ comment mới từ Graph — chỉ chạy khi nhận webhook, không phải polling.
    */
   /** Đồng bộ comment mới từ Graph (gọi từ webhook hoặc client khi tab Bình luận mở). */
-  async syncCommentsForPage(pageId: string): Promise<{
+  async syncCommentsForPage(
+    pageId: string,
+    force = false,
+  ): Promise<{
     ingested: number;
     threadIds: string[];
   }> {
-    return this.syncFeedCommentsFromGraph(pageId);
+    return this.syncFeedCommentsFromGraph(pageId, force);
   }
 
-  private async syncFeedCommentsFromGraph(pageId: string): Promise<{
+  /**
+   * @param force true khi được gọi từ webhook → bỏ qua cooldown nhưng vẫn giữ lock
+   *              (chỉ cooldown client polling, không cooldown webhook)
+   */
+  private async syncFeedCommentsFromGraph(
+    pageId: string,
+    force = false,
+  ): Promise<{
+    ingested: number;
+    threadIds: string[];
+  }> {
+    // Luôn giữ lock để tránh 2 sync chạy song song cho cùng page
+    if (this.syncInProgress.has(pageId)) {
+      return { ingested: 0, threadIds: [] };
+    }
+    // Cooldown chỉ áp dụng cho client polling (force=false)
+    if (!force) {
+      const last = this.syncLastAt.get(pageId) ?? 0;
+      if (Date.now() - last < FacebookWebhookService.SYNC_COOLDOWN_MS) {
+        return { ingested: 0, threadIds: [] };
+      }
+    }
+    this.syncInProgress.add(pageId);
+    try {
+      return await this._doSyncFeedCommentsFromGraph(pageId);
+    } finally {
+      this.syncLastAt.set(pageId, Date.now());
+      this.syncInProgress.delete(pageId);
+    }
+  }
+
+  private async _doSyncFeedCommentsFromGraph(pageId: string): Promise<{
     ingested: number;
     threadIds: string[];
   }> {

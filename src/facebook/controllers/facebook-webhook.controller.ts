@@ -227,7 +227,7 @@ export class FacebookWebhookController {
   @Post('subscribe')
   @ApiOperation({ summary: 'Đăng ký app-level webhook callback URL với Facebook và re-subscribe tất cả pages' })
   async subscribeWebhook() {
-    const appResult = await this.facebookOAuthService.subscribeAppWebhook();
+    const appResult = await this.facebookOAuth.subscribeAppWebhook();
 
     const base = this.configService
       .get<string>('PUBLIC_BASE_URL', 'http://localhost:3000')
@@ -251,7 +251,7 @@ export class FacebookWebhookController {
   @Get('subscriptions')
   @ApiOperation({ summary: 'Kiểm tra trạng thái đăng ký webhook hiện tại với Facebook' })
   async checkSubscriptions() {
-    const appSubs = await this.facebookOAuthService.getAppSubscriptions();
+    const appSubs = await this.facebookOAuth.getAppSubscriptions();
     const pageSubs = await this.facebookPageService.getPageSubscriptions();
 
     return {

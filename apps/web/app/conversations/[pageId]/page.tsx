@@ -24,7 +24,6 @@ import {
   initiateOAuth,
   performCommentAction,
   subscribeMessages,
-  syncComments,
   type CommentAction,
   type ConversationKind,
   type ConversationThread,
@@ -40,7 +39,6 @@ import {
   isValidFacebookCommentId,
   mergeThreadMessages,
   pickBetterSenderName,
-  pickDefaultReplyComment,
   resolveCustomerNameFromMessages,
   resolveThreadIdFromEvent,
 } from '@/lib/conversation';
@@ -241,6 +239,12 @@ export default function ConversationsPage() {
     threadMessagesRef.current?.scrollToComment(replyCommentId);
   }, [replyCommentId]);
 
+  const clearReplyComment = useCallback(() => {
+    setReplyCommentId(null);
+    setReplyPreview(null);
+    setReplyMentionName(null);
+  }, []);
+
   const shouldApplyConversationEvent = useCallback(
     (eventId: string): boolean => {
       const seen = seenConversationEventIdsRef.current;
@@ -341,15 +345,9 @@ export default function ConversationsPage() {
         setHasMoreMessages(false);
         setHighlightComment(undefined);
         setPostExpanded(false);
-
-        const commentId = event.commentId ?? event.messageId;
-        if (event.direction === 'IN' && isValidFacebookCommentId(commentId)) {
-          setReplyCommentId(commentId);
-          setReplyPreview(event.content ?? null);
-          setReplyMentionName(
-            pickBetterSenderName(event.senderName, thread.senderName),
-          );
-        }
+        setReplyCommentId(null);
+        setReplyPreview(null);
+        setReplyMentionName(null);
       }
     },
     [appendRealtimeMessage],
@@ -370,18 +368,6 @@ export default function ConversationsPage() {
       setMessages((prev) => mergeThreadMessages(prev, msgs));
       setMessagesCursor(paging.nextBefore);
       setHasMoreMessages(paging.hasMore);
-
-      if (threadId.startsWith('comment:')) {
-        const defaultReply = pickDefaultReplyComment(msgs, pageId);
-        setReplyCommentId(defaultReply.commentId);
-        setReplyPreview(defaultReply.preview);
-        if (defaultReply.commentId) {
-          const target = findCommentMessageById(msgs, defaultReply.commentId);
-          setReplyMentionName(pickBetterSenderName(target?.senderName, null));
-        } else {
-          setReplyMentionName(null);
-        }
-      }
     } catch {
       // bỏ qua lỗi refresh nền
     }
@@ -577,12 +563,6 @@ export default function ConversationsPage() {
       setReplyPreview(null);
       setReplyMentionName(null);
       setPostExpanded(false);
-      setUnreadMap((prev) => {
-        if (!prev[thread.id]) return prev;
-        const next = { ...prev };
-        delete next[thread.id];
-        return next;
-      });
 
       try {
         const { data: msgs, paging } = await getConversationMessages(
@@ -616,20 +596,6 @@ export default function ConversationsPage() {
         setMessages(msgs);
         setMessagesCursor(paging.nextBefore);
         setHasMoreMessages(paging.hasMore);
-
-        if (thread.kind === 'FEED_COMMENT') {
-          const defaultReply = pickDefaultReplyComment(msgs, pageId);
-          setReplyCommentId(defaultReply.commentId);
-          setReplyPreview(defaultReply.preview);
-          if (defaultReply.commentId) {
-            const target = findCommentMessageById(msgs, defaultReply.commentId);
-            setReplyMentionName(
-              pickBetterSenderName(target?.senderName, resolvedName),
-            );
-          } else {
-            setReplyMentionName(null);
-          }
-        }
 
         // Auto-detect postId from latest message (Messenger threads) so the post panel shows up without requiring a click.
         if (thread.kind !== 'FEED_COMMENT') {
@@ -722,11 +688,15 @@ export default function ConversationsPage() {
           isActiveContentStatus(msg.status) &&
           isValidFacebookCommentId(commentKey)
         ) {
-          setReplyCommentId(commentKey);
-          setReplyPreview(msg.content ?? null);
-          setReplyMentionName(
-            pickBetterSenderName(msg.senderName, selected.senderName),
-          );
+          if (replyCommentId === commentKey) {
+            clearReplyComment();
+          } else {
+            setReplyCommentId(commentKey);
+            setReplyPreview(getCommentPreviewText(msg));
+            setReplyMentionName(
+              pickBetterSenderName(msg.senderName, selected.senderName),
+            );
+          }
         }
       }
 
@@ -747,7 +717,14 @@ export default function ConversationsPage() {
         setPostLoading(false);
       }
     },
-    [pageId, extractPostIdFromText, selected?.kind, selected?.senderName],
+    [
+      pageId,
+      extractPostIdFromText,
+      selected?.kind,
+      selected?.senderName,
+      replyCommentId,
+      clearReplyComment,
+    ],
   );
 
   const handleReplyToComment = useCallback(
@@ -762,6 +739,11 @@ export default function ConversationsPage() {
         return;
       }
 
+      if (replyCommentId === commentKey) {
+        clearReplyComment();
+        return;
+      }
+
       setReplyCommentId(commentKey);
       setReplyPreview(getCommentPreviewText(msg));
       setReplyMentionName(
@@ -769,7 +751,13 @@ export default function ConversationsPage() {
       );
       void handleSelectMessage(msg);
     },
-    [pageId, selected?.senderName, handleSelectMessage],
+    [
+      pageId,
+      selected?.senderName,
+      handleSelectMessage,
+      replyCommentId,
+      clearReplyComment,
+    ],
   );
 
   const handleCommentAction = useCallback(
@@ -938,20 +926,6 @@ export default function ConversationsPage() {
     });
   }, [handleFeedSynced]);
 
-  // Meta thường không gửi webhook comment đầy đủ — đồng bộ Graph khi tab Bình luận đang mở
-  useEffect(() => {
-    if (activeTab !== 'FEED_COMMENT') return;
-
-    const runSync = () => {
-      if (document.visibilityState !== 'visible') return;
-      void syncComments(pageId).catch(() => undefined);
-    };
-
-    runSync();
-    const timer = window.setInterval(runSync, 5000);
-    return () => window.clearInterval(timer);
-  }, [activeTab, pageId]);
-
   useEffect(() => {
     return onContentRemoved((payload) => {
       if (payload.pageId !== pageId) return;
@@ -1053,26 +1027,7 @@ export default function ConversationsPage() {
         </div>
       )}
 
-      {!commentPermissionsOk && (
-        <div className="flex items-center gap-3 border-b border-[#fde68a] bg-[#fffbeb] px-4 py-3 text-sm text-[#92400e]">
-          <div className="min-w-0 flex-1">
-            <p className="font-semibold">Chưa đủ quyền quản lý bình luận</p>
-            <p className="mt-1 text-xs text-[#b45309]">
-              {missingCommentScopes.length > 0
-                ? `Thiếu quyền: ${missingCommentScopes.join(', ')}`
-                : 'Kết nối lại Facebook để cấp quyền đọc, phản hồi và quản lý bình luận.'}
-            </p>
-          </div>
-          <CommentHeaderIconButton
-            label="Kết nối lại Facebook để cấp quyền comment"
-            icon={<RefreshIcon className="h-5 w-5" />}
-            onClick={() => {
-              void reconnectFacebook();
-            }}
-          />
-        </div>
-      )}
-
+    
       <div className="grid min-h-0 flex-1 grid-cols-1 lg:grid-cols-[320px_1fr_280px]">
         <aside className="min-h-0 border-r border-[#e5e7eb]">
           <ConversationList
@@ -1173,7 +1128,6 @@ export default function ConversationsPage() {
                       pageId={pageId}
                       threadId={selected.id}
                       shopPictureUrl={pagePictureUrl}
-                      commentId={selected.commentId}
                       onSent={({ clientMessageId, text }) => {
                         const optimistic: WebhookMessage = {
                           id: clientMessageId,
@@ -1228,10 +1182,11 @@ export default function ConversationsPage() {
                       pageId={pageId}
                       threadId={selected.id}
                       shopPictureUrl={pagePictureUrl}
-                      commentId={replyCommentId ?? selected.commentId}
+                      commentId={replyCommentId}
                       replyPreview={replyTargetPreview}
                       replyMentionName={replyMentionName}
                       onReplyPreviewClick={scrollToReplyTarget}
+                      onClearReply={clearReplyComment}
                       iconOnlyActions
                       allowAttachments={false}
                       onSent={({ clientMessageId, text }) => {

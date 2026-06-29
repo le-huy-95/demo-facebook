@@ -5,6 +5,7 @@ import {
   MessageBody,
   ConnectedSocket,
 } from '@nestjs/websockets';
+import { Logger } from '@nestjs/common';
 import { Server, Socket } from 'socket.io';
 import type { WebhookEvent } from '@prisma/client';
 import { buildThreadId } from '../utils/conversation-thread.util';
@@ -20,6 +21,8 @@ import { EventsService } from '../services/events.service';
   transports: ['websocket', 'polling'],
 })
 export class EventsGateway {
+  private readonly logger = new Logger(EventsGateway.name);
+
   constructor(
     private readonly facebookMessaging: FacebookMessagingService,
     private readonly eventsService: EventsService,
@@ -35,6 +38,7 @@ export class EventsGateway {
   ): void {
     if (data?.threadId) {
       void client.join(`thread:${data.threadId}`);
+      this.logger.log(`[DEBUG] Socket ${client.id} joined room thread:${data.threadId}`);
     }
   }
 
@@ -55,6 +59,7 @@ export class EventsGateway {
   ): void {
     if (data?.pageId) {
       void client.join(`page:${data.pageId}`);
+      this.logger.log(`[DEBUG] Socket ${client.id} joined room page:${data.pageId}`);
     }
   }
 
@@ -65,6 +70,7 @@ export class EventsGateway {
   ): void {
     if (data?.pageId) {
       void client.leave(`page:${data.pageId}`);
+      this.logger.log(`[DEBUG] Socket ${client.id} left room page:${data.pageId}`);
     }
   }
 
@@ -87,8 +93,8 @@ export class EventsGateway {
   ) {
     try {
       const result = await this.facebookMessaging.sendToThread({
-        pageId: data?.pageId,
-        threadId: data?.threadId,
+        pageId: data?.pageId ?? '',
+        threadId: data?.threadId ?? '',
         text: data?.text,
         attachment: data?.attachment,
         commentId: data?.commentId,
@@ -118,9 +124,15 @@ export class EventsGateway {
   }
 
   emitWebhookEvent(event: WebhookEvent): void {
-    if (!this.server) return;
+    if (!this.server) {
+      this.logger.warn(`[DEBUG] emitWebhookEvent: server chưa sẵn sàng — bỏ qua id=${event.id}`);
+      return;
+    }
 
-    if (!event.pageId) return;
+    if (!event.pageId) {
+      this.logger.warn(`[DEBUG] emitWebhookEvent: pageId rỗng — bỏ qua id=${event.id}`);
+      return;
+    }
 
     const payload = {
       ...event,
@@ -130,11 +142,18 @@ export class EventsGateway {
           : event.createdAt,
     };
 
-    this.server.to(`page:${event.pageId}`).emit('webhook:event', payload);
-
     const threadId = buildThreadId(event);
-    if (threadId) {
-      this.server.to(`thread:${threadId}`).emit('webhook:event', payload);
+    const roomPage = `page:${event.pageId}`;
+    const roomThread = threadId ? `thread:${threadId}` : null;
+
+    this.logger.log(
+      `[DEBUG] emitWebhookEvent → socket room="${roomPage}" threadRoom="${roomThread ?? 'none'}" eventType=${event.eventType} id=${event.id}`,
+    );
+
+    this.server.to(roomPage).emit('webhook:event', payload);
+
+    if (roomThread) {
+      this.server.to(roomThread).emit('webhook:event', payload);
     }
   }
 

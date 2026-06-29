@@ -13,7 +13,7 @@ export function isValidFacebookCommentId(
   commentId: string | null | undefined,
 ): boolean {
   if (!commentId?.trim()) return false;
-  return /^\d+_\d+$/.test(commentId.trim());
+  return /^\d+(?:_\d+)+$/.test(commentId.trim());
 }
 
 export function pickBetterSenderName(
@@ -36,32 +36,59 @@ function parseRawPayload(
   }
 }
 
-/** Bổ sung postId/senderId từ rawPayload webhook khi DB thiếu field. */
+/** Bổ sung postId/senderId/parentCommentId từ rawPayload webhook khi DB thiếu field. */
 export function enrichEventForThread(event: WebhookMessage): WebhookMessage {
   if (event.eventType !== 'FEED_COMMENT') return event;
-  if (event.postId && event.senderId) return event;
+
+  const alreadyFull =
+    event.postId &&
+    event.senderId &&
+    (event.parentCommentId !== undefined || event.commentId);
+  if (alreadyFull) return event;
 
   const raw = parseRawPayload(event.rawPayload);
   if (!raw) return event;
 
   const from = (raw.from ?? {}) as { id?: string; name?: string };
+
   const postId =
     event.postId ??
     (typeof raw.post_id === 'string' ? raw.post_id : null) ??
     (typeof raw.parent_id === 'string' && /^\d+_\d+$/.test(raw.parent_id)
       ? raw.parent_id
       : null);
+
   const senderId = event.senderId ?? from.id ?? null;
 
-  if (!postId && !senderId) return event;
+  // Trích parent_id (bình luận cha) để tính rootCommentId đúng như backend
+  const parentIdRaw =
+    typeof raw.parent_id === 'string' && /^\d+_\d+$/.test(raw.parent_id)
+      ? raw.parent_id
+      : null;
+  const parentCommentId =
+    event.parentCommentId !== undefined
+      ? event.parentCommentId
+      : parentIdRaw;
+
+  if (!postId && !senderId && parentCommentId === event.parentCommentId) {
+    return event;
+  }
   return {
     ...event,
     postId: postId ?? event.postId,
     senderId: senderId ?? event.senderId,
     senderName: event.senderName ?? from.name ?? event.senderName,
+    parentCommentId: parentCommentId ?? event.parentCommentId,
   };
 }
 
+/**
+ * Tính threadId từ event — mirror CHÍNH XÁC logic backend `buildThreadId`.
+ *
+ * MESSENGER/POSTBACK : `messenger:{pageId}:{customerId}`
+ * FEED_COMMENT       : `comment:{pageId}:{postId}:{customerId}:{rootCommentId}`
+ *   rootCommentId = parentCommentId ?? commentId  (Facebook chỉ hỗ trợ 1 cấp nesting)
+ */
 export function buildThreadIdFromEvent(event: WebhookMessage): string | null {
   const enriched = enrichEventForThread(event);
   if (!enriched.pageId) return null;
@@ -79,8 +106,25 @@ export function buildThreadIdFromEvent(event: WebhookMessage): string | null {
   }
 
   if (enriched.eventType === 'FEED_COMMENT') {
-    if (!enriched.postId || !enriched.senderId) return null;
-    return `comment:${enriched.pageId}:${enriched.postId}:${enriched.senderId}`;
+    if (!enriched.postId) return null;
+
+    // rootCommentId: parentCommentId nếu là reply, commentId nếu là root comment
+    const rootCommentId = enriched.parentCommentId ?? enriched.commentId;
+    if (!rootCommentId) return null;
+
+    // customerId: bên gửi là khách (không phải page)
+    let customerId: string | null;
+    if (enriched.direction === 'OUT') {
+      customerId =
+        enriched.senderId && enriched.senderId !== enriched.pageId
+          ? enriched.senderId
+          : enriched.recipientId;
+    } else {
+      customerId = enriched.senderId;
+    }
+    if (!customerId || customerId === enriched.pageId) return null;
+
+    return `comment:${enriched.pageId}:${enriched.postId}:${customerId}:${rootCommentId}`;
   }
 
   return null;
@@ -133,6 +177,17 @@ export function findCommentMessageById(
   return messages.find((msg) => getMessageCommentKey(msg) === commentId);
 }
 
+/** rootCommentId nhúng trong threadId FEED_COMMENT. */
+export function parseRootCommentIdFromThreadId(
+  threadId: string | null | undefined,
+): string | null {
+  if (!threadId?.startsWith('comment:')) return null;
+  const parts = threadId.split(':');
+  if (parts.length < 5) return null;
+  const rootId = parts.slice(4).join(':');
+  return isValidFacebookCommentId(rootId) ? rootId : null;
+}
+
 /** Mặc định reply vào bình luận IN mới nhất của khách (không dùng comment OUT của Page). */
 export function pickDefaultReplyComment(
   messages: WebhookMessage[],
@@ -158,12 +213,31 @@ export function pickDefaultReplyComment(
   return { commentId: null, preview: null };
 }
 
+/** Target reply comment — ưu tiên IN mới nhất, fallback rootCommentId từ threadId. */
+export function resolveFeedCommentReplyTarget(
+  threadId: string,
+  messages: WebhookMessage[],
+  pageId: string,
+): { commentId: string | null; preview: string | null } {
+  const fromMessages = pickDefaultReplyComment(messages, pageId);
+  if (fromMessages.commentId) return fromMessages;
+
+  const rootId = parseRootCommentIdFromThreadId(threadId);
+  if (!rootId) return { commentId: null, preview: null };
+
+  const target = findCommentMessageById(messages, rootId);
+  return {
+    commentId: rootId,
+    preview: target?.content ?? null,
+  };
+}
+
 /** URL xem bình luận trên Facebook. */
 export function buildFacebookCommentUrl(
   commentId: string,
   postPermalinkUrl?: string | null,
 ): string {
-  const fbid = commentId.split('_')[1];
+  const fbid = commentId.split('_').at(-1);
   if (postPermalinkUrl && fbid) {
     const base = postPermalinkUrl.split('?')[0];
     return `${base}?comment_id=${fbid}`;

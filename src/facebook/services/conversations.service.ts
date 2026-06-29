@@ -98,12 +98,12 @@ export class ConversationsService {
 
     const beforeDate = parseDateCursor(options?.before);
     const eligible = beforeDate
-      ? sorted.filter(
+      ? allSorted.filter(
           (t) =>
             new Date(t.lastMessageAt).getTime() <
             beforeDate.getTime(),
         )
-      : sorted;
+      : allSorted;
 
     const hasMore = eligible.length > limit;
     const page = eligible.slice(0, limit);
@@ -409,7 +409,9 @@ export class ConversationsService {
           existing._latest = ts;
           existing.lastMessageAt = comment.created_time;
           existing.preview = comment.message ?? existing.preview;
-          existing.commentId = comment.id;
+          if (senderId !== pageId) {
+            existing.commentId = comment.id;
+          }
           if (comment.from?.name && !isGenericSenderName(comment.from.name)) {
             existing.senderName = comment.from.name;
           }
