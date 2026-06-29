@@ -36,8 +36,58 @@ function parseRawPayload(
   }
 }
 
+function normalizeFbPostId(raw: string): string | null {
+  if (/^\d+_\d+$/.test(raw)) return raw;
+  const m = raw.match(/(\d+_\d+)/);
+  return m?.[1] ?? (/^\d+$/.test(raw) ? raw : null);
+}
+
+/** Trích postId quảng cáo từ rawPayload Messenger (referral). */
+export function extractMessengerPostIdFromRaw(
+  raw: Record<string, unknown>,
+): string | null {
+  const referral =
+    raw.referral ??
+    (raw.message as Record<string, unknown> | undefined)?.referral ??
+    (raw.postback as Record<string, unknown> | undefined)?.referral;
+
+  if (referral && typeof referral === 'object') {
+    const ref = referral as Record<string, unknown>;
+    const adsPostId = (ref.ads_context_data as Record<string, unknown> | undefined)
+      ?.post_id;
+    if (typeof adsPostId === 'string' && adsPostId.trim()) {
+      const normalized = normalizeFbPostId(adsPostId.trim());
+      if (normalized) return normalized;
+    }
+    const rawRef = ref.ref ?? ref.ad_id;
+    if (typeof rawRef === 'string' && rawRef.trim()) {
+      const normalized = normalizeFbPostId(rawRef.trim());
+      if (normalized) return normalized;
+    }
+  }
+  return null;
+}
+
+export function getRealtimeEventKey(event: WebhookMessage): string {
+  if (event.messageId) return `mid:${event.messageId}`;
+  if (event.commentId) return `cid:${event.commentId}`;
+  return `id:${event.id}`;
+}
+
 /** Bổ sung postId/senderId/parentCommentId từ rawPayload webhook khi DB thiếu field. */
 export function enrichEventForThread(event: WebhookMessage): WebhookMessage {
+  const raw = parseRawPayload(event.rawPayload);
+
+  if (
+    event.eventType === 'MESSENGER' ||
+    event.eventType === 'MESSENGER_POSTBACK'
+  ) {
+    if (event.postId) return event;
+    const postFromRaw = raw ? extractMessengerPostIdFromRaw(raw) : null;
+    if (!postFromRaw) return event;
+    return { ...event, postId: postFromRaw };
+  }
+
   if (event.eventType !== 'FEED_COMMENT') return event;
 
   const alreadyFull =
@@ -46,7 +96,6 @@ export function enrichEventForThread(event: WebhookMessage): WebhookMessage {
     (event.parentCommentId !== undefined || event.commentId);
   if (alreadyFull) return event;
 
-  const raw = parseRawPayload(event.rawPayload);
   if (!raw) return event;
 
   const from = (raw.from ?? {}) as { id?: string; name?: string };
@@ -59,8 +108,8 @@ export function enrichEventForThread(event: WebhookMessage): WebhookMessage {
       : null);
 
   const senderId = event.senderId ?? from.id ?? null;
+  const resolvedPostId = postId ?? event.postId ?? null;
 
-  // Trích parent_id (bình luận cha) để tính rootCommentId đúng như backend
   const parentIdRaw =
     typeof raw.parent_id === 'string' && /^\d+_\d+$/.test(raw.parent_id)
       ? raw.parent_id
@@ -68,7 +117,9 @@ export function enrichEventForThread(event: WebhookMessage): WebhookMessage {
   const parentCommentId =
     event.parentCommentId !== undefined
       ? event.parentCommentId
-      : parentIdRaw;
+      : parentIdRaw && parentIdRaw !== resolvedPostId
+        ? parentIdRaw
+        : null;
 
   if (!postId && !senderId && parentCommentId === event.parentCommentId) {
     return event;
@@ -85,9 +136,8 @@ export function enrichEventForThread(event: WebhookMessage): WebhookMessage {
 /**
  * Tính threadId từ event — mirror CHÍNH XÁC logic backend `buildThreadId`.
  *
- * MESSENGER/POSTBACK : `messenger:{pageId}:{customerId}`
+ * MESSENGER/POSTBACK : `messenger:{pageId}:{customerId}` hoặc `...:{postId}` (quảng cáo)
  * FEED_COMMENT       : `comment:{pageId}:{postId}:{customerId}:{rootCommentId}`
- *   rootCommentId = parentCommentId ?? commentId  (Facebook chỉ hỗ trợ 1 cấp nesting)
  */
 export function buildThreadIdFromEvent(event: WebhookMessage): string | null {
   const enriched = enrichEventForThread(event);
@@ -102,6 +152,10 @@ export function buildThreadIdFromEvent(event: WebhookMessage): string | null {
         ? enriched.recipientId
         : enriched.senderId;
     if (!customerId) return null;
+    const postId = enriched.postId?.trim();
+    if (postId) {
+      return `messenger:${enriched.pageId}:${customerId}:${postId}`;
+    }
     return `messenger:${enriched.pageId}:${customerId}`;
   }
 

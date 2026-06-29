@@ -297,7 +297,7 @@ export class FacebookMessagingService {
         senderName: 'Page',
         recipientId: parsed.senderId,
         messageId: fbResp.message_id ?? null,
-        postId: null,
+        postId: parsed.postId ?? null,
         commentId: null,
         msgType,
         content: attachment ? content : text,

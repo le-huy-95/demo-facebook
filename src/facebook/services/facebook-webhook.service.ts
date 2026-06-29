@@ -15,6 +15,7 @@ import {
 } from '../utils/facebook-payload.util';
 import { transformFeedChange, extractFeedCommentKey, extractFeedPostKey, type FeedEventTransform } from '../utils/facebook-feed.util';
 import { buildThreadId } from '../utils/conversation-thread.util';
+import { extractPostIdFromMessengerPayload } from '../utils/messenger-thread.util';
 import { isValidFacebookCommentId } from '../utils/facebook-comment-id.util';
 import {
   EVENT_STATUS_ACTIVE,
@@ -218,7 +219,7 @@ export class FacebookWebhookService implements OnModuleInit {
       where: {
         pageId: data.pageId,
         messageId: data.messageId,
-        msgType: data.msgType ?? undefined,
+        eventType: { in: ['MESSENGER', 'MESSENGER_POSTBACK'] },
       },
     });
   }
@@ -232,7 +233,7 @@ export class FacebookWebhookService implements OnModuleInit {
       this.logger.log(
         `[DEBUG] saveAndBroadcast: DUPLICATE → vẫn emit socket. eventType=${data.eventType} id=${duplicate.id}`,
       );
-      // Vẫn broadcast để client không bỏ lỡ realtime (socket reconnect, tab mới, v.v.)
+      await this.invalidateCachesForEvent(duplicate.pageId ?? '', duplicate);
       this.eventsService.emitNewMessage(duplicate);
       this.eventsGateway.emitWebhookEvent(duplicate);
       return duplicate;
@@ -404,10 +405,15 @@ export class FacebookWebhookService implements OnModuleInit {
       return;
     }
 
-    const postId = this.extractPostIdFromMessagingEvent(event);
+    const extractedPostId = this.extractPostIdFromMessagingEvent(event);
     const resolvedOrgId = await this.resolveOrgId(pageId);
 
     if (event.postback) {
+      const postId = await this.resolveMessengerPostIdForEvent(
+        pageId,
+        event.sender?.id ?? '',
+        extractedPostId,
+      );
       await this.saveAndBroadcast({
         organizationId: resolvedOrgId,
         pageId,
@@ -438,6 +444,11 @@ export class FacebookWebhookService implements OnModuleInit {
     const messageId: string = event.message?.mid ?? '';
     const conversationId = isEcho ? recipientId : senderId;
     const direction = isEcho ? 'OUT' : 'IN';
+    const postId = await this.resolveMessengerPostIdForEvent(
+      pageId,
+      conversationId,
+      extractedPostId,
+    );
 
     const { msgType, content, contentRaw, lastMessagePreview } =
       transformInboundMessage(event);
@@ -505,45 +516,37 @@ export class FacebookWebhookService implements OnModuleInit {
   }
 
   private extractPostIdFromMessagingEvent(event: any): string | null {
-    const referral =
-      event?.referral ?? event?.message?.referral ?? event?.postback?.referral;
+    return extractPostIdFromMessengerPayload(event);
+  }
 
-    if (referral) {
-      const adsPostId = referral?.ads_context_data?.post_id;
-      if (typeof adsPostId === 'string' && adsPostId) {
-        if (/^\d+_\d+$/.test(adsPostId)) return adsPostId;
-        const m = adsPostId.match(/(\d+_\d+)/);
-        if (m?.[1]) return m[1];
-        if (/^\d+$/.test(adsPostId)) return adsPostId;
-      }
+  /**
+   * Gắn tin nhắn vào thread quảng cáo đúng:
+   * - Có referral/post_id trong webhook → dùng ngay
+   * - Tin tiếp theo không có referral → kế thừa postId inbound gần nhất (7 ngày)
+   */
+  private async resolveMessengerPostIdForEvent(
+    pageId: string,
+    customerPsid: string,
+    fromWebhook: string | null,
+  ): Promise<string | null> {
+    if (fromWebhook?.trim()) return fromWebhook.trim();
+    if (!customerPsid?.trim()) return null;
 
-      const rawRef: unknown = referral?.ref ?? referral?.ad_id ?? null;
-      if (typeof rawRef === 'string' && rawRef) {
-        if (/^\d+_\d+$/.test(rawRef)) return rawRef;
-        const m = rawRef.match(/(\d+_\d+)/);
-        if (m?.[1]) return m[1];
-      }
-    }
+    const cutoff = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+    const recent = await this.prisma.webhookEvent.findFirst({
+      where: {
+        pageId,
+        eventType: { in: ['MESSENGER', 'MESSENGER_POSTBACK'] },
+        direction: 'IN',
+        senderId: customerPsid,
+        postId: { not: null },
+        createdAt: { gte: cutoff },
+      },
+      orderBy: { createdAt: 'desc' },
+      select: { postId: true },
+    });
 
-    const url: unknown =
-      event?.message?.attachments?.[0]?.payload?.url ??
-      event?.message?.attachments?.[0]?.url ??
-      null;
-
-    if (typeof url === 'string' && url) {
-      try {
-        const u = new URL(url);
-        const storyFbid = u.searchParams.get('story_fbid');
-        const id = u.searchParams.get('id');
-        if (storyFbid && id) {
-          return `${id}_${storyFbid}`;
-        }
-      } catch {
-        // ignore invalid URL
-      }
-    }
-
-    return null;
+    return recent?.postId ?? null;
   }
 
   private async processFeedChange(

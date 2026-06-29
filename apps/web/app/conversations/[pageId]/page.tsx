@@ -36,6 +36,7 @@ import {
   buildThreadFromEvent,
   enrichEventForThread,
   findCommentMessageById,
+  getRealtimeEventKey,
   isValidFacebookCommentId,
   mergeThreadMessages,
   pickBetterSenderName,
@@ -247,11 +248,12 @@ export default function ConversationsPage() {
   }, []);
 
   const shouldApplyConversationEvent = useCallback(
-    (eventId: string): boolean => {
+    (event: WebhookMessage): boolean => {
+      const key = getRealtimeEventKey(event);
       const seen = seenConversationEventIdsRef.current;
-      if (seen.has(eventId)) return false;
+      if (seen.has(key)) return false;
 
-      seen.add(eventId);
+      seen.add(key);
       if (seen.size > 500) {
         const oldest = seen.values().next().value;
         if (oldest) seen.delete(oldest);
@@ -428,7 +430,7 @@ export default function ConversationsPage() {
 
   const updateConversationFromEvent = useCallback(
     (event: WebhookMessage, threadId: string, reloadMissing: boolean) => {
-      if (isReceiptMessage(event) || !shouldApplyConversationEvent(event.id))
+      if (isReceiptMessage(event) || !shouldApplyConversationEvent(event))
         return;
 
       setConversations((prev) => {

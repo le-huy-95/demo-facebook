@@ -1,6 +1,10 @@
 import type { Prisma, WebhookEvent } from '@prisma/client';
 import { isMessagingReceiptMsgType } from './facebook-payload.util';
 import { isVisibleEvent } from './event-visibility.util';
+import {
+  buildMessengerThreadId,
+  parseMessengerThreadParts,
+} from './messenger-thread.util';
 
 export type ConversationKind = 'MESSENGER' | 'FEED_COMMENT';
 
@@ -57,7 +61,7 @@ export function buildThreadId(event: WebhookEvent): string | null {
     const customerId =
       event.direction === 'OUT' ? event.recipientId : event.senderId;
     if (!customerId) return null;
-    return `messenger:${event.pageId}:${customerId}`;
+    return buildMessengerThreadId(event.pageId, customerId, event.postId);
   }
 
   if (event.eventType === 'FEED_COMMENT') {
@@ -92,11 +96,13 @@ export function parseThreadId(threadId: string): {
   commentId?: string;
 } | null {
   const parts = threadId.split(':');
-  if (parts[0] === 'messenger' && parts.length >= 3) {
+  const messenger = parseMessengerThreadParts(parts);
+  if (messenger) {
     return {
       kind: 'MESSENGER',
-      pageId: parts[1],
-      senderId: parts.slice(2).join(':'),
+      pageId: messenger.pageId,
+      senderId: messenger.senderId,
+      postId: messenger.postId,
     };
   }
   if (parts[0] === 'comment' && parts.length >= 5) {
@@ -140,10 +146,26 @@ export function buildThreadEventWhere(
   };
 
   if (parsed.kind === 'MESSENGER') {
+    const customerFilter: Prisma.WebhookEventWhereInput = {
+      OR: [{ senderId: parsed.senderId }, { recipientId: parsed.senderId }],
+    };
+
+    if (parsed.postId) {
+      return {
+        ...base,
+        eventType: { in: ['MESSENGER', 'MESSENGER_POSTBACK'] },
+        AND: [customerFilter, { postId: parsed.postId }],
+      };
+    }
+
+    // Thread direct / legacy (không gắn quảng cáo)
     return {
       ...base,
       eventType: { in: ['MESSENGER', 'MESSENGER_POSTBACK'] },
-      OR: [{ senderId: parsed.senderId }, { recipientId: parsed.senderId }],
+      AND: [
+        customerFilter,
+        { OR: [{ postId: null }, { postId: '' }] },
+      ],
     };
   }
 

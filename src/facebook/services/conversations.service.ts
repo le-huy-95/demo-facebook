@@ -608,6 +608,8 @@ export class ConversationsService {
     limit: number,
     before?: string,
   ): Promise<ThreadMessagesPage> {
+    const parsed = parseThreadId(threadId);
+    const adPostId = parsed?.postId;
     const token = await this.getPageAccessToken(pageId, orgId);
 
     let graphEvents: ConversationMessage[] = [];
@@ -625,9 +627,16 @@ export class ConversationsService {
           { limit, before },
         );
 
-      graphEvents = messages.map((msg) =>
-        this.graphMessageToEvent(msg, pageId, customerPsid, orgId),
-      );
+      graphEvents = messages
+        .map((msg) =>
+          this.graphMessageToEvent(msg, pageId, customerPsid, orgId),
+        )
+        .filter((msg) => {
+          if (!adPostId) {
+            return !msg.postId;
+          }
+          return msg.postId === adPostId;
+        });
 
       const hasMore = messages.length >= limit && !!paging?.cursors?.before;
       graphPaging = {
