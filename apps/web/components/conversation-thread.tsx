@@ -941,8 +941,8 @@ export const ThreadMessages = forwardRef<
 
       {showFeedCommentBanner && (
         <div className="border-b border-[#a7f3d0] bg-[#ecfdf5] px-4 py-2 text-xs text-[#047857]">
-          Bạn đang phản hồi bình luận của người dùng về bài viết trên Trang của
-          mình.
+          Bạn có thể viết bình luận mới trên bài viết hoặc chọn một bình luận
+          để trả lời.
         </div>
       )}
 

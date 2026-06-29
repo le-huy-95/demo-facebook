@@ -1560,6 +1560,51 @@ export class FacebookOAuthService {
     }
   }
 
+  /** Bình luận mới trực tiếp trên bài viết (không phải reply). */
+  async createPostComment(
+    postId: string,
+    pageAccessToken: string,
+    message: string,
+  ): Promise<CreateCommentResponse> {
+    if (!postId?.trim()) {
+      throw new BadRequestException('Missing postId');
+    }
+    if (!pageAccessToken?.trim()) {
+      throw new BadRequestException('Missing pageAccessToken');
+    }
+    if (!message?.trim()) {
+      throw new BadRequestException('Comment message is empty');
+    }
+
+    try {
+      return await got
+        .post(
+          `https://graph.facebook.com/${this.graphApiVersion}/${postId}/comments`,
+          {
+            searchParams: {
+              access_token: pageAccessToken,
+              message,
+            },
+            timeout: { request: 15_000 },
+          },
+        )
+        .json<CreateCommentResponse>();
+    } catch (err: any) {
+      const body = err?.response?.body;
+      const fbError =
+        typeof body === 'string'
+          ? body.startsWith('{')
+            ? JSON.parse(body)
+            : { message: body }
+          : body;
+      this.logger.error(
+        `Failed to create post comment on ${postId}`,
+        fbError ?? err.message,
+      );
+      throw this.mapFbError(fbError?.error);
+    }
+  }
+
   async replyToComment(
     commentId: string,
     pageAccessToken: string,

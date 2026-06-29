@@ -186,7 +186,10 @@ export class ConversationsController {
   }
 
   @Post(':threadId/send')
-  @ApiOperation({ summary: 'Gửi tin nhắn Messenger hoặc trả lời bình luận' })
+  @ApiOperation({
+    summary:
+      'Gửi tin nhắn Messenger, bình luận mới trên bài viết, hoặc trả lời bình luận (có commentId)',
+  })
   async sendInThread(
     @Param('threadId') threadId: string,
     @Body()

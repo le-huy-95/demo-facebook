@@ -155,27 +155,75 @@ export class FacebookMessagingService {
         orgId,
         'MODERATE',
       );
-      const replyText = text;
-      if (!replyText) {
-        throw new BadRequestException('Reply text is required for comments');
+      const commentText = text;
+      if (!commentText) {
+        throw new BadRequestException('Comment text is required');
+      }
+      if (!parsed.postId) {
+        throw new BadRequestException('Thiếu postId cho bình luận');
       }
 
-      const targetCommentId = await this.resolveValidReplyTargetCommentId({
-        pageId,
-        postId: parsed.postId!,
-        customerId: parsed.senderId,
-        requestedCommentId: input.commentId?.trim(),
-        threadRootCommentId: parsed.commentId,
-        pageAccessToken,
-      });
+      const requestedCommentId = input.commentId?.trim() || undefined;
+
+      if (requestedCommentId) {
+        const targetCommentId = await this.resolveValidReplyTargetCommentId({
+          pageId,
+          postId: parsed.postId,
+          customerId: parsed.senderId,
+          requestedCommentId,
+          threadRootCommentId: parsed.commentId,
+          pageAccessToken,
+        });
+
+        this.logger.log(
+          `[Messaging] Replying to comment ${targetCommentId} on post ${parsed.postId} for customer ${parsed.senderId}`,
+        );
+        const fbResp = await this.facebookOAuth.replyToComment(
+          targetCommentId,
+          pageAccessToken,
+          commentText,
+        );
+
+        const saved = await this.prisma.webhookEvent.create({
+          data: {
+            organizationId: orgId,
+            pageId,
+            eventType: 'FEED_COMMENT',
+            direction: 'OUT',
+            senderId: parsed.senderId,
+            senderName: 'Page',
+            recipientId: pageId,
+            messageId: fbResp.id ?? null,
+            postId: parsed.postId,
+            commentId: fbResp.id ?? null,
+            parentCommentId: parsed.commentId ?? targetCommentId ?? null,
+            msgType: 'feed.comment.reply',
+            content: commentText,
+            rawPayload: JSON.stringify({
+              source: 'socket_send',
+              clientMessageId: input.clientMessageId ?? null,
+              targetCommentId,
+              fb: fbResp,
+            }),
+          },
+        });
+
+        await this.redisCache.bumpPageRevision(orgId, pageId);
+        await this.redisCache.bumpThreadRevision(pageId, threadId);
+
+        return {
+          savedEvent: saved,
+          fb: { recipientId: undefined, messageId: fbResp.id },
+        };
+      }
 
       this.logger.log(
-        `[Messaging] Replying to comment ${targetCommentId} on post ${parsed.postId} for customer ${parsed.senderId}`,
+        `[Messaging] Creating post comment on ${parsed.postId} for customer thread ${parsed.senderId}`,
       );
-      const fbResp = await this.facebookOAuth.replyToComment(
-        targetCommentId,
+      const fbResp = await this.facebookOAuth.createPostComment(
+        parsed.postId,
         pageAccessToken,
-        replyText,
+        commentText,
       );
 
       const saved = await this.prisma.webhookEvent.create({
@@ -188,15 +236,15 @@ export class FacebookMessagingService {
           senderName: 'Page',
           recipientId: pageId,
           messageId: fbResp.id ?? null,
-          postId: parsed.postId ?? null,
+          postId: parsed.postId,
           commentId: fbResp.id ?? null,
-          parentCommentId: parsed.commentId ?? targetCommentId ?? null,
-          msgType: 'feed.comment.reply',
-          content: replyText,
+          parentCommentId: null,
+          msgType: 'feed.comment',
+          content: commentText,
           rawPayload: JSON.stringify({
             source: 'socket_send',
             clientMessageId: input.clientMessageId ?? null,
-            targetCommentId,
+            mode: 'post_comment',
             fb: fbResp,
           }),
         },

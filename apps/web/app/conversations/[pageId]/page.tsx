@@ -182,6 +182,7 @@ export default function ConversationsPage() {
   const [loading, setLoading] = useState(true);
   const [postLoading, setPostLoading] = useState(false);
   const [messagesLoading, setMessagesLoading] = useState(false);
+  const [threadLoadError, setThreadLoadError] = useState<string | null>(null);
   const [loadingMoreMessages, setLoadingMoreMessages] = useState(false);
   const [hasMoreMessages, setHasMoreMessages] = useState(false);
   const [messagesCursor, setMessagesCursor] = useState<string | null>(null);
@@ -563,6 +564,7 @@ export default function ConversationsPage() {
       setReplyPreview(null);
       setReplyMentionName(null);
       setPostExpanded(false);
+      setThreadLoadError(null);
 
       try {
         const { data: msgs, paging } = await getConversationMessages(
@@ -628,6 +630,14 @@ export default function ConversationsPage() {
             setPost(null);
           }
         }
+      } catch (err) {
+        if (threadLoadSeqRef.current !== loadSeq) return;
+        setMessages([]);
+        setMessagesCursor(null);
+        setHasMoreMessages(false);
+        setThreadLoadError(
+          err instanceof Error ? err.message : 'Không tải được tin nhắn',
+        );
       } finally {
         if (threadLoadSeqRef.current === loadSeq) setMessagesLoading(false);
       }
@@ -657,7 +667,9 @@ export default function ConversationsPage() {
   const handleTabChange = useCallback(
     (tab: ConversationKind) => {
       setActiveTab(tab);
-      const first = conversations.find((c) => c.kind === tab);
+      const first = conversations.find(
+        (c) => c.kind === tab && c.pageId === pageId,
+      );
       if (first) {
         void loadThread(first);
         return;
@@ -668,7 +680,7 @@ export default function ConversationsPage() {
       setMessagesCursor(null);
       setHasMoreMessages(false);
     },
-    [conversations, loadThread],
+    [conversations, loadThread, pageId],
   );
 
   const handleSelectMessage = useCallback(
@@ -1086,6 +1098,11 @@ export default function ConversationsPage() {
                   }
                 }}
               >
+                {threadLoadError && (
+                  <div className="border-b border-[#fecaca] bg-[#fef2f2] px-4 py-2 text-sm text-[#991b1b]">
+                    {threadLoadError}
+                  </div>
+                )}
                 <ThreadMessages
                   ref={threadMessagesRef}
                   messages={messages}
@@ -1190,6 +1207,7 @@ export default function ConversationsPage() {
                       iconOnlyActions
                       allowAttachments={false}
                       onSent={({ clientMessageId, text }) => {
+                        const isReply = Boolean(replyCommentId);
                         const optimistic: WebhookMessage = {
                           id: clientMessageId,
                           organizationId: null,
@@ -1202,7 +1220,9 @@ export default function ConversationsPage() {
                           messageId: null,
                           postId: selected.postId,
                           commentId: null,
-                          msgType: 'feed.comment.reply',
+                          msgType: isReply
+                            ? 'feed.comment.reply'
+                            : 'feed.comment',
                           content: text,
                           rawPayload: JSON.stringify({
                             source: 'optimistic',

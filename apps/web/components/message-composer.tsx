@@ -219,7 +219,6 @@ export function MessageComposer({
     if (!trimmed || sending || disabled) return;
 
     const isCommentThread = threadId.startsWith('comment:');
-    if (isCommentThread && !commentId) return;
 
     const clientMessageId = `client-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     setSending(true);
@@ -333,10 +332,8 @@ export function MessageComposer({
 
   const isReplyingComment = Boolean(commentId);
   const isReplyingMessage = Boolean(replyToMessageId);
-  const isReplying = isReplyingComment || isReplyingMessage;
   const isCommentThread = threadId.startsWith('comment:');
-  const needsCommentSelection = isCommentThread && !commentId;
-  const canSend = Boolean(text.trim()) && !needsCommentSelection;
+  const canSend = Boolean(text.trim());
 
   return (
     <div className="space-y-2">
@@ -405,7 +402,7 @@ export function MessageComposer({
               commentId
                 ? 'Trả lời bình luận... (Enter để gửi)'
                 : isCommentThread
-                  ? 'Chọn bình luận để trả lời...'
+                  ? 'Viết bình luận mới trên bài viết... (Enter để gửi)'
                   : 'Nhập tin nhắn... (Enter để gửi, Shift+Enter xuống dòng)'
             }
             className="min-h-[44px] flex-1 resize-none rounded-xl border border-[#e5e7eb] bg-white px-4 py-3 text-sm text-[#111827] outline-none ring-[#3b82f6] focus:ring-2 disabled:bg-[#f3f4f6]"
@@ -417,7 +414,11 @@ export function MessageComposer({
                   ? 'Đang gửi'
                   : uploading
                     ? 'Đang upload'
-                    : 'Gửi bình luận'
+                    : commentId
+                      ? 'Gửi phản hồi'
+                      : isCommentThread
+                        ? 'Gửi bình luận mới'
+                        : 'Gửi'
               }
               icon={<SendIcon className="h-5 w-5" />}
               onClick={handleSend}

@@ -1,7 +1,8 @@
-/** Kết nối thẳng Nest (NEXT_PUBLIC_API_URL) — tránh Next.js proxy làm hỏng SSE. */
+/** Browser: same-origin → Next.js rewrite → Nest. SSR: env hoặc localhost. */
 export const API_BASE =
-  process.env.NEXT_PUBLIC_API_URL ??
-  (typeof window !== 'undefined' ? '' : 'http://localhost:3000');
+  typeof window !== 'undefined'
+    ? ''
+    : (process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:3000');
 
 const API_HEADERS: HeadersInit = {
   'ngrok-skip-browser-warning': 'true',
@@ -166,6 +167,24 @@ export async function getConversations(
   }>;
 }
 
+async function readApiErrorMessage(
+  res: Response,
+  fallback: string,
+): Promise<string> {
+  try {
+    const body = (await res.json()) as {
+      message?: string | string[];
+      error?: string;
+    };
+    const raw = body.message ?? body.error;
+    if (Array.isArray(raw)) return raw.join(', ');
+    if (typeof raw === 'string' && raw.trim()) return raw;
+  } catch {
+    // ignore non-JSON body
+  }
+  return fallback;
+}
+
 export async function getConversationMessages(
   pageId: string,
   threadId: string,
@@ -179,7 +198,9 @@ export async function getConversationMessages(
     `${API_BASE}/conversations/${encodeURIComponent(threadId)}/messages?${qs}`,
     { cache: 'no-store' },
   );
-  if (!res.ok) throw new Error('Không tải được tin nhắn');
+  if (!res.ok) {
+    throw new Error(await readApiErrorMessage(res, 'Không tải được tin nhắn'));
+  }
   return res.json() as Promise<{
     data: WebhookMessage[];
     paging: MessagesPaging;
