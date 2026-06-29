@@ -1,4 +1,5 @@
 import {
+  ForbiddenException,
   BadRequestException,
   Injectable,
   NotFoundException,
@@ -35,6 +36,7 @@ export class FacebookMessagingService {
   private async resolvePageAccessToken(
     pageId: string,
     orgId: string,
+    requiredTask?: 'MODERATE' | 'CREATE_CONTENT',
   ): Promise<string> {
     const pages = await this.facebookRepo.listPages(orgId);
     const page = pages.find((p) => p.pageId === pageId);
@@ -43,6 +45,26 @@ export class FacebookMessagingService {
         'Fanpage chưa liên kết hoặc thiếu page access token',
       );
     }
+
+    if (requiredTask) {
+      let tasks: string[] = [];
+      try {
+        tasks = JSON.parse((page as any).tasks ?? '[]');
+      } catch {
+        tasks = [];
+      }
+      const normalized = tasks.map((t) => String(t).toUpperCase());
+      const hasAllowedTask =
+        normalized.includes('MANAGE') ||
+        normalized.includes(requiredTask) ||
+        (requiredTask === 'MODERATE' && normalized.includes('CREATE_CONTENT'));
+      if (!hasAllowedTask) {
+        throw new ForbiddenException(
+          `Tài khoản Facebook hiện không có task phù hợp trên Page để phản hồi bình luận. Required=${requiredTask}, current=[${normalized.join(', ') || 'none'}]. Vui lòng liên kết lại bằng tài khoản có quyền MANAGE/MODERATE.`,
+        );
+      }
+    }
+
     return page.pageAccessToken;
   }
 
@@ -96,6 +118,7 @@ export class FacebookMessagingService {
     text?: string;
     attachment?: OutboundAttachment;
     commentId?: string;
+    replyToMessageId?: string;
     clientMessageId?: string;
   }): Promise<{
     savedEvent: WebhookEvent;
@@ -105,6 +128,7 @@ export class FacebookMessagingService {
     const threadId = input.threadId?.trim();
     const text = (input.text ?? '').trim();
     const attachment = input.attachment;
+    const replyToMessageId = input.replyToMessageId?.trim() || undefined;
 
     if (!pageId) throw new BadRequestException('Missing pageId');
     if (!threadId) throw new BadRequestException('Missing threadId');
@@ -119,19 +143,25 @@ export class FacebookMessagingService {
 
     const map = this.pageMapService.getSocialMap(pageId);
     const orgId = map?.orgId ?? this.getDefaultOrgId();
-    const pageAccessToken = await this.resolvePageAccessToken(pageId, orgId);
-
     if (parsed.kind === 'FEED_COMMENT') {
+      const pageAccessToken = await this.resolvePageAccessToken(
+        pageId,
+        orgId,
+        'MODERATE',
+      );
       const replyText = text;
       if (!replyText) {
         throw new BadRequestException('Reply text is required for comments');
       }
+
+      const rootCommentId = parsed.commentId ?? null;
 
       const targetCommentId = input.commentId?.trim()
         ? input.commentId.trim()
         : await this.resolveLatestInboundCommentId({
             pageId,
             postId: parsed.postId!,
+            rootCommentId: rootCommentId ?? undefined,
             customerId: parsed.senderId,
           });
 
@@ -145,8 +175,6 @@ export class FacebookMessagingService {
         replyText,
       );
 
-      // IMPORTANT: For FEED_COMMENT thread grouping, keep senderId as customerId (parsed.senderId)
-      // so buildThreadId/buildThreadEventWhere keep working for the same conversation thread.
       const saved = await this.prisma.webhookEvent.create({
         data: {
           organizationId: orgId,
@@ -159,6 +187,7 @@ export class FacebookMessagingService {
           messageId: fbResp.id ?? null,
           postId: parsed.postId ?? null,
           commentId: fbResp.id ?? null,
+          parentCommentId: rootCommentId,
           msgType: 'feed.comment.reply',
           content: replyText,
           rawPayload: JSON.stringify({
@@ -182,16 +211,24 @@ export class FacebookMessagingService {
       throw new BadRequestException('Thread kind không được hỗ trợ');
     }
 
+    const pageAccessToken = await this.resolvePageAccessToken(
+      pageId,
+      orgId,
+      'CREATE_CONTENT',
+    );
+
     const fbResp = attachment
       ? await this.facebookOAuth.sendAttachmentMessageToPsid(
           parsed.senderId,
           pageAccessToken,
           attachment,
+          replyToMessageId,
         )
       : await this.facebookOAuth.sendTextMessageToPsid(
           parsed.senderId,
           pageAccessToken,
           text,
+          replyToMessageId,
         );
 
     const { msgType, content } = this.buildOutboundContent(text, attachment);
@@ -213,6 +250,7 @@ export class FacebookMessagingService {
         rawPayload: JSON.stringify({
           source: 'socket_send',
           clientMessageId: input.clientMessageId ?? null,
+          replyToMessageId: replyToMessageId ?? null,
           attachment: attachment ?? null,
           fb: fbResp,
         }),
@@ -239,17 +277,28 @@ export class FacebookMessagingService {
   private async resolveLatestInboundCommentId(input: {
     pageId: string;
     postId: string;
+    rootCommentId?: string;
     customerId: string;
   }): Promise<string | null> {
+    const where: any = {
+      pageId: input.pageId,
+      eventType: 'FEED_COMMENT',
+      direction: 'IN',
+      postId: input.postId,
+      commentId: { not: null },
+    };
+
+    if (input.rootCommentId) {
+      where.OR = [
+        { commentId: input.rootCommentId },
+        { parentCommentId: input.rootCommentId },
+      ];
+    } else {
+      where.senderId = input.customerId;
+    }
+
     const row = await this.prisma.webhookEvent.findFirst({
-      where: {
-        pageId: input.pageId,
-        eventType: 'FEED_COMMENT',
-        direction: 'IN',
-        postId: input.postId,
-        senderId: input.customerId,
-        commentId: { not: null },
-      },
+      where,
       orderBy: { createdAt: 'desc' },
       select: { commentId: true },
     });

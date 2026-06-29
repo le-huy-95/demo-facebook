@@ -27,6 +27,7 @@ export interface WebhookMessage {
   messageId: string | null;
   postId: string | null;
   commentId: string | null;
+  parentCommentId?: string | null;
   msgType: string | null;
   content: string | null;
   rawPayload: string;

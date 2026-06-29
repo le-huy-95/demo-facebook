@@ -16,6 +16,8 @@ import * as crypto from 'crypto';
 import type { Request, Response } from 'express';
 import { AppLogger } from '../../common/logger.service';
 import { FacebookWebhookService } from '../services/facebook-webhook.service';
+import { FacebookOAuthService } from '../services/facebook-oauth.service';
+import { FacebookPageService } from '../services/facebook-page.service';
 
 @ApiTags('facebook-webhook')
 @Controller('webhook/facebook')
@@ -28,6 +30,8 @@ export class FacebookWebhookController {
     private readonly logger: AppLogger,
     private readonly configService: ConfigService,
     private readonly webhookService: FacebookWebhookService,
+    private readonly facebookOAuthService: FacebookOAuthService,
+    private readonly facebookPageService: FacebookPageService,
   ) {
     this.verifyToken = this.configService.get<string>(
       'FACEBOOK_WEBHOOK_VERIFY_TOKEN',
@@ -138,6 +142,20 @@ export class FacebookWebhookController {
 
     res.status(HttpStatus.OK).send('EVENT_RECEIVED');
 
+    const entryCount = body.entry?.length ?? 0;
+    const feedChanges = (body.entry ?? []).reduce(
+      (n: number, e: any) =>
+        n + (e.changes ?? []).filter((c: any) => c.field === 'feed').length,
+      0,
+    );
+    const messagingCount = (body.entry ?? []).reduce(
+      (n: number, e: any) => n + (e.messaging?.length ?? 0) + (e.standby?.length ?? 0),
+      0,
+    );
+    this.logger.log(
+      `[Webhook] Processing ${entryCount} entry(ies): ${feedChanges} feed change(s), ${messagingCount} messaging event(s)`,
+    );
+
     try {
       await this.webhookService.processWebhookBody(body);
     } catch (err) {
@@ -174,6 +192,45 @@ export class FacebookWebhookController {
           stats.inCount === 0
             ? 'Chưa có tin IN từ Facebook. Kiểm tra Callback URL trên Facebook Developer và tunnel forward → localhost:3000'
             : 'Webhook inbound đã nhận tin nhắn trước đó',
+      },
+    };
+  }
+
+  @Post('subscribe')
+  @ApiOperation({ summary: 'Đăng ký app-level webhook callback URL với Facebook và re-subscribe tất cả pages' })
+  async subscribeWebhook() {
+    const appResult = await this.facebookOAuthService.subscribeAppWebhook();
+
+    const base = this.configService
+      .get<string>('PUBLIC_BASE_URL', 'http://localhost:3000')
+      .replace(/\/$/, '');
+
+    const pageResults = await this.facebookPageService.resubscribeAllPages();
+
+    return {
+      statusCode: HttpStatus.OK,
+      data: {
+        appWebhookRegistered: appResult,
+        callbackUrl: `${base}/webhook/facebook`,
+        pageSubscriptions: pageResults,
+        hint: appResult
+          ? 'App-level webhook registered successfully. Facebook sẽ gửi feed events tới callback URL.'
+          : 'Không thể đăng ký webhook. Kiểm tra FACEBOOK_APP_ID, FACEBOOK_APP_SECRET và PUBLIC_BASE_URL.',
+      },
+    };
+  }
+
+  @Get('subscriptions')
+  @ApiOperation({ summary: 'Kiểm tra trạng thái đăng ký webhook hiện tại với Facebook' })
+  async checkSubscriptions() {
+    const appSubs = await this.facebookOAuthService.getAppSubscriptions();
+    const pageSubs = await this.facebookPageService.getPageSubscriptions();
+
+    return {
+      statusCode: HttpStatus.OK,
+      data: {
+        appSubscriptions: appSubs,
+        pageSubscriptions: pageSubs,
       },
     };
   }

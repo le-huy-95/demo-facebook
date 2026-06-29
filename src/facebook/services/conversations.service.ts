@@ -54,7 +54,8 @@ export interface ConversationListPage {
 }
 
 const MESSAGE_PAGE_SIZE = 15;
-const CONVERSATION_PAGE_SIZE = 15;
+const CONVERSATION_PAGE_SIZE = 30;
+const FEED_POSTS_SCAN_LIMIT = 50;
 
 @Injectable()
 export class ConversationsService {
@@ -68,26 +69,33 @@ export class ConversationsService {
   async listByPage(
     pageId: string,
     orgId: string,
-    options?: { limit?: number; before?: string },
+    options?: { limit?: number; before?: string; kind?: ConversationThread['kind'] },
   ): Promise<ConversationListPage> {
     const limit = options?.limit ?? CONVERSATION_PAGE_SIZE;
     const merged = await this.fetchMergedThreads(pageId, orgId);
     const withPictures = await this.enrichThreadPictures(merged, pageId);
     const enriched = await this.enrichThreadNames(withPictures, pageId, orgId);
 
-    const sorted = [...enriched].sort(
+    const allSorted = [...enriched].sort(
       (a, b) =>
         new Date(b.lastMessageAt).getTime() -
         new Date(a.lastMessageAt).getTime(),
     );
 
-    const eligible = options?.before
-      ? sorted.filter(
-          (t) =>
-            new Date(t.lastMessageAt).getTime() <
-            new Date(options.before!).getTime(),
-        )
-      : sorted;
+    const filtered = options?.kind
+      ? allSorted.filter((t) => t.kind === options.kind)
+      : allSorted;
+
+    let eligible: ConversationThread[];
+    if (options?.before) {
+      eligible = filtered.filter(
+        (t) =>
+          new Date(t.lastMessageAt).getTime() <
+          new Date(options.before!).getTime(),
+      );
+    } else {
+      eligible = filtered;
+    }
 
     const hasMore = eligible.length > limit;
     const page = eligible.slice(0, limit);
@@ -181,6 +189,7 @@ export class ConversationsService {
         threadId,
         limit,
         options?.before,
+        parsed.commentId,
       );
     }
 
@@ -272,6 +281,7 @@ export class ConversationsService {
     const posts = await this.facebookOAuth.listPageFeedWithComments(
       pageId,
       token,
+      FEED_POSTS_SCAN_LIMIT,
     );
     const map = new Map<string, ConversationThread & { _latest: number }>();
 
@@ -279,14 +289,18 @@ export class ConversationsService {
       const postId = post.id;
       if (!postId) continue;
 
-      for (const comment of post.comments?.data ?? []) {
+      const allComments = post.comments?.data ?? [];
+      const commentById = new Map(allComments.map((c) => [c.id, c]));
+
+      for (const comment of allComments) {
         const senderId = comment.from?.id;
         if (!senderId || senderId === pageId || !comment.created_time) continue;
 
         const ts = new Date(comment.created_time).getTime();
         if (!Number.isFinite(ts)) continue;
 
-        const threadId = `comment:${pageId}:${postId}:${senderId}`;
+        const rootCommentId = comment.parent?.id ?? comment.id;
+        const threadId = `comment:${pageId}:${postId}:${senderId}:${rootCommentId}`;
         const existing = map.get(threadId);
 
         if (!existing) {
@@ -300,7 +314,7 @@ export class ConversationsService {
             preview: comment.message ?? '',
             lastMessageAt: comment.created_time,
             postId,
-            commentId: comment.id,
+            commentId: rootCommentId,
             messageCount: 1,
             _latest: ts,
           });
@@ -312,10 +326,33 @@ export class ConversationsService {
           existing._latest = ts;
           existing.lastMessageAt = comment.created_time;
           existing.preview = comment.message ?? existing.preview;
-          existing.commentId = comment.id;
           if (comment.from?.name) existing.senderName = comment.from.name;
           const picture = extractGraphPictureUrl(comment.from);
           if (picture) existing.senderPictureUrl = picture;
+        }
+      }
+
+      // Also create threads for page replies to customer comments
+      for (const comment of allComments) {
+        if (comment.from?.id !== pageId || !comment.parent?.id) continue;
+        const parentComment = commentById.get(comment.parent.id);
+        if (!parentComment?.from?.id || parentComment.from.id === pageId) continue;
+
+        const customerId = parentComment.from.id;
+        const rootCommentId = comment.parent.id;
+        const threadId = `comment:${pageId}:${postId}:${customerId}:${rootCommentId}`;
+        const existing = map.get(threadId);
+
+        if (!existing) continue;
+
+        const ts = new Date(comment.created_time).getTime();
+        if (!Number.isFinite(ts)) continue;
+
+        existing.messageCount += 1;
+        if (ts >= existing._latest) {
+          existing._latest = ts;
+          existing.lastMessageAt = comment.created_time;
+          existing.preview = comment.message ?? existing.preview;
         }
       }
     }
@@ -501,31 +538,47 @@ export class ConversationsService {
     threadId: string,
     limit: number,
     before?: string,
+    rootCommentId?: string,
   ): Promise<ThreadMessagesPage> {
     const token = await this.getPageAccessToken(pageId, orgId);
-    const customerCommentIds = new Set<string>();
-
     let graphEvents: ConversationMessage[] = [];
     if (token) {
-      const { comments } = await this.facebookOAuth.getPostComments(
+      const comments = await this.facebookOAuth.getAllPostComments(
         postId,
         token,
-        { limit: 100 },
       );
-      for (const comment of comments) {
-        if (comment.from?.id === customerId) {
-          customerCommentIds.add(comment.id);
+
+      const relevantIds = new Set<string>();
+
+      if (rootCommentId) {
+        for (const comment of comments) {
+          if (comment.id === rootCommentId || comment.parent?.id === rootCommentId) {
+            relevantIds.add(comment.id);
+          }
+        }
+      } else {
+        for (const comment of comments) {
+          if (comment.from?.id === customerId) {
+            relevantIds.add(comment.id);
+          }
+        }
+
+        let changed = true;
+        while (changed) {
+          changed = false;
+          for (const comment of comments) {
+            if (relevantIds.has(comment.id)) continue;
+            if (!comment.parent?.id || !relevantIds.has(comment.parent.id)) continue;
+            if (comment.from?.id === pageId || comment.from?.id === customerId) {
+              relevantIds.add(comment.id);
+              changed = true;
+            }
+          }
         }
       }
 
       graphEvents = comments
-        .filter(
-          (comment) =>
-            comment.from?.id === customerId ||
-            (comment.from?.id === pageId &&
-              comment.parent?.id &&
-              customerCommentIds.has(comment.parent.id)),
-        )
+        .filter((comment) => relevantIds.has(comment.id))
         .map((comment) =>
           this.graphCommentToEvent(comment, pageId, postId, customerId, orgId),
         );
@@ -898,6 +951,7 @@ export class ConversationsService {
       messageId: msg.id,
       postId: null,
       commentId: null,
+      parentCommentId: null,
       msgType: 'text',
       content: msg.message ?? '',
       rawPayload: JSON.stringify(msg),
@@ -932,6 +986,7 @@ export class ConversationsService {
       content: comment.message ?? '',
       rawPayload: JSON.stringify(comment),
       createdAt: new Date(comment.created_time),
+      parentCommentId: comment.parent?.id ?? null,
     };
   }
 
@@ -948,6 +1003,8 @@ export class ConversationsService {
     for (const event of webhook) {
       const key = event.messageId ?? event.id;
       const existing = byMessageId.get(key);
+      const parentCommentId =
+        existing?.parentCommentId ?? this.extractParentCommentId(event);
       const merged = {
         ...event,
         senderName: pickBetterSenderName(
@@ -955,6 +1012,7 @@ export class ConversationsService {
           event.senderName,
         ),
         senderPictureUrl: existing?.senderPictureUrl ?? null,
+        parentCommentId,
       } as ConversationMessage;
       byMessageId.set(key, merged);
     }
@@ -962,6 +1020,18 @@ export class ConversationsService {
     return [...byMessageId.values()].sort(
       (a, b) => a.createdAt.getTime() - b.createdAt.getTime(),
     );
+  }
+
+  private extractParentCommentId(event: WebhookEvent): string | null {
+    if (!event.rawPayload) return null;
+    try {
+      const raw = JSON.parse(event.rawPayload);
+      if (raw.parent?.id) return raw.parent.id;
+      if (raw.parent_id && raw.parent_id !== raw.post_id) return raw.parent_id;
+    } catch {
+      // ignore
+    }
+    return null;
   }
 
   private async enrichMessagePictures(

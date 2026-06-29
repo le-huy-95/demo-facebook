@@ -72,6 +72,7 @@ export class EventsGateway {
       threadId: string;
       text?: string;
       clientMessageId?: string;
+      replyToMessageId?: string;
       attachment?: {
         type: 'image' | 'video' | 'audio' | 'file';
         url: string;
@@ -86,6 +87,7 @@ export class EventsGateway {
         text: data?.text,
         attachment: data?.attachment,
         commentId: data?.commentId,
+        replyToMessageId: data?.replyToMessageId,
         clientMessageId: data?.clientMessageId,
       });
 

@@ -4,6 +4,7 @@ const backendUrl = process.env.BACKEND_URL ?? 'http://localhost:3000';
 
 const nextConfig: NextConfig = {
   reactStrictMode: true,
+  skipTrailingSlashRedirect: true,
   eslint: {
     ignoreDuringBuilds: true,
   },
@@ -38,6 +39,14 @@ const nextConfig: NextConfig = {
       },
       { source: '/config/:path*', destination: `${backendUrl}/config/:path*` },
       { source: '/setup/:path*', destination: `${backendUrl}/setup/:path*` },
+      {
+        source: '/socket.io/',
+        destination: `${backendUrl}/socket.io/`,
+      },
+      {
+        source: '/socket.io/:path*',
+        destination: `${backendUrl}/socket.io/:path*`,
+      },
       { source: '/health', destination: `${backendUrl}/health` },
       { source: '/api-docs', destination: `${backendUrl}/api-docs` },
       {

@@ -35,6 +35,7 @@ Set-EnvLine $envFile 'PUBLIC_BASE_URL' $baseUrl
 Set-EnvLine $envFile 'FRONTEND_URL' $baseUrl
 Set-EnvLine $envFile 'FACEBOOK_OAUTH_REDIRECT_URI' "$baseUrl/facebook-page/oauth/callback"
 Set-EnvLine $webEnvFile 'NEXT_PUBLIC_API_URL' $baseUrl
+Set-EnvLine $webEnvFile 'NEXT_PUBLIC_SOCKET_URL' $baseUrl
 
 Write-Host "Ngrok HTTPS (frontend + API): $baseUrl"
 Write-Host "Mo app: $baseUrl/login"

@@ -61,12 +61,15 @@ export class SetupController {
     <strong>4. Webhook</strong> (Webhooks → Page):
     <div>Callback URL: <span class="url">${webhookUrl}</span></div>
     <div>Verify Token: <code>${verifyToken}</code></div>
+    <div style="margin-top:8px;color:#16a34a;font-size:0.9rem;">✓ Webhook được tự động đăng ký khi server khởi động. Nếu cần đăng ký lại thủ công: <code>POST ${base}/webhook/facebook/subscribe</code></div>
+    <div style="margin-top:4px;font-size:0.9rem;">Subscribed fields: <code>feed, messages, message_deliveries, message_echoes, message_reads, ...</code></div>
   </div>
 
   <ol>
     <li>Bật <strong>Client OAuth Login</strong> và <strong>Web OAuth Login</strong></li>
     <li>Thêm URI ở mục 1 vào <strong>Valid OAuth Redirect URIs</strong> → Save</li>
     <li>Tài khoản Facebook đăng nhập phải là <strong>Admin/Developer/Tester</strong> của app (nếu app ở chế độ Development)</li>
+    <li>Webhook <strong>feed</strong> chỉ gửi cho những tài khoản có role trong app (Admin/Dev/Tester) nếu app ở chế độ Development</li>
     <li>Quay lại <a href="${base}/login">trang đăng nhập</a> và thử lại</li>
   </ol>
 </body>

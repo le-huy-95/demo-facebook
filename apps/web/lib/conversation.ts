@@ -30,8 +30,24 @@ export function buildThreadIdFromEvent(event: WebhookMessage): string | null {
   }
 
   if (event.eventType === 'FEED_COMMENT') {
-    if (!event.postId || !event.senderId) return null;
-    return `comment:${event.pageId}:${event.postId}:${event.senderId}`;
+    if (!event.postId) return null;
+
+    const rootCommentId = event.parentCommentId ?? event.commentId;
+    if (!rootCommentId) return null;
+
+    let customerId: string | null;
+    if (event.direction === 'OUT') {
+      if (event.senderId && event.senderId !== event.pageId) {
+        customerId = event.senderId;
+      } else {
+        customerId = event.recipientId;
+      }
+    } else {
+      customerId = event.senderId;
+    }
+
+    if (!customerId || customerId === event.pageId) return null;
+    return `comment:${event.pageId}:${event.postId}:${customerId}:${rootCommentId}`;
   }
 
   return null;

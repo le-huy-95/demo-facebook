@@ -11,12 +11,15 @@ import {
   getConversationMessages,
   getConversations,
   getPostPreview,
-  subscribeMessages,
   type ConversationThread,
   type FacebookPostPreview,
   type WebhookMessage,
 } from '@/lib/api';
-import { buildThreadIdFromEvent, resolveCustomerNameFromMessages } from '@/lib/conversation';
+import {
+  buildThreadIdFromEvent,
+  pickBetterSenderName,
+  resolveCustomerNameFromMessages,
+} from '@/lib/conversation';
 import { isReceiptMessage } from '@/lib/message-content';
 import { MessageComposer } from '@/components/message-composer';
 import {
@@ -31,14 +34,36 @@ export default function ConversationsPage() {
   const params = useParams();
   const pageId = params.pageId as string;
 
+  const extractPostIdFromJson = useCallback((rawPayload: string | null | undefined): string | null => {
+    if (!rawPayload) return null;
+    try {
+      const raw = JSON.parse(rawPayload);
+
+      const referral = raw?.referral ?? raw?.message?.referral ?? raw?.postback?.referral;
+      if (referral) {
+        const adsPostId = referral?.ads_context_data?.post_id;
+        if (typeof adsPostId === 'string' && adsPostId) {
+          if (/^\d+_\d+$/.test(adsPostId)) return adsPostId;
+          if (/^\d+$/.test(adsPostId)) return adsPostId;
+        }
+      }
+
+      if (raw?.post_id && typeof raw.post_id === 'string') return raw.post_id;
+    } catch {
+      // not JSON
+    }
+    return null;
+  }, []);
+
   const extractPostIdFromText = useCallback((text: string | null | undefined): string | null => {
     if (!text) return null;
 
-    // Case 1: Already a Graph post id like "pageId_storyFbid"
+    const fromJson = extractPostIdFromJson(text);
+    if (fromJson) return fromJson;
+
     const direct = text.match(/\b(\d+_\d+)\b/);
     if (direct?.[1]) return direct[1];
 
-    // Case 2: permalink.php?story_fbid=...&id=...
     const perm = text.match(/https?:\/\/[^\s)]+/g) ?? [];
     for (const rawUrl of perm) {
       try {
@@ -47,7 +72,6 @@ export default function ConversationsPage() {
         const id = url.searchParams.get('id');
         if (storyFbid && id) return `${id}_${storyFbid}`;
 
-        // Case 3: /posts/<pageId>_<fbid>
         const m = url.pathname.match(/\/posts\/(\d+_\d+)/);
         if (m?.[1]) return m[1];
       } catch {
@@ -56,7 +80,7 @@ export default function ConversationsPage() {
     }
 
     return null;
-  }, []);
+  }, [extractPostIdFromJson]);
 
   const [pageName, setPageName] = useState('');
   const [pagePictureUrl, setPagePictureUrl] = useState<string | null>(null);
@@ -67,6 +91,8 @@ export default function ConversationsPage() {
   const [highlightComment, setHighlightComment] = useState<string | undefined>(undefined);
   const [replyCommentId, setReplyCommentId] = useState<string | null>(null);
   const [replyPreview, setReplyPreview] = useState<string | null>(null);
+  const [replyToMessageId, setReplyToMessageId] = useState<string | null>(null);
+  const [replyToSenderName, setReplyToSenderName] = useState<string | null>(null);
   const [postExpanded, setPostExpanded] = useState(false);
   const [loading, setLoading] = useState(true);
   const [postLoading, setPostLoading] = useState(false);
@@ -77,6 +103,73 @@ export default function ConversationsPage() {
   const [hasMoreConversations, setHasMoreConversations] = useState(false);
   const [loadingMoreConversations, setLoadingMoreConversations] = useState(false);
   const [conversationsCursor, setConversationsCursor] = useState<string | null>(null);
+  const [unreadMap, setUnreadMap] = useState<Record<string, number>>({});
+
+  const upsertConversationFromRealtimeEvent = useCallback(
+    (event: WebhookMessage, threadId: string) => {
+      setConversations((prev) => {
+        const kind = event.eventType === 'FEED_COMMENT' ? 'FEED_COMMENT' : 'MESSENGER';
+        const rootCommentId = event.parentCommentId ?? event.commentId;
+        const derivedCustomerId =
+          event.eventType === 'FEED_COMMENT'
+            ? event.direction === 'OUT'
+              ? (event.senderId && event.senderId !== event.pageId
+                  ? event.senderId
+                  : event.recipientId)
+              : event.senderId
+            : event.direction === 'OUT'
+              ? event.recipientId
+              : event.senderId;
+        if (!derivedCustomerId) return prev;
+
+        const idx = prev.findIndex((c) => c.id === threadId);
+        if (idx >= 0) {
+          const current = prev[idx];
+          const nextSenderName = pickBetterSenderName(
+            event.direction === 'IN' ? event.senderName : current.senderName,
+            current.senderName,
+          );
+          const updated = {
+            ...current,
+            senderId: derivedCustomerId,
+            senderName: nextSenderName,
+            preview: event.content ?? current.preview,
+            lastMessageAt: event.createdAt,
+            messageCount: current.messageCount + 1,
+            postId: event.postId ?? current.postId,
+            commentId: rootCommentId ?? current.commentId,
+          };
+          const next = [...prev];
+          next[idx] = updated;
+          return next.sort(
+            (a, b) =>
+              new Date(b.lastMessageAt).getTime() -
+              new Date(a.lastMessageAt).getTime(),
+          );
+        }
+
+        const created = {
+          id: threadId,
+          kind,
+          pageId: event.pageId ?? pageId,
+          senderId: derivedCustomerId,
+          senderName: pickBetterSenderName(event.senderName, 'Khách hàng'),
+          preview: event.content ?? '',
+          lastMessageAt: event.createdAt,
+          postId: event.postId ?? null,
+          commentId: rootCommentId ?? null,
+          messageCount: 1,
+        } as ConversationThread;
+
+        return [created, ...prev].sort(
+          (a, b) =>
+            new Date(b.lastMessageAt).getTime() -
+            new Date(a.lastMessageAt).getTime(),
+        );
+      });
+    },
+    [pageId],
+  );
 
   const loadConversations = useCallback(async () => {
     const status = await getAuthStatus();
@@ -84,7 +177,7 @@ export default function ConversationsPage() {
     setPageName(page?.name ?? pageId);
     setPagePictureUrl(page?.pictureUrl ?? null);
 
-    const { data, paging } = await getConversations(pageId, { limit: 15 });
+    const { data, paging } = await getConversations(pageId, { limit: 30 });
     const filtered = data.filter((c) => c.pageId === pageId);
     setConversations(filtered);
     setConversationsCursor(paging.nextBefore);
@@ -98,7 +191,7 @@ export default function ConversationsPage() {
     setLoadingMoreConversations(true);
     try {
       const { data, paging } = await getConversations(pageId, {
-        limit: 15,
+        limit: 30,
         before: conversationsCursor,
       });
 
@@ -124,7 +217,15 @@ export default function ConversationsPage() {
       setHighlightComment(undefined);
       setReplyCommentId(null);
       setReplyPreview(null);
+      setReplyToMessageId(null);
+      setReplyToSenderName(null);
       setPostExpanded(false);
+      setUnreadMap((prev) => {
+        if (!prev[thread.id]) return prev;
+        const next = { ...prev };
+        delete next[thread.id];
+        return next;
+      });
 
       try {
         const { data: msgs, paging } = await getConversationMessages(pageId, thread.id, { limit: 15 });
@@ -138,13 +239,27 @@ export default function ConversationsPage() {
         setMessagesCursor(paging.nextBefore);
         setHasMoreMessages(paging.hasMore);
 
-        // Auto-detect postId from latest message (Messenger threads) so the post panel shows up without requiring a click.
+        if (thread.kind === 'FEED_COMMENT') {
+          const latestInbound = [...msgs].reverse().find(
+            (m) => m.eventType === 'FEED_COMMENT' && m.direction === 'IN',
+          );
+          setReplyCommentId(latestInbound?.commentId ?? thread.commentId ?? null);
+          setReplyPreview(latestInbound?.content ?? thread.preview ?? null);
+          setHighlightComment(latestInbound?.content ?? thread.preview ?? undefined);
+        }
+
+        // Auto-detect postId for Messenger threads.
+        // Prefer thread.postId from server summary, then fallback to recent messages.
         if (thread.kind !== 'FEED_COMMENT') {
-          const latestWithPost =
-            [...msgs]
-              .reverse()
-              .map((m) => m.postId ?? extractPostIdFromText(m.content) ?? extractPostIdFromText(m.rawPayload))
-              .find(Boolean) ?? null;
+          const recentPostIds = [...msgs]
+            .reverse()
+            .map((m) => m.postId ?? extractPostIdFromText(m.content) ?? extractPostIdFromText(m.rawPayload))
+            .filter((v): v is string => typeof v === 'string' && v.length > 0);
+          const candidatePostIds = [thread.postId, ...recentPostIds].filter(
+            (v, idx, arr): v is string =>
+              typeof v === 'string' && v.length > 0 && arr.indexOf(v) === idx,
+          );
+          const latestWithPost = candidatePostIds[0] ?? null;
 
           if (latestWithPost) {
             setPostLoading(true);
@@ -156,6 +271,8 @@ export default function ConversationsPage() {
             } finally {
               setPostLoading(false);
             }
+          } else {
+            setPost(null);
           }
         }
       } finally {
@@ -177,7 +294,7 @@ export default function ConversationsPage() {
         setPostLoading(false);
       }
     },
-    [pageId],
+    [pageId, extractPostIdFromText],
   );
 
   const handleSelectMessage = useCallback(
@@ -250,7 +367,7 @@ export default function ConversationsPage() {
         setPageName(page?.name ?? pageId);
         setPagePictureUrl(page?.pictureUrl ?? null);
 
-        const { data, paging } = await getConversations(pageId, { limit: 15 });
+        const { data, paging } = await getConversations(pageId, { limit: 30 });
         const list = data.filter((c) => c.pageId === pageId);
         if (!cancelled) {
           setConversations(list);
@@ -290,32 +407,50 @@ export default function ConversationsPage() {
       if (event.pageId !== pageId) return;
 
       const threadId = buildThreadIdFromEvent(event);
-      if (!threadId) return;
+      if (!threadId) {
+        if (event.eventType === 'FEED_COMMENT') {
+          // Fallback for partial feed payloads: refresh threads and patch opened comment thread.
+          void loadConversations();
+          setSelected((current) => {
+            if (
+              current?.kind === 'FEED_COMMENT' &&
+              current.postId &&
+              event.postId === current.postId &&
+              (event.senderId === current.senderId || event.recipientId === current.senderId)
+            ) {
+              setMessages((msgs) => {
+                if (msgs.some((m) => m.id === event.id)) return msgs;
+                if (
+                  event.messageId &&
+                  msgs.some((m) => m.messageId === event.messageId && m.msgType === event.msgType)
+                ) {
+                  return msgs;
+                }
+                return [...msgs, event];
+              });
+            }
+            return current;
+          });
+        }
+        return;
+      }
 
       const isReceipt = isReceiptMessage(event);
 
       if (!isReceipt) {
-        setConversations((prev) => {
-          const existing = prev.find((c) => c.id === threadId);
-          if (!existing) {
-            void loadConversations();
-            return prev;
-          }
-          const updated = prev.map((c) =>
-            c.id === threadId
-              ? {
-                  ...c,
-                  preview: event.content ?? c.preview,
-                  lastMessageAt: event.createdAt,
-                  messageCount: c.messageCount + 1,
-                }
-              : c,
-          );
-          return [...updated].sort(
-            (a, b) =>
-              new Date(b.lastMessageAt).getTime() - new Date(a.lastMessageAt).getTime(),
-          );
-        });
+        upsertConversationFromRealtimeEvent(event, threadId);
+
+        if (event.direction === 'IN') {
+          setSelected((current) => {
+            if (current?.id !== threadId) {
+              setUnreadMap((prev) => ({
+                ...prev,
+                [threadId]: (prev[threadId] ?? 0) + 1,
+              }));
+            }
+            return current;
+          });
+        }
       }
 
       setSelected((current) => {
@@ -349,59 +484,7 @@ export default function ConversationsPage() {
         return current;
       });
     });
-  }, [pageId, loadConversations]);
-
-  // Fallback: also listen via SSE stream (helps when Socket.IO delivery is flaky).
-  useEffect(() => {
-    return subscribeMessages((event) => {
-      if (event.pageId !== pageId) return;
-      const threadId = buildThreadIdFromEvent(event);
-      if (!threadId) return;
-
-      const isReceipt = isReceiptMessage(event);
-
-      if (!isReceipt) {
-        setConversations((prev) => {
-          const existing = prev.find((c) => c.id === threadId);
-          if (!existing) return prev;
-          const updated = prev.map((c) =>
-            c.id === threadId
-              ? {
-                  ...c,
-                  preview: event.content ?? c.preview,
-                  lastMessageAt: event.createdAt,
-                  messageCount: c.messageCount + 1,
-                }
-              : c,
-          );
-          return [...updated].sort(
-            (a, b) =>
-              new Date(b.lastMessageAt).getTime() -
-              new Date(a.lastMessageAt).getTime(),
-          );
-        });
-      }
-
-      setSelected((current) => {
-        if (current?.id === threadId) {
-          setMessages((msgs) => {
-            if (msgs.some((m) => m.id === event.id)) return msgs;
-            if (
-              event.messageId &&
-              msgs.some(
-                (m) =>
-                  m.messageId === event.messageId && m.msgType === event.msgType,
-              )
-            ) {
-              return msgs;
-            }
-            return [...msgs, event];
-          });
-        }
-        return current;
-      });
-    });
-  }, [pageId]);
+  }, [pageId, loadConversations, upsertConversationFromRealtimeEvent]);
 
   if (loading) {
     return (
@@ -438,6 +521,7 @@ export default function ConversationsPage() {
             hasMore={hasMoreConversations}
             loadingMore={loadingMoreConversations}
             onLoadMore={loadMoreConversations}
+            unreadMap={unreadMap}
           />
         </aside>
 
@@ -471,10 +555,27 @@ export default function ConversationsPage() {
                 pageName={pageName}
                 pagePictureUrl={pagePictureUrl}
                 selectedCommentId={selected.kind === 'FEED_COMMENT' ? replyCommentId : null}
+                loading={messagesLoading}
                 hasMore={hasMoreMessages}
-                loadingMore={loadingMoreMessages || messagesLoading}
+                loadingMore={loadingMoreMessages}
                 onLoadMore={loadMoreMessages}
                 onSelectMessage={handleSelectMessage}
+                onReplyMessage={(msg) => {
+                  if (selected.kind === 'FEED_COMMENT') {
+                    setReplyCommentId(msg.commentId ?? null);
+                    setReplyPreview(msg.content ?? null);
+                    setReplyToMessageId(null);
+                    setReplyToSenderName(null);
+                    setHighlightComment(msg.content ?? undefined);
+                    return;
+                  }
+
+                  if (!msg.messageId) return;
+                  setReplyToMessageId(msg.messageId);
+                  setReplyPreview(msg.content ?? null);
+                  setReplyToSenderName(msg.senderName ?? selected.senderName);
+                  setReplyCommentId(null);
+                }}
                 post={post}
                 postLoading={postLoading}
                 highlightComment={resolvedHighlightComment}
@@ -492,6 +593,14 @@ export default function ConversationsPage() {
                     threadId={selected.id}
                     shopPictureUrl={pagePictureUrl}
                     commentId={selected.commentId}
+                    replyToMessageId={replyToMessageId}
+                    replyPreview={replyPreview}
+                    replySenderName={replyToSenderName}
+                    onClearReplyTarget={() => {
+                      setReplyToMessageId(null);
+                      setReplyPreview(null);
+                      setReplyToSenderName(null);
+                    }}
                     onSent={({ clientMessageId, text }) => {
                       const optimistic: WebhookMessage = {
                         id: clientMessageId,
@@ -507,7 +616,13 @@ export default function ConversationsPage() {
                         commentId: null,
                         msgType: 'webchat',
                         content: text,
-                        rawPayload: JSON.stringify({ source: 'optimistic', clientMessageId }),
+                        rawPayload: JSON.stringify({
+                          source: 'optimistic',
+                          clientMessageId,
+                          replyToMessageId,
+                          replyToText: replyPreview,
+                          replyToSenderName,
+                        }),
                         createdAt: new Date().toISOString(),
                       };
                       setMessages((msgs) => [...msgs, optimistic]);
@@ -528,6 +643,9 @@ export default function ConversationsPage() {
                               new Date(a.lastMessageAt).getTime(),
                           ),
                       );
+                      setReplyToMessageId(null);
+                      setReplyPreview(null);
+                      setReplyToSenderName(null);
                     }}
                     onAck={({ clientMessageId, ok }) => {
                       if (!ok) {
@@ -542,9 +660,12 @@ export default function ConversationsPage() {
                     shopPictureUrl={pagePictureUrl}
                     commentId={replyCommentId ?? selected.commentId}
                     replyPreview={replyPreview}
+                    replySenderName={replyToSenderName}
                     onClearReplyTarget={() => {
                       setReplyCommentId(null);
                       setReplyPreview(null);
+                      setReplyToMessageId(null);
+                      setReplyToSenderName(null);
                     }}
                     onSent={({ clientMessageId, text }) => {
                       const optimistic: WebhookMessage = {
@@ -559,6 +680,7 @@ export default function ConversationsPage() {
                         messageId: null,
                         postId: selected.postId,
                         commentId: null,
+                        parentCommentId: replyCommentId ?? selected.commentId,
                         msgType: 'feed.comment.reply',
                         content: text,
                         rawPayload: JSON.stringify({

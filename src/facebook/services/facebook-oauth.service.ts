@@ -59,6 +59,9 @@ export interface GraphPostComment {
   created_time: string;
   from?: GraphConversationParticipant;
   parent?: { id?: string };
+  comments?: {
+    data: GraphPostComment[];
+  };
 }
 
 export interface GraphFeedPost {
@@ -93,7 +96,10 @@ export class FacebookOAuthService {
     'pages_show_list',
     'pages_messaging',
     'pages_manage_metadata',
+    'pages_manage_engagement',
+    'pages_manage_posts',
     'pages_read_engagement',
+    'pages_read_user_content',
   ];
 
   private readonly webhookFields: string[] = [
@@ -115,6 +121,9 @@ export class FacebookOAuthService {
   private readonly appId: string;
   private readonly appSecret: string;
   private readonly redirectUri: string;
+
+  private appWebhookRegisteredAt = 0;
+  private static readonly APP_WEBHOOK_COOLDOWN_MS = 60_000;
 
   constructor(
     private readonly configService: ConfigService,
@@ -180,6 +189,7 @@ export class FacebookOAuthService {
       scope: this.oauthScopes.join(','),
       state,
       response_type: 'code',
+      auth_type: 'rerequest',
     });
 
     return `https://www.facebook.com/${this.graphApiVersion}/dialog/oauth?${params.toString()}`;
@@ -598,7 +608,7 @@ export class FacebookOAuthService {
   async listPageFeedWithComments(
     pageId: string,
     accessToken: string,
-    limit = 15,
+    limit = 50,
   ): Promise<GraphFeedPost[]> {
     if (!pageId || !accessToken) return [];
 
@@ -610,7 +620,7 @@ export class FacebookOAuthService {
             searchParams: {
               access_token: accessToken,
               fields:
-                'id,message,created_time,comments.limit(50){id,message,from{id,name,picture.type(large)},created_time,parent{id}}',
+                'id,message,created_time,comments.filter(stream).limit(100){id,message,from{id,name,picture.type(large)},created_time,parent{id},comments{id,message,from{id,name,picture.type(large)},created_time,parent{id}}}',
               limit,
             },
             timeout: { request: 15_000 },
@@ -618,7 +628,13 @@ export class FacebookOAuthService {
         )
         .json<{ data: GraphFeedPost[] }>();
 
-      return response.data ?? [];
+      const posts = response.data ?? [];
+      for (const post of posts) {
+        if (post.comments?.data) {
+          post.comments.data = this.flattenComments(post.comments.data);
+        }
+      }
+      return posts;
     } catch (err: any) {
       const body = err?.response?.body;
       const fbError =
@@ -651,7 +667,7 @@ export class FacebookOAuthService {
     const searchParams: Record<string, string | number> = {
       access_token: accessToken,
       fields:
-        'id,message,from{id,name,picture.type(large)},created_time,parent{id}',
+        'id,message,from{id,name,picture.type(large)},created_time,parent{id},comments{id,message,from{id,name,picture.type(large)},created_time,parent{id}}',
       limit,
       filter: 'stream',
       order: 'chronological',
@@ -675,8 +691,9 @@ export class FacebookOAuthService {
           paging?: { cursors?: { before?: string; after?: string } };
         }>();
 
+      const flat = this.flattenComments(response.data ?? []);
       return {
-        comments: response.data ?? [],
+        comments: flat,
         paging: response.paging,
       };
     } catch (err: any) {
@@ -693,6 +710,70 @@ export class FacebookOAuthService {
       );
       return { comments: [] };
     }
+  }
+
+  async getAllPostComments(
+    postId: string,
+    accessToken: string,
+    maxPages = 5,
+  ): Promise<GraphPostComment[]> {
+    if (!postId || !accessToken) return [];
+
+    const allComments: GraphPostComment[] = [];
+    let afterCursor: string | undefined;
+
+    for (let page = 0; page < maxPages; page++) {
+      const searchParams: Record<string, string | number> = {
+        access_token: accessToken,
+        fields:
+          'id,message,from{id,name,picture.type(large)},created_time,parent{id},comments{id,message,from{id,name,picture.type(large)},created_time,parent{id}}',
+        limit: 100,
+        filter: 'stream',
+        order: 'chronological',
+      };
+      if (afterCursor) {
+        searchParams.after = afterCursor;
+      }
+
+      try {
+        const response = await got
+          .get(
+            `https://graph.facebook.com/${this.graphApiVersion}/${postId}/comments`,
+            { searchParams, timeout: { request: 15_000 } },
+          )
+          .json<{
+            data: GraphPostComment[];
+            paging?: { cursors?: { after?: string }; next?: string };
+          }>();
+
+        const comments = response.data ?? [];
+        allComments.push(...this.flattenComments(comments));
+
+        if (!response.paging?.next || comments.length < 100) break;
+        afterCursor = response.paging.cursors?.after;
+        if (!afterCursor) break;
+      } catch (err: any) {
+        this.logger.warn(
+          `Failed to paginate comments for post ${postId} (page ${page})`,
+          err?.message,
+        );
+        break;
+      }
+    }
+
+    return allComments;
+  }
+
+  private flattenComments(comments: GraphPostComment[]): GraphPostComment[] {
+    const result: GraphPostComment[] = [];
+    for (const comment of comments) {
+      const { comments: children, ...rest } = comment;
+      result.push(rest);
+      if (children?.data?.length) {
+        result.push(...this.flattenComments(children.data));
+      }
+    }
+    return result;
   }
 
   async getMe(accessToken: string): Promise<{ id: string; name: string }> {
@@ -717,17 +798,76 @@ export class FacebookOAuthService {
   private mapFbError(error: any): Error {
     if (!error) return new Error('Facebook API request failed');
 
-    const { code, message } = error;
+    const { code, message, fbtrace_id: fbtraceId } = error;
 
     if (code === 190)
       return new BadRequestException(`Token invalid or expired: ${message}`);
     if (code === 10 || code === 200)
-      return new BadRequestException(`Permission denied: ${message}`);
+      return new BadRequestException(
+        `Permission denied: ${message}. Vui lòng liên kết lại Page và cấp đủ quyền pages_manage_engagement, pages_manage_posts, pages_read_engagement. fbtrace_id=${fbtraceId ?? 'n/a'}`,
+      );
     if (code === 4 || code === 17 || code === 32) {
       return new BadRequestException(`Rate limit exceeded: ${message}`);
     }
 
     return new BadRequestException(`Facebook API error [${code}]: ${message}`);
+  }
+
+  /**
+   * GET /{app_id}/subscriptions — verify what webhook fields
+   * are currently registered at the app level.
+   */
+  async getAppSubscriptions(): Promise<any> {
+    if (!this.appId || !this.appSecret) return { error: 'Missing appId or appSecret' };
+
+    const appAccessToken = `${this.appId}|${this.appSecret}`;
+    try {
+      const res = await got
+        .get(
+          `https://graph.facebook.com/${this.graphApiVersion}/${this.appId}/subscriptions`,
+          {
+            searchParams: { access_token: appAccessToken },
+            timeout: { request: 10_000 },
+          },
+        )
+        .json<any>();
+      return res;
+    } catch (err: any) {
+      const body = err?.response?.body;
+      let fbError: any;
+      try { fbError = typeof body === 'string' ? JSON.parse(body) : body; } catch { fbError = err.message; }
+      this.logger.error('[getAppSubscriptions] Failed', fbError);
+      return { error: fbError };
+    }
+  }
+
+  /**
+   * GET /{page_id}/subscribed_apps — verify which apps are subscribed
+   * to a page's webhooks and which fields.
+   */
+  async getPageSubscriptionStatus(
+    pageId: string,
+    pageAccessToken: string,
+  ): Promise<any> {
+    if (!pageId || !pageAccessToken) return { error: 'Missing pageId or token' };
+
+    try {
+      const res = await got
+        .get(
+          `https://graph.facebook.com/${this.graphApiVersion}/${pageId}/subscribed_apps`,
+          {
+            searchParams: { access_token: pageAccessToken },
+            timeout: { request: 10_000 },
+          },
+        )
+        .json<any>();
+      return res;
+    } catch (err: any) {
+      const body = err?.response?.body;
+      let fbError: any;
+      try { fbError = typeof body === 'string' ? JSON.parse(body) : body; } catch { fbError = err.message; }
+      return { pageId, error: fbError };
+    }
   }
 
   async revokeUserToken(userAccessToken: string): Promise<void> {
@@ -748,11 +888,104 @@ export class FacebookOAuthService {
     }
   }
 
+  /**
+   * Register the app-level webhook callback URL with Facebook.
+   * This tells Facebook WHERE to deliver webhook events for this app.
+   * Uses app access token ({app_id}|{app_secret}).
+   *
+   * IMPORTANT: The HTTP server MUST be listening before calling this,
+   * because Facebook verifies the callback URL by sending a GET request.
+   *
+   * Includes a 60s cooldown to avoid hitting Facebook rate limits.
+   */
+  async subscribeAppWebhook(): Promise<boolean> {
+    const elapsed = Date.now() - this.appWebhookRegisteredAt;
+    if (elapsed < FacebookOAuthService.APP_WEBHOOK_COOLDOWN_MS) {
+      this.logger.debug(
+        `[subscribeAppWebhook] Skipped — already registered ${Math.round(elapsed / 1000)}s ago`,
+      );
+      return true;
+    }
+
+    if (!this.appId || !this.appSecret) {
+      this.logger.warn('[FacebookOAuthService] Cannot subscribe app webhook — missing appId or appSecret');
+      return false;
+    }
+
+    const baseUrl = this.configService
+      .get<string>('PUBLIC_BASE_URL', '')
+      .replace(/\/$/, '');
+    if (!baseUrl) {
+      this.logger.warn('[FacebookOAuthService] Cannot subscribe app webhook — missing PUBLIC_BASE_URL');
+      return false;
+    }
+
+    const callbackUrl = `${baseUrl}/webhook/facebook`;
+    const verifyToken = this.configService.get<string>(
+      'FACEBOOK_WEBHOOK_VERIFY_TOKEN',
+      'dev_verify_token',
+    );
+    const appAccessToken = `${this.appId}|${this.appSecret}`;
+    const fields = this.webhookFields.join(',');
+
+    this.logger.log(
+      `[subscribeAppWebhook] Registering callback=${callbackUrl} fields=${fields}`,
+    );
+
+    try {
+      const response = await got
+        .post(
+          `https://graph.facebook.com/${this.graphApiVersion}/${this.appId}/subscriptions`,
+          {
+            searchParams: {
+              object: 'page',
+              callback_url: callbackUrl,
+              verify_token: verifyToken,
+              fields,
+              access_token: appAccessToken,
+            },
+            timeout: { request: 20_000 },
+          },
+        )
+        .json<{ success: boolean }>();
+
+      if (response.success) {
+        this.appWebhookRegisteredAt = Date.now();
+        this.logger.log(
+          `[subscribeAppWebhook] SUCCESS — callback=${callbackUrl}`,
+        );
+        return true;
+      }
+      this.logger.warn(
+        `[subscribeAppWebhook] Facebook returned success=false for ${callbackUrl}`,
+      );
+      return false;
+    } catch (err: any) {
+      const body = err?.response?.body;
+      let fbError: any;
+      try {
+        fbError = typeof body === 'string' ? JSON.parse(body) : body;
+      } catch {
+        fbError = body ?? err.message;
+      }
+      this.logger.error(
+        `[subscribeAppWebhook] FAILED callback=${callbackUrl}`,
+        JSON.stringify(fbError),
+      );
+      return false;
+    }
+  }
+
   async subscribeToPageWebhook(
     pageId: string,
     pageAccessToken: string,
   ): Promise<boolean> {
     if (!pageId || !pageAccessToken) return false;
+
+    const fields = this.webhookFields.join(',');
+    this.logger.log(
+      `[subscribeToPageWebhook] pageId=${pageId} fields=${fields}`,
+    );
 
     try {
       const response = await got
@@ -761,7 +994,7 @@ export class FacebookOAuthService {
           {
             searchParams: {
               access_token: pageAccessToken,
-              subscribed_fields: this.webhookFields.join(','),
+              subscribed_fields: fields,
             },
             timeout: { request: 15_000 },
           },
@@ -770,12 +1003,12 @@ export class FacebookOAuthService {
 
       if (response.success) {
         this.logger.log(
-          `[FacebookOAuthService] Subscribed webhooks for page ${pageId} successfully`,
+          `[subscribeToPageWebhook] SUCCESS pageId=${pageId}`,
         );
         return true;
       }
       this.logger.warn(
-        `[FacebookOAuthService] Failed to subscribe Facebook webhook for page ${pageId}`,
+        `[subscribeToPageWebhook] Facebook returned success=false for pageId=${pageId}`,
       );
       return false;
     } catch (err: any) {
@@ -787,8 +1020,8 @@ export class FacebookOAuthService {
             : { message: body }
           : body;
       this.logger.error(
-        `Failed to subscribe Facebook webhook for page ${pageId}`,
-        fbError ?? err.message,
+        `[subscribeToPageWebhook] FAILED pageId=${pageId}`,
+        JSON.stringify(fbError ?? err.message),
       );
       return false;
     }
@@ -823,6 +1056,7 @@ export class FacebookOAuthService {
     psid: string,
     pageAccessToken: string,
     message: Record<string, unknown>,
+    replyToMessageId?: string,
   ): Promise<SendMessageResponse> {
     if (!psid || !pageAccessToken) {
       throw new BadRequestException('Missing psid or pageAccessToken');
@@ -838,6 +1072,12 @@ export class FacebookOAuthService {
               messaging_type: 'RESPONSE',
               recipient: { id: psid },
               message,
+              ...(replyToMessageId
+                ? {
+                    // Send API expects reply_to at top-level payload, not inside "message".
+                    reply_to: { mid: replyToMessageId },
+                  }
+                : {}),
             },
             timeout: { request: 15_000 },
           },
@@ -863,32 +1103,44 @@ export class FacebookOAuthService {
     psid: string,
     pageAccessToken: string,
     text: string,
+    replyToMessageId?: string,
   ): Promise<SendMessageResponse> {
     if (!text?.trim()) {
       throw new BadRequestException('Message text is empty');
     }
 
-    return this.postMessageToPsid(psid, pageAccessToken, { text });
+    return this.postMessageToPsid(
+      psid,
+      pageAccessToken,
+      { text },
+      replyToMessageId,
+    );
   }
 
   async sendAttachmentMessageToPsid(
     psid: string,
     pageAccessToken: string,
     attachment: { type: 'image' | 'video' | 'audio' | 'file'; url: string },
+    replyToMessageId?: string,
   ): Promise<SendMessageResponse> {
     if (!attachment?.url?.trim()) {
       throw new BadRequestException('Attachment url is empty');
     }
 
-    return this.postMessageToPsid(psid, pageAccessToken, {
-      attachment: {
-        type: attachment.type,
-        payload: {
-          url: attachment.url,
-          is_reusable: true,
+    return this.postMessageToPsid(
+      psid,
+      pageAccessToken,
+      {
+        attachment: {
+          type: attachment.type,
+          payload: {
+            url: attachment.url,
+            is_reusable: true,
+          },
         },
       },
-    });
+      replyToMessageId,
+    );
   }
 
   async replyToComment(
@@ -906,32 +1158,48 @@ export class FacebookOAuthService {
       throw new BadRequestException('Reply message is empty');
     }
 
-    try {
-      return await got
-        .post(
-          `https://graph.facebook.com/${this.graphApiVersion}/${commentId}/comments`,
-          {
-            searchParams: {
-              access_token: pageAccessToken,
-              message,
+    const triedIds: string[] = [];
+    const candidates = Array.from(
+      new Set(
+        [
+          commentId,
+          // Some sources store comment IDs as "<objectId>_<commentNumericId>".
+          // For a subset of endpoints/pages, the numeric segment is required.
+          commentId.includes('_') ? commentId.split('_').at(-1) ?? '' : '',
+        ].filter((id) => id && id.trim()),
+      ),
+    );
+
+    let lastFbError: any = null;
+    for (const candidateId of candidates) {
+      triedIds.push(candidateId);
+      try {
+        return await got
+          .post(
+            `https://graph.facebook.com/${this.graphApiVersion}/${candidateId}/comments`,
+            {
+              searchParams: {
+                access_token: pageAccessToken,
+                message,
+              },
+              timeout: { request: 15_000 },
             },
-            timeout: { request: 15_000 },
-          },
-        )
-        .json<CreateCommentResponse>();
-    } catch (err: any) {
-      const body = err?.response?.body;
-      const fbError =
-        typeof body === 'string'
-          ? body.startsWith('{')
-            ? JSON.parse(body)
-            : { message: body }
-          : body;
-      this.logger.error(
-        `Failed to reply comment ${commentId}`,
-        fbError ?? err.message,
-      );
-      throw this.mapFbError(fbError?.error);
+          )
+          .json<CreateCommentResponse>();
+      } catch (err: any) {
+        const body = err?.response?.body;
+        lastFbError =
+          typeof body === 'string'
+            ? body.startsWith('{')
+              ? JSON.parse(body)
+              : { message: body }
+            : body;
+      }
     }
+
+    this.logger.error(
+      `Failed to reply comment. inputId=${commentId} tried=${triedIds.join(',')} error=${JSON.stringify(lastFbError ?? {})}`,
+    );
+    throw this.mapFbError(lastFbError?.error);
   }
 }

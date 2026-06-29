@@ -6,6 +6,7 @@ import * as express from 'express';
 import * as fs from 'fs';
 import * as path from 'path';
 import { AppModule } from './app.module';
+import { FacebookPageService } from './facebook/services/facebook-page.service';
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule, { rawBody: true });
@@ -97,6 +98,9 @@ async function bootstrap() {
   await app.listen(port, '0.0.0.0');
   console.log(`HTTP server listening on http://localhost:${port}`);
   console.log(`Swagger: http://localhost:${port}/api-docs`);
+
+  const fbPageService = app.get(FacebookPageService);
+  void fbPageService.registerWebhooksAfterStartup();
 }
 
 bootstrap();

@@ -7,6 +7,7 @@ export interface FeedEventTransform {
   postId: string;
   commentId: string;
   messageId: string;
+  parentCommentId: string | null;
 }
 
 export function transformFeedChange(
@@ -14,10 +15,45 @@ export function transformFeedChange(
 ): FeedEventTransform | null {
   const item = String(value.item ?? '');
   const verb = String(value.verb ?? '');
-  const message = String(value.message ?? value.post ?? '');
+  const rawMessage = value.message ?? value.post ?? '';
+  const message =
+    typeof rawMessage === 'string'
+      ? rawMessage
+      : typeof rawMessage === 'object' && rawMessage && 'message' in rawMessage
+        ? String((rawMessage as { message?: unknown }).message ?? '')
+        : '';
   const from = (value.from ?? {}) as { id?: string; name?: string };
-  const postId = String(value.post_id ?? value.parent_id ?? '');
+  let postId = String(value.post_id ?? '');
   const commentId = String(value.comment_id ?? '');
+
+  if (!postId && typeof value.post === 'string' && /^\d+_\d+$/.test(value.post)) {
+    postId = value.post;
+  }
+  if (
+    !postId &&
+    typeof value.post === 'object' &&
+    value.post &&
+    'id' in value.post
+  ) {
+    const objectPostId = String((value.post as { id?: unknown }).id ?? '');
+    if (/^\d+_\d+$/.test(objectPostId)) {
+      postId = objectPostId;
+    }
+  }
+  if (!postId && /^\d+_\d+(?:_\d+)*$/.test(commentId)) {
+    const parts = commentId.split('_');
+    if (parts.length >= 2) {
+      postId = `${parts[0]}_${parts[1]}`;
+    }
+  }
+
+  // Reply comments may omit post_id; parent_id is the post id for top-level comments.
+  if (item === 'comment' && !postId && value.parent_id) {
+    const parentId = String(value.parent_id);
+    if (/^\d+_\d+$/.test(parentId)) {
+      postId = parentId;
+    }
+  }
 
   if (verb === 'remove') {
     return null;
@@ -48,6 +84,16 @@ export function transformFeedChange(
       ? '[Bình luận mới trên bài viết]'
       : `[Cập nhật feed: ${item}]`);
 
+  // For reply comments, parent_id is the comment being replied to (not the post)
+  let parentCommentId: string | null = null;
+  if (item === 'comment' && value.parent_id) {
+    const pid = String(value.parent_id);
+    // If parent_id looks like a comment ID (not a post ID with underscore pattern)
+    if (pid && pid !== postId) {
+      parentCommentId = pid;
+    }
+  }
+
   return {
     eventType,
     msgType,
@@ -57,5 +103,6 @@ export function transformFeedChange(
     postId,
     commentId,
     messageId: commentId || postId || `${item}-${Date.now()}`,
+    parentCommentId,
   };
 }

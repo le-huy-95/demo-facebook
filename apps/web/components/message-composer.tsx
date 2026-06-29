@@ -10,7 +10,9 @@ interface MessageComposerProps {
   threadId: string;
   shopPictureUrl?: string | null;
   commentId?: string | null;
+  replyToMessageId?: string | null;
   replyPreview?: string | null;
+  replySenderName?: string | null;
   onClearReplyTarget?: () => void;
   disabled?: boolean;
   onSent?: (payload: {
@@ -32,7 +34,9 @@ export function MessageComposer({
   threadId,
   shopPictureUrl = null,
   commentId = null,
+  replyToMessageId = null,
   replyPreview = null,
+  replySenderName = null,
   onClearReplyTarget,
   disabled = false,
   onSent,
@@ -65,6 +69,7 @@ export function MessageComposer({
         pageId,
         threadId,
         commentId: commentId ?? undefined,
+        replyToMessageId: replyToMessageId ?? undefined,
         text: trimmed,
         clientMessageId,
       },
@@ -84,7 +89,7 @@ export function MessageComposer({
         }
       },
     );
-  }, [text, sending, disabled, pageId, threadId, commentId, onSent, onAck]);
+  }, [text, sending, disabled, pageId, threadId, commentId, replyToMessageId, onSent, onAck]);
 
   const handleAttach = useCallback(
     async (file: File) => {
@@ -108,6 +113,7 @@ export function MessageComposer({
             pageId,
             threadId,
             commentId: commentId ?? undefined,
+            replyToMessageId: replyToMessageId ?? undefined,
             text: text.trim() || '',
             clientMessageId,
             attachment: { type, url: data.url },
@@ -131,15 +137,22 @@ export function MessageComposer({
         setUploading(false);
       }
     },
-    [disabled, sending, uploading, pageId, threadId, commentId, onSent, onAck, text],
+    [disabled, sending, uploading, pageId, threadId, commentId, replyToMessageId, onSent, onAck, text],
   );
+
+  const isReplyingComment = Boolean(commentId);
+  const isReplyingMessage = Boolean(replyToMessageId);
+  const isReplying = isReplyingComment || isReplyingMessage;
 
   return (
     <div className="space-y-2">
-      {commentId && (
+      {isReplying && (
         <div className="flex items-start justify-between gap-3 rounded-xl border border-[#fde68a] bg-[#fffbeb] px-3 py-2 text-xs text-[#92400e]">
           <div className="min-w-0">
-            <p className="font-semibold">Đang trả lời bình luận</p>
+            <p className="font-semibold">
+              {isReplyingComment ? 'Đang trả lời bình luận' : 'Đang trả lời tin nhắn'}
+            </p>
+            {replySenderName ? <p className="mt-0.5 text-[#a16207]">cho {replySenderName}</p> : null}
             {replyPreview ? (
               <p className="mt-0.5 line-clamp-2 text-[#a16207]">{replyPreview}</p>
             ) : null}
@@ -150,7 +163,7 @@ export function MessageComposer({
               onClick={onClearReplyTarget}
               className="shrink-0 rounded-lg border border-[#f59e0b]/30 bg-white/60 px-2 py-1 text-[#92400e] hover:bg-white"
             >
-              Bỏ chọn
+              Hủy
             </button>
           ) : null}
         </div>
@@ -202,7 +215,11 @@ export function MessageComposer({
             <span>{uploading ? 'Đang upload...' : 'Đính kèm file / ảnh'}</span>
           </label>
           <p className="text-xs text-[#6b7280]">
-            {commentId ? 'Trả lời bình luận' : 'Tin nhắn'}
+            {isReplyingComment
+              ? 'Trả lời bình luận'
+              : isReplyingMessage
+                ? 'Trả lời tin nhắn'
+                : 'Tin nhắn'}
           </p>
         </div>
       </div>

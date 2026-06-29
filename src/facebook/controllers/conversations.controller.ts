@@ -147,6 +147,7 @@ export class ConversationsController {
         e.createdAt instanceof Date
           ? e.createdAt.toISOString()
           : String(e.createdAt),
+      parentCommentId: (e as any).parentCommentId ?? null,
     }));
 
     return { statusCode: 200, data, paging: result.paging };

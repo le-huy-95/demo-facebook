@@ -202,6 +202,7 @@ export class FacebookRepoService {
         category: true,
         pictureUrl: true,
         pageAccessToken: true,
+        tasks: true,
         webhookSubscribed: true,
         isPinned: true,
         pinnedAt: true,

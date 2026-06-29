@@ -59,9 +59,10 @@ model WebhookEvent {
   senderName     String?  @map("sender_name")
   recipientId    String?  @map("recipient_id")
   messageId      String?  @map("message_id")
-  postId         String?  @map("post_id")
-  commentId      String?  @map("comment_id")
-  msgType        String?  @map("msg_type")
+  postId            String?  @map("post_id")
+  commentId         String?  @map("comment_id")
+  parentCommentId   String?  @map("parent_comment_id")
+  msgType           String?  @map("msg_type")
   content        String?
   rawPayload     String   @map("raw_payload")
   createdAt      DateTime @default(now()) @map("created_at")
@@ -69,6 +70,7 @@ model WebhookEvent {
   @@index([pageId])
   @@index([eventType])
   @@index([createdAt])
+  @@index([parentCommentId])
   @@map("webhook_events")
 }
 

@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, type OnModuleInit } from '@nestjs/common';
 import type { WebhookEvent } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
 import { AppLogger } from '../../common/logger.service';
@@ -19,7 +19,7 @@ type WebhookEventCreateData = Parameters<
 >[0]['data'];
 
 @Injectable()
-export class FacebookWebhookService {
+export class FacebookWebhookService implements OnModuleInit {
   constructor(
     private readonly logger: AppLogger,
     private readonly prisma: PrismaService,
@@ -30,6 +30,58 @@ export class FacebookWebhookService {
     private readonly redisCache: RedisCacheService,
   ) {
     this.logger.setContext(FacebookWebhookService.name);
+  }
+
+  async onModuleInit() {
+    void this.backfillParentCommentIds().catch((err) =>
+      this.logger.warn('Backfill parentCommentId failed', err?.message),
+    );
+  }
+
+  private async backfillParentCommentIds(): Promise<void> {
+    const events = await this.prisma.webhookEvent.findMany({
+      where: {
+        eventType: 'FEED_COMMENT',
+        parentCommentId: null,
+        commentId: { not: null },
+      },
+      select: { id: true, rawPayload: true },
+    });
+
+    let updated = 0;
+    for (const event of events) {
+      try {
+        const raw = JSON.parse(event.rawPayload);
+        let parentCommentId: string | null = null;
+        if (raw.parent?.id) {
+          parentCommentId = raw.parent.id;
+        } else if (raw.parent_id) {
+          const pid = String(raw.parent_id);
+          const postId = raw.post_id ? String(raw.post_id) : null;
+          if (pid && pid !== postId) {
+            parentCommentId = pid;
+          }
+        } else if (raw.targetCommentId) {
+          parentCommentId = raw.targetCommentId;
+        }
+
+        if (parentCommentId) {
+          await this.prisma.webhookEvent.update({
+            where: { id: event.id },
+            data: { parentCommentId },
+          });
+          updated++;
+        }
+      } catch {
+        // skip malformed payloads
+      }
+    }
+
+    if (updated > 0) {
+      this.logger.log(
+        `[Backfill] Updated parentCommentId for ${updated}/${events.length} FEED_COMMENT events`,
+      );
+    }
   }
 
   async processWebhookBody(body: any): Promise<void> {
@@ -225,13 +277,22 @@ export class FacebookWebhookService {
   private extractPostIdFromMessagingEvent(event: any): string | null {
     const referral =
       event?.referral ?? event?.message?.referral ?? event?.postback?.referral;
-    const rawRef: unknown = referral?.ref ?? referral?.ad_id ?? null;
 
-    if (typeof rawRef === 'string' && rawRef) {
-      if (/^\d+_\d+$/.test(rawRef)) return rawRef;
+    if (referral) {
+      const adsPostId = referral?.ads_context_data?.post_id;
+      if (typeof adsPostId === 'string' && adsPostId) {
+        if (/^\d+_\d+$/.test(adsPostId)) return adsPostId;
+        const m = adsPostId.match(/(\d+_\d+)/);
+        if (m?.[1]) return m[1];
+        if (/^\d+$/.test(adsPostId)) return adsPostId;
+      }
 
-      const m = rawRef.match(/(\d+_\d+)/);
-      if (m?.[1]) return m[1];
+      const rawRef: unknown = referral?.ref ?? referral?.ad_id ?? null;
+      if (typeof rawRef === 'string' && rawRef) {
+        if (/^\d+_\d+$/.test(rawRef)) return rawRef;
+        const m = rawRef.match(/(\d+_\d+)/);
+        if (m?.[1]) return m[1];
+      }
     }
 
     const url: unknown =
@@ -263,23 +324,41 @@ export class FacebookWebhookService {
     if (!parsed) return;
 
     const orgId = await this.resolveOrgId(pageId);
+    const isPageAction = parsed.senderId === pageId;
+
+    let recipientId: string | null = null;
+    if (isPageAction && parsed.parentCommentId && parsed.postId) {
+      const parentEvent = await this.prisma.webhookEvent.findFirst({
+        where: {
+          pageId,
+          commentId: parsed.parentCommentId,
+          direction: 'IN',
+        },
+        select: { senderId: true },
+      });
+      if (parentEvent?.senderId) {
+        recipientId = parentEvent.senderId;
+      }
+    }
 
     await this.saveAndBroadcast({
       organizationId: orgId,
       pageId,
       eventType: parsed.eventType,
-      direction: 'IN',
+      direction: isPageAction ? 'OUT' : 'IN',
       senderId: parsed.senderId,
-      senderName: parsed.senderName,
+      recipientId: recipientId,
+      senderName: isPageAction ? 'Page' : parsed.senderName,
       messageId: parsed.messageId,
       postId: parsed.postId || null,
       commentId: parsed.commentId || null,
+      parentCommentId: parsed.parentCommentId || null,
       msgType: parsed.msgType,
       content: parsed.content,
       rawPayload: JSON.stringify(value),
     });
 
-    if (parsed.eventType === 'FEED_COMMENT' && parsed.senderId) {
+    if (parsed.eventType === 'FEED_COMMENT' && parsed.senderId && !isPageAction) {
       if (orgId) {
         void this.conversationsService
           .fetchAndCacheCustomerProfile(
@@ -298,7 +377,7 @@ export class FacebookWebhookService {
     }
 
     this.logger.log(
-      `[Webhook] ${parsed.eventType} pageId=${pageId} postId=${parsed.postId}`,
+      `[Webhook] ${parsed.eventType} ${isPageAction ? 'OUT' : 'IN'} pageId=${pageId} postId=${parsed.postId} commentId=${parsed.commentId} recipientId=${recipientId}`,
     );
   }
 

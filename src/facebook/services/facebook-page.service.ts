@@ -24,6 +24,9 @@ interface FacebookAuthDto {
 
 @Injectable()
 export class FacebookPageService implements OnModuleInit {
+  private readonly SUBSCRIBE_MAX_RETRIES = 3;
+  private readonly SUBSCRIBE_BASE_DELAY_MS = 2000;
+
   constructor(
     private readonly logger: AppLogger,
     private readonly configService: ConfigService,
@@ -46,9 +49,92 @@ export class FacebookPageService implements OnModuleInit {
         isAiEnabled: true,
       });
     }
+
     if (pages.length > 0) {
       this.logger.log(`Restored ${pages.length} page mapping(s) from database`);
     }
+  }
+
+  /**
+   * Must be called AFTER the HTTP server is listening so Facebook can
+   * verify the callback URL during subscription.
+   */
+  async registerWebhooksAfterStartup(): Promise<void> {
+    const orgId = this.getDefaultOrgId();
+
+    const appOk = await this.subscribeAppWebhookWithRetry();
+    if (!appOk) {
+      this.logger.error(
+        '[Startup] App-level webhook registration FAILED after retries — ' +
+          'Facebook will NOT deliver feed/comment events. ' +
+          'Check PUBLIC_BASE_URL, FACEBOOK_APP_ID, FACEBOOK_APP_SECRET.',
+      );
+      return;
+    }
+    this.logger.log('[Startup] App-level webhook callback registered with Facebook');
+
+    const pages = await this.facebookRepo.listPages(orgId);
+    if (pages.length === 0) return;
+
+    const unsubscribed = pages.filter(
+      (p) => p.pageAccessToken && !p.webhookSubscribed,
+    );
+    if (unsubscribed.length === 0) {
+      this.logger.log(
+        `[Startup] All ${pages.length} page(s) already subscribed — skipping re-subscription`,
+      );
+      return;
+    }
+
+    let subscribed = 0;
+    for (const page of unsubscribed) {
+      if (!page.pageAccessToken) continue;
+      try {
+        await this.delay(500);
+        const ok = await this.facebookOAuthService.subscribeToPageWebhook(
+          page.pageId,
+          page.pageAccessToken,
+        );
+        if (ok) {
+          subscribed++;
+          await this.facebookRepo.updatePageWebhook(page.id, true);
+          this.logger.log(
+            `[Startup] Page ${page.pageId} (${page.name}) webhook subscribed`,
+          );
+        } else {
+          this.logger.warn(
+            `[Startup] Page ${page.pageId} (${page.name}) webhook subscription failed`,
+          );
+        }
+      } catch (err: any) {
+        this.logger.warn(
+          `[Startup] Page ${page.pageId} webhook error: ${err?.message}`,
+        );
+      }
+    }
+    this.logger.log(
+      `[Startup] Subscribed ${subscribed}/${unsubscribed.length} unsubscribed page(s)`,
+    );
+  }
+
+  private async subscribeAppWebhookWithRetry(): Promise<boolean> {
+    for (let attempt = 1; attempt <= this.SUBSCRIBE_MAX_RETRIES; attempt++) {
+      const ok = await this.facebookOAuthService.subscribeAppWebhook();
+      if (ok) return true;
+
+      if (attempt < this.SUBSCRIBE_MAX_RETRIES) {
+        const delay = this.SUBSCRIBE_BASE_DELAY_MS * attempt;
+        this.logger.warn(
+          `[Startup] App webhook attempt ${attempt}/${this.SUBSCRIBE_MAX_RETRIES} failed, retrying in ${delay}ms...`,
+        );
+        await this.delay(delay);
+      }
+    }
+    return false;
+  }
+
+  private delay(ms: number): Promise<void> {
+    return new Promise((r) => setTimeout(r, ms));
   }
 
   getDefaultOrgId(): string {
@@ -122,11 +208,18 @@ export class FacebookPageService implements OnModuleInit {
         fbUserName,
         pageTokens,
       );
-    await this.subscribeWebhooks(resolvedCredentialId, pageTokens);
+
     await this.syncPagesWithForward(
       resolvedCredentialId,
       stateData.orgId,
       pageTokens,
+    );
+
+    void this.subscribeWebhooks(resolvedCredentialId, pageTokens).catch(
+      (err) =>
+        this.logger.warn(
+          `[handleOAuthCallback] webhook subscription deferred: ${err?.message}`,
+        ),
     );
 
     this.logger.log(
@@ -269,6 +362,59 @@ export class FacebookPageService implements OnModuleInit {
     return { disconnectedPages: pages.length };
   }
 
+  async getPageSubscriptions(): Promise<any[]> {
+    const orgId = this.getDefaultOrgId();
+    const pages = await this.facebookRepo.listPages(orgId);
+    const results: any[] = [];
+
+    for (const page of pages) {
+      if (!page.pageAccessToken) {
+        results.push({ pageId: page.pageId, name: page.name, error: 'No access token' });
+        continue;
+      }
+      try {
+        await this.delay(300);
+        const status = await this.facebookOAuthService.getPageSubscriptionStatus(
+          page.pageId,
+          page.pageAccessToken,
+        );
+        results.push({ pageId: page.pageId, name: page.name, subscriptions: status });
+      } catch (err: any) {
+        results.push({ pageId: page.pageId, name: page.name, error: err?.message });
+      }
+    }
+
+    return results;
+  }
+
+  async resubscribeAllPages(): Promise<any[]> {
+    const orgId = this.getDefaultOrgId();
+    const pages = await this.facebookRepo.listPages(orgId);
+    const results: any[] = [];
+
+    for (const page of pages) {
+      if (!page.pageAccessToken) {
+        results.push({ pageId: page.pageId, name: page.name, subscribed: false, reason: 'No access token' });
+        continue;
+      }
+      try {
+        await this.delay(500);
+        const ok = await this.facebookOAuthService.subscribeToPageWebhook(
+          page.pageId,
+          page.pageAccessToken,
+        );
+        if (ok) {
+          await this.facebookRepo.updatePageWebhook(page.id, true);
+        }
+        results.push({ pageId: page.pageId, name: page.name, subscribed: ok });
+      } catch (err: any) {
+        results.push({ pageId: page.pageId, name: page.name, subscribed: false, reason: err?.message });
+      }
+    }
+
+    return results;
+  }
+
   private async fetchTokenAndPages(
     code: string,
     state: string,
@@ -285,37 +431,18 @@ export class FacebookPageService implements OnModuleInit {
     const shortLived =
       await this.facebookOAuthService.exchangeCodeForToken(code);
 
-    const [fbUser, freshPageTokens] = await Promise.all([
+    const [fbUser, longLived] = await Promise.all([
       this.facebookOAuthService.getMe(shortLived.access_token),
-      this.facebookOAuthService.getPageTokens(shortLived.access_token),
+      this.facebookOAuthService.extendToLongLivedToken(shortLived.access_token),
     ]);
-
-    const longLived = await this.facebookOAuthService.extendToLongLivedToken(
-      shortLived.access_token,
-    );
 
     const userTokenExpiresAt = longLived.expires_in
       ? new Date(Date.now() + longLived.expires_in * 1000)
       : new Date(Date.now() + 60 * 24 * 60 * 60 * 1000);
 
-    const longLivedPageTokens = await this.facebookOAuthService.getPageTokens(
+    const pageTokens = await this.facebookOAuthService.getPageTokens(
       longLived.access_token,
     );
-
-    const validPageIds = new Set(freshPageTokens.map((p) => p.pageId));
-    const pageTokens = longLivedPageTokens.filter((p) =>
-      validPageIds.has(p.pageId),
-    );
-
-    const longLivedPageIds = new Set(longLivedPageTokens.map((p) => p.pageId));
-    for (const fresh of freshPageTokens) {
-      if (!longLivedPageIds.has(fresh.pageId)) {
-        this.logger.warn(
-          `[FacebookPageService] Page ${fresh.pageId} missing in long-lived token. Falling back to short-lived page token.`,
-        );
-        pageTokens.push(fresh);
-      }
-    }
 
     return {
       stateData,
@@ -375,8 +502,16 @@ export class FacebookPageService implements OnModuleInit {
   ): Promise<void> {
     if (pageTokens.length === 0) return;
 
+    const appOk = await this.facebookOAuthService.subscribeAppWebhook();
+    if (!appOk) {
+      this.logger.warn(
+        '[subscribeWebhooks] App-level webhook registration failed — page subscriptions may not deliver events',
+      );
+    }
+
     for (const page of pageTokens) {
       try {
+        await this.delay(300);
         const subscribed =
           await this.facebookOAuthService.subscribeToPageWebhook(
             page.pageId,

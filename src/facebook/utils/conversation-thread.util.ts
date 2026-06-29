@@ -37,6 +37,14 @@ export function pickBetterSenderName(
   return primary?.trim() || fallback?.trim() || 'Khách hàng';
 }
 
+/**
+ * Resolves the root comment ID for a FEED_COMMENT event.
+ * Facebook only supports 1 level of nesting, so parentCommentId IS the root.
+ */
+export function resolveRootCommentId(event: WebhookEvent): string | null {
+  return event.parentCommentId ?? event.commentId ?? null;
+}
+
 export function buildThreadId(event: WebhookEvent): string | null {
   if (!event.pageId) return null;
 
@@ -51,8 +59,24 @@ export function buildThreadId(event: WebhookEvent): string | null {
   }
 
   if (event.eventType === 'FEED_COMMENT') {
-    if (!event.postId || !event.senderId) return null;
-    return `comment:${event.pageId}:${event.postId}:${event.senderId}`;
+    if (!event.postId) return null;
+
+    const rootCommentId = resolveRootCommentId(event);
+    if (!rootCommentId) return null;
+
+    let customerId: string | null;
+    if (event.direction === 'OUT') {
+      if (event.senderId && event.senderId !== event.pageId) {
+        customerId = event.senderId;
+      } else {
+        customerId = event.recipientId;
+      }
+    } else {
+      customerId = event.senderId;
+    }
+
+    if (!customerId || customerId === event.pageId) return null;
+    return `comment:${event.pageId}:${event.postId}:${customerId}:${rootCommentId}`;
   }
 
   return null;
@@ -63,6 +87,7 @@ export function parseThreadId(threadId: string): {
   pageId: string;
   senderId: string;
   postId?: string;
+  commentId?: string;
 } | null {
   const parts = threadId.split(':');
   if (parts[0] === 'messenger' && parts.length >= 3) {
@@ -70,6 +95,15 @@ export function parseThreadId(threadId: string): {
       kind: 'MESSENGER',
       pageId: parts[1],
       senderId: parts.slice(2).join(':'),
+    };
+  }
+  if (parts[0] === 'comment' && parts.length >= 5) {
+    return {
+      kind: 'FEED_COMMENT',
+      pageId: parts[1],
+      postId: parts[2],
+      senderId: parts[3],
+      commentId: parts.slice(4).join(':'),
     };
   }
   if (parts[0] === 'comment' && parts.length >= 4) {
@@ -111,16 +145,52 @@ export function buildThreadEventWhere(
     };
   }
 
+  if (parsed.commentId) {
+    return {
+      pageId,
+      eventType: 'FEED_COMMENT',
+      postId: parsed.postId,
+      AND: [
+        { OR: [{ organizationId: orgId }, { organizationId: null }] },
+        {
+          OR: [
+            { commentId: parsed.commentId },
+            { parentCommentId: parsed.commentId },
+          ],
+        },
+      ],
+    };
+  }
+
+  // Legacy fallback: old thread IDs without rootCommentId
   return {
-    ...base,
+    pageId,
     eventType: 'FEED_COMMENT',
     postId: parsed.postId,
-    senderId: parsed.senderId,
+    AND: [
+      { OR: [{ organizationId: orgId }, { organizationId: null }] },
+      {
+        OR: [
+          { senderId: parsed.senderId },
+          { senderId: parsed.pageId, direction: 'OUT', recipientId: parsed.senderId },
+          { senderId: parsed.pageId, direction: 'OUT', recipientId: null },
+        ],
+      },
+    ],
   };
 }
 
 export function resolveCustomerId(event: WebhookEvent): string {
   if (event.eventType === 'FEED_COMMENT') {
+    if (event.direction === 'OUT') {
+      if (event.recipientId && event.recipientId !== event.pageId) {
+        return event.recipientId;
+      }
+      if (event.senderId && event.senderId !== event.pageId) {
+        return event.senderId;
+      }
+      return event.recipientId ?? '';
+    }
     return event.senderId ?? '';
   }
 
@@ -148,6 +218,7 @@ export function aggregateConversations(
 
     const existing = map.get(threadId);
     const customerId = resolveCustomerId(event);
+    const rootCommentId = kind === 'FEED_COMMENT' ? resolveRootCommentId(event) : null;
 
     if (!existing) {
       const inboundName =
@@ -166,7 +237,7 @@ export function aggregateConversations(
         preview: event.content ?? '',
         lastMessageAt: event.createdAt.toISOString(),
         postId: event.postId,
-        commentId: event.commentId,
+        commentId: rootCommentId ?? event.commentId,
         messageCount: 1,
         _latest: ts,
       });
