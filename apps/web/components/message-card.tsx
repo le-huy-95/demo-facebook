@@ -36,6 +36,16 @@ export function MessageCard({ message }: { message: WebhookMessage }) {
 
       <p className="mb-3 text-sm leading-6 text-[var(--text)]">{message.content || '(Không có nội dung)'}</p>
 
+      {message.status && message.status !== 'ACTIVE' && (
+        <p className="mb-3 text-xs text-amber-600">
+          {message.status === 'HIDDEN'
+            ? 'Đã bị ẩn trên Facebook'
+            : message.status === 'DELETED'
+              ? 'Đã bị xóa trên Facebook'
+              : `Trạng thái: ${message.status}`}
+        </p>
+      )}
+
       <dl className="grid gap-1 text-xs text-[var(--muted)] sm:grid-cols-2">
         {message.senderName && (
           <div>

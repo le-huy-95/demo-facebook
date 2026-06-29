@@ -64,11 +64,14 @@ model WebhookEvent {
   msgType        String?  @map("msg_type")
   content        String?
   rawPayload     String   @map("raw_payload")
+  /// ACTIVE | HIDDEN | DELETED — ẩn/xóa trên Facebook thì không trả ra API list
+  status         String   @default("ACTIVE")
   createdAt      DateTime @default(now()) @map("created_at")
 
   @@index([pageId])
   @@index([eventType])
   @@index([createdAt])
+  @@index([status])
   @@map("webhook_events")
 }
 

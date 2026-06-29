@@ -1,3 +1,4 @@
+import { AppLogger } from '../../common/logger.service';
 import {
   BadRequestException,
   Injectable,
@@ -11,6 +12,8 @@ import { PageMapService } from './page-map.service';
 import { ConfigService } from '@nestjs/config';
 import { RedisCacheService } from '../../redis/redis-cache.service';
 import { parseThreadId } from '../utils/conversation-thread.util';
+import { isValidFacebookCommentId } from '../utils/facebook-comment-id.util';
+import { resolvePublicAssetUrl } from '../../common/public-url.util';
 
 export interface OutboundAttachment {
   type: 'image' | 'video' | 'audio' | 'file';
@@ -26,7 +29,10 @@ export class FacebookMessagingService {
     private readonly pageMapService: PageMapService,
     private readonly configService: ConfigService,
     private readonly redisCache: RedisCacheService,
-  ) {}
+    private readonly logger: AppLogger,
+  ) {
+    this.logger.setContext(FacebookMessagingService.name);
+  }
 
   private getDefaultOrgId(): string {
     return this.configService.get<string>('DEFAULT_ORG_ID', 'default-org');
@@ -127,18 +133,17 @@ export class FacebookMessagingService {
         throw new BadRequestException('Reply text is required for comments');
       }
 
-      const targetCommentId = input.commentId?.trim()
-        ? input.commentId.trim()
-        : await this.resolveLatestInboundCommentId({
-            pageId,
-            postId: parsed.postId!,
-            customerId: parsed.senderId,
-          });
+      const targetCommentId = await this.resolveValidReplyTargetCommentId({
+        pageId,
+        postId: parsed.postId!,
+        customerId: parsed.senderId,
+        requestedCommentId: input.commentId?.trim(),
+        pageAccessToken,
+      });
 
-      if (!targetCommentId) {
-        throw new NotFoundException('Không tìm thấy commentId để phản hồi');
-      }
-
+      this.logger.log(
+        `[Messaging] Replying to comment ${targetCommentId} on post ${parsed.postId} for customer ${parsed.senderId}`,
+      );
       const fbResp = await this.facebookOAuth.replyToComment(
         targetCommentId,
         pageAccessToken,
@@ -170,6 +175,7 @@ export class FacebookMessagingService {
         },
       });
 
+      await this.redisCache.bumpPageRevision(orgId, pageId);
       await this.redisCache.bumpThreadRevision(pageId, threadId);
 
       return {
@@ -186,7 +192,10 @@ export class FacebookMessagingService {
       ? await this.facebookOAuth.sendAttachmentMessageToPsid(
           parsed.senderId,
           pageAccessToken,
-          attachment,
+          {
+            ...attachment,
+            url: this.resolveAttachmentUrl(attachment.url),
+          },
         )
       : await this.facebookOAuth.sendTextMessageToPsid(
           parsed.senderId,
@@ -219,6 +228,7 @@ export class FacebookMessagingService {
       },
     });
 
+    await this.redisCache.bumpPageRevision(orgId, pageId);
     await this.redisCache.bumpThreadRevision(pageId, threadId);
 
     return {
@@ -236,12 +246,83 @@ export class FacebookMessagingService {
     return this.sendToThread(input);
   }
 
+  /** Chọn comment parent còn tồn tại trên Graph — tránh reply vào ID cũ/đã xóa. */
+  private async resolveValidReplyTargetCommentId(input: {
+    pageId: string;
+    postId: string;
+    customerId: string;
+    requestedCommentId?: string;
+    pageAccessToken: string;
+  }): Promise<string> {
+    const candidates: string[] = [];
+
+    if (
+      input.requestedCommentId &&
+      isValidFacebookCommentId(input.requestedCommentId)
+    ) {
+      candidates.push(input.requestedCommentId);
+    }
+
+    const inboundRows = await this.prisma.webhookEvent.findMany({
+      where: {
+        pageId: input.pageId,
+        eventType: 'FEED_COMMENT',
+        direction: 'IN',
+        postId: input.postId,
+        senderId: input.customerId,
+        commentId: { not: null },
+      },
+      orderBy: { createdAt: 'desc' },
+      take: 20,
+      select: { commentId: true },
+    });
+    for (const row of inboundRows) {
+      if (row.commentId && isValidFacebookCommentId(row.commentId)) {
+        candidates.push(row.commentId);
+      }
+    }
+
+    const graphFallback = await this.resolveLatestInboundCommentId({
+      pageId: input.pageId,
+      postId: input.postId,
+      customerId: input.customerId,
+      pageAccessToken: input.pageAccessToken,
+    });
+    if (graphFallback) {
+      candidates.push(graphFallback);
+    }
+
+    const seen = new Set<string>();
+    for (const id of candidates) {
+      if (seen.has(id)) continue;
+      seen.add(id);
+
+      const meta = await this.facebookOAuth.getCommentMeta(
+        id,
+        input.pageAccessToken,
+      );
+      if (meta?.id) {
+        if (id !== input.requestedCommentId) {
+          this.logger.warn(
+            `[Messaging] commentId ${input.requestedCommentId ?? 'none'} không hợp lệ, dùng ${meta.id}`,
+          );
+        }
+        return meta.id;
+      }
+    }
+
+    throw new NotFoundException(
+      'Không tìm thấy bình luận khách hàng còn tồn tại trên Facebook. Tải lại thread hoặc chọn bình luận khác.',
+    );
+  }
+
   private async resolveLatestInboundCommentId(input: {
     pageId: string;
     postId: string;
     customerId: string;
+    pageAccessToken?: string;
   }): Promise<string | null> {
-    const row = await this.prisma.webhookEvent.findFirst({
+    const inbound = await this.prisma.webhookEvent.findFirst({
       where: {
         pageId: input.pageId,
         eventType: 'FEED_COMMENT',
@@ -253,7 +334,60 @@ export class FacebookMessagingService {
       orderBy: { createdAt: 'desc' },
       select: { commentId: true },
     });
+    if (inbound?.commentId && isValidFacebookCommentId(inbound.commentId)) {
+      return inbound.commentId;
+    }
 
-    return row?.commentId ?? null;
+    // Fallback: comment gần nhất trong thread (kể cả từ Graph sync)
+    const anyInThread = await this.prisma.webhookEvent.findFirst({
+      where: {
+        pageId: input.pageId,
+        eventType: 'FEED_COMMENT',
+        postId: input.postId,
+        senderId: input.customerId,
+        commentId: { not: null },
+      },
+      orderBy: { createdAt: 'desc' },
+      select: { commentId: true },
+    });
+    if (
+      anyInThread?.commentId &&
+      isValidFacebookCommentId(anyInThread.commentId)
+    ) {
+      return anyInThread.commentId;
+    }
+
+    // Fallback cuối: lấy từ Graph API comment mới nhất của khách trên post
+    try {
+      const token =
+        input.pageAccessToken ??
+        (await this.resolvePageAccessToken(
+          input.pageId,
+          this.getDefaultOrgId(),
+        ));
+      const { comments } = await this.facebookOAuth.getPostComments(
+        input.postId,
+        token,
+        { limit: 50 },
+      );
+      const customerComment = comments
+        .filter((c) => c.from?.id === input.customerId && c.id)
+        .sort(
+          (a, b) =>
+            new Date(b.created_time).getTime() -
+            new Date(a.created_time).getTime(),
+        )[0];
+      return customerComment?.id ?? null;
+    } catch {
+      return null;
+    }
+  }
+
+  private resolveAttachmentUrl(url: string): string {
+    const publicBaseUrl = this.configService.get<string>(
+      'PUBLIC_BASE_URL',
+      'http://localhost:3000',
+    );
+    return resolvePublicAssetUrl(url, publicBaseUrl);
   }
 }

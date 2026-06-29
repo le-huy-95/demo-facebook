@@ -26,4 +26,16 @@ export class FacebookOAuthCallbackDto {
   @IsString()
   @IsOptional()
   error_reason?: string;
+
+  /** Facebook gửi kèm khi user từ chối / hủy OAuth (vd. error_code=200). */
+  @ApiPropertyOptional()
+  @IsString()
+  @IsOptional()
+  error_code?: string;
+
+  /** Facebook gửi kèm khi user đóng popup (vd. action=cancel). */
+  @ApiPropertyOptional()
+  @IsString()
+  @IsOptional()
+  action?: string;
 }

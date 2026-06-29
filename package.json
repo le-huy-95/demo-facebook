@@ -31,6 +31,7 @@
     "dev:ngrok:backend:nokill": "powershell -ExecutionPolicy Bypass -File ./scripts/start-ngrok-backend-nokill.ps1",
     "dev:ngrok:both": "concurrently -n ngrok_frontend,ngrok_backend -c green,magenta \"npm run dev:ngrok:frontend:nokill\" \"npm run dev:ngrok:backend:nokill\"",
     "sync:ngrok": "powershell -ExecutionPolicy Bypass -File ./scripts/sync-ngrok-env.ps1",
+    "sync:ngrok:mac": "bash ./scripts/sync-ngrok-env.sh",
     "sync:ngrok:backend": "powershell -ExecutionPolicy Bypass -File ./scripts/sync-ngrok-backend-env.ps1",
     "dev:full": "concurrently -n backend,ngrok -c blue,magenta \"npm run dev:backend\" \"npm run dev:ngrok\"",
     "prisma:generate": "prisma generate",

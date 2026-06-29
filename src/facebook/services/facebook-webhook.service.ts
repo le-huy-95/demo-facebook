@@ -1,4 +1,5 @@
-import { Injectable } from '@nestjs/common';
+import { BadRequestException, Injectable } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import type { WebhookEvent } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
 import { AppLogger } from '../../common/logger.service';
@@ -6,12 +7,21 @@ import { PageMapService } from '../services/page-map.service';
 import { EventsService } from '../services/events.service';
 import { EventsGateway } from '../gateways/events.gateway';
 import { ConversationsService } from '../services/conversations.service';
+import { FacebookOAuthService } from '../services/facebook-oauth.service';
+import { FacebookRepoService } from '../services/facebook-repo.service';
 import {
   transformInboundMessage,
   transformMessagingReceipt,
 } from '../utils/facebook-payload.util';
-import { transformFeedChange } from '../utils/facebook-feed.util';
+import { transformFeedChange, extractFeedCommentKey, extractFeedPostKey, type FeedEventTransform } from '../utils/facebook-feed.util';
 import { buildThreadId } from '../utils/conversation-thread.util';
+import { isValidFacebookCommentId } from '../utils/facebook-comment-id.util';
+import {
+  EVENT_STATUS_ACTIVE,
+  EVENT_STATUS_DELETED,
+  EVENT_STATUS_HIDDEN,
+  type EventVisibilityStatus,
+} from '../utils/event-visibility.util';
 import { RedisCacheService } from '../../redis/redis-cache.service';
 
 type WebhookEventCreateData = Parameters<
@@ -28,6 +38,9 @@ export class FacebookWebhookService {
     private readonly eventsGateway: EventsGateway,
     private readonly conversationsService: ConversationsService,
     private readonly redisCache: RedisCacheService,
+    private readonly facebookOAuth: FacebookOAuthService,
+    private readonly facebookRepo: FacebookRepoService,
+    private readonly configService: ConfigService,
   ) {
     this.logger.setContext(FacebookWebhookService.name);
   }
@@ -44,10 +57,40 @@ export class FacebookWebhookService {
         await this.processMessagingEvent(pageId, messagingEvent);
       }
 
-      for (const change of entry.changes ?? []) {
-        if (change.field === 'feed') {
-          await this.processFeedChange(pageId, change.value);
+      const changes = entry.changes ?? [];
+      const changedFields = (entry.changed_fields ?? []) as string[];
+      let hasFeedActivity = changedFields.includes('feed');
+
+      for (const change of changes) {
+        const field = String(change.field ?? '');
+        const value = (change.value ?? {}) as Record<string, unknown>;
+
+        if (field === 'feed') {
+          hasFeedActivity = true;
+          this.logger.log(
+            `[Webhook] feed change item=${String(value?.item ?? '')} verb=${String(value?.verb ?? '')} pageId=${pageId}`,
+          );
+          await this.processFeedChange(pageId, value);
+          continue;
         }
+
+        if (field) {
+          this.logger.log(
+            `[Webhook] change field=${field} item=${String(value?.item ?? '')} verb=${String(value?.verb ?? '')} pageId=${pageId}`,
+          );
+        }
+      }
+
+      if (changedFields.length > 0) {
+        this.logger.log(
+          `[Webhook] changed_fields=[${changedFields.join(',')}] pageId=${pageId} changes=${changes.length}`,
+        );
+      }
+
+      // Meta thường gửi changed_fields=feed không kèm changes[] — đồng bộ Graph làm lưới an toàn
+      if (hasFeedActivity) {
+        const syncResult = await this.syncFeedCommentsFromGraph(pageId);
+        this.eventsGateway.emitFeedSynced(pageId, syncResult);
       }
     }
   }
@@ -66,7 +109,26 @@ export class FacebookWebhookService {
   private async findDuplicateEvent(
     data: WebhookEventCreateData,
   ): Promise<WebhookEvent | null> {
-    if (!data.pageId || !data.messageId) return null;
+    if (!data.pageId) return null;
+
+    const isFeedComment =
+      data.eventType === 'FEED_COMMENT' ||
+      data.msgType?.startsWith('feed.comment');
+
+    if (isFeedComment) {
+      const commentKey = data.commentId ?? data.messageId;
+      if (!commentKey) return null;
+
+      return this.prisma.webhookEvent.findFirst({
+        where: {
+          pageId: data.pageId,
+          eventType: 'FEED_COMMENT',
+          OR: [{ messageId: commentKey }, { commentId: commentKey }],
+        },
+      });
+    }
+
+    if (!data.messageId) return null;
 
     return this.prisma.webhookEvent.findFirst({
       where: {
@@ -83,6 +145,9 @@ export class FacebookWebhookService {
       this.logger.debug(
         `[Webhook] Duplicate skipped pageId=${data.pageId} messageId=${data.messageId} msgType=${data.msgType}`,
       );
+      // Vẫn broadcast để client không bỏ lỡ realtime (socket reconnect, tab mới, v.v.)
+      this.eventsService.emitNewMessage(duplicate);
+      this.eventsGateway.emitWebhookEvent(duplicate);
       return duplicate;
     }
 
@@ -99,6 +164,11 @@ export class FacebookWebhookService {
   ): Promise<void> {
     if (!pageId) return;
 
+    const orgId =
+      event.organizationId ??
+      this.configService.get<string>('DEFAULT_ORG_ID', 'default-org');
+    await this.redisCache.bumpPageRevision(orgId, pageId);
+
     const threadId = buildThreadId(event);
     if (threadId) {
       await this.redisCache.bumpThreadRevision(pageId, threadId);
@@ -111,6 +181,119 @@ export class FacebookWebhookService {
     }
   }
 
+  private async markCommentVisibility(
+    pageId: string,
+    commentKey: string,
+    status: EventVisibilityStatus,
+  ): Promise<void> {
+    const updated = await this.prisma.webhookEvent.updateMany({
+      where: {
+        pageId,
+        eventType: 'FEED_COMMENT',
+        OR: [{ commentId: commentKey }, { messageId: commentKey }],
+      },
+      data: { status },
+    });
+
+    if (updated.count === 0) {
+      this.logger.debug(
+        `[Webhook] ${status} comment ${commentKey} — không có event trong DB`,
+      );
+    } else {
+      this.logger.log(
+        `[Webhook] Comment ${commentKey} → ${status} (${updated.count} event)`,
+      );
+    }
+
+    const orgId = await this.resolveOrgId(pageId);
+    if (orgId) {
+      await this.redisCache.bumpPageRevision(orgId, pageId);
+    }
+
+    const sample = await this.prisma.webhookEvent.findFirst({
+      where: {
+        pageId,
+        OR: [{ commentId: commentKey }, { messageId: commentKey }],
+      },
+    });
+    const threadId = sample ? buildThreadId(sample) : null;
+
+    this.eventsGateway.emitContentRemoved({
+      pageId,
+      threadId: threadId ?? undefined,
+      commentId: commentKey,
+      status,
+    });
+  }
+
+  private async markPostCommentsVisibility(
+    pageId: string,
+    postId: string,
+    status: EventVisibilityStatus,
+  ): Promise<void> {
+    const updated = await this.prisma.webhookEvent.updateMany({
+      where: {
+        pageId,
+        postId,
+        eventType: 'FEED_COMMENT',
+      },
+      data: { status },
+    });
+
+    this.logger.log(
+      `[Webhook] Post ${postId} comments → ${status} (${updated.count} event)`,
+    );
+
+    const orgId = await this.resolveOrgId(pageId);
+    if (orgId) {
+      await this.redisCache.bumpPageRevision(orgId, pageId);
+    }
+
+    this.eventsGateway.emitContentRemoved({
+      pageId,
+      postId,
+      status,
+    });
+  }
+
+  private async markMessengerMessageVisibility(
+    pageId: string,
+    messageId: string,
+    status: EventVisibilityStatus,
+  ): Promise<void> {
+    const updated = await this.prisma.webhookEvent.updateMany({
+      where: {
+        pageId,
+        messageId,
+        eventType: { in: ['MESSENGER', 'MESSENGER_POSTBACK'] },
+      },
+      data: { status },
+    });
+
+    if (updated.count > 0) {
+      this.logger.log(
+        `[Webhook] Messenger ${messageId} → ${status} (${updated.count} event)`,
+      );
+    }
+
+    const orgId = await this.resolveOrgId(pageId);
+    if (orgId) {
+      await this.redisCache.bumpPageRevision(orgId, pageId);
+    }
+
+    const sample = await this.prisma.webhookEvent.findFirst({
+      where: { pageId, messageId },
+    });
+    const threadId = sample ? buildThreadId(sample) : null;
+
+    this.eventsGateway.emitContentRemoved({
+      pageId,
+      threadId: threadId ?? undefined,
+      messageId,
+      status,
+    });
+  }
+
   private async processMessagingEvent(
     pageId: string,
     event: any,
@@ -121,6 +304,15 @@ export class FacebookWebhookService {
     }
 
     if (!event.message && !event.postback) return;
+
+    // Messenger: user/page thu hồi tin nhắn
+    if (event.message?.is_deleted === true) {
+      const mid = event.message?.mid ?? '';
+      if (mid) {
+        await this.markMessengerMessageVisibility(pageId, mid, EVENT_STATUS_DELETED);
+      }
+      return;
+    }
 
     const postId = this.extractPostIdFromMessagingEvent(event);
     const resolvedOrgId = await this.resolveOrgId(pageId);
@@ -259,47 +451,441 @@ export class FacebookWebhookService {
     pageId: string,
     value: Record<string, unknown>,
   ): Promise<void> {
+    const item = String(value.item ?? '');
+    const verb = String(value.verb ?? '');
+
+    if (item === 'comment' && (verb === 'remove' || verb === 'hide')) {
+      const commentKey = extractFeedCommentKey(value);
+      if (commentKey) {
+        await this.markCommentVisibility(
+          pageId,
+          commentKey,
+          verb === 'hide' ? EVENT_STATUS_HIDDEN : EVENT_STATUS_DELETED,
+        );
+      }
+      return;
+    }
+
+    if (item === 'comment' && verb === 'unhide') {
+      const commentKey = extractFeedCommentKey(value);
+      if (commentKey) {
+        await this.markCommentVisibility(pageId, commentKey, EVENT_STATUS_ACTIVE);
+      }
+      return;
+    }
+
+    if (item === 'post' && verb === 'remove') {
+      const postKey = extractFeedPostKey(value);
+      if (postKey) {
+        await this.markPostCommentsVisibility(pageId, postKey, EVENT_STATUS_DELETED);
+      }
+      return;
+    }
+
     const parsed = transformFeedChange(value);
-    if (!parsed) return;
+    if (!parsed) {
+      this.logger.debug(
+        `[Webhook] feed value bỏ qua item=${String(value?.item ?? '')} verb=${String(value?.verb ?? '')}`,
+      );
+      return;
+    }
 
     const orgId = await this.resolveOrgId(pageId);
+
+    if (parsed.eventType !== 'FEED_COMMENT') {
+      await this.saveAndBroadcast({
+        organizationId: orgId,
+        pageId,
+        eventType: parsed.eventType,
+        direction: 'IN',
+        senderId: parsed.senderId,
+        senderName: parsed.senderName,
+        messageId: parsed.messageId,
+        postId: parsed.postId || null,
+        commentId: parsed.commentId || null,
+        msgType: parsed.msgType,
+        content: parsed.content,
+        rawPayload: JSON.stringify(value),
+      });
+      return;
+    }
+
+    let postId = parsed.postId;
+    if (!postId && parsed.commentId && isValidFacebookCommentId(parsed.commentId)) {
+      postId = await this.resolvePostIdFromComment(
+        pageId,
+        parsed.commentId,
+        orgId,
+      );
+    }
+
+    if (parsed.senderId === pageId) {
+      await this.processPageCommentReply(pageId, parsed, postId, orgId, value);
+      return;
+    }
+
+    if (!parsed.senderId) return;
+
+    if (!postId) {
+      this.logger.warn(
+        `[Webhook] FEED_COMMENT thiếu postId, bỏ qua commentId=${parsed.commentId}`,
+      );
+      return;
+    }
 
     await this.saveAndBroadcast({
       organizationId: orgId,
       pageId,
-      eventType: parsed.eventType,
+      eventType: 'FEED_COMMENT',
       direction: 'IN',
       senderId: parsed.senderId,
       senderName: parsed.senderName,
       messageId: parsed.messageId,
-      postId: parsed.postId || null,
+      postId,
       commentId: parsed.commentId || null,
       msgType: parsed.msgType,
       content: parsed.content,
       rawPayload: JSON.stringify(value),
     });
 
-    if (parsed.eventType === 'FEED_COMMENT' && parsed.senderId) {
-      if (orgId) {
-        void this.conversationsService
-          .fetchAndCacheCustomerProfile(
-            pageId,
-            parsed.senderId,
-            orgId,
-            parsed.senderName,
-          )
-          .catch((err) =>
-            this.logger.warn(
-              `Failed to cache commenter profile ${parsed.senderId}`,
-              err?.message,
-            ),
-          );
-      }
+    if (orgId) {
+      void this.conversationsService
+        .fetchAndCacheCustomerProfile(
+          pageId,
+          parsed.senderId,
+          orgId,
+          parsed.senderName,
+        )
+        .catch((err) =>
+          this.logger.warn(
+            `Failed to cache commenter profile ${parsed.senderId}`,
+            err?.message,
+          ),
+        );
     }
 
     this.logger.log(
-      `[Webhook] ${parsed.eventType} pageId=${pageId} postId=${parsed.postId}`,
+      `[Webhook] FEED_COMMENT IN pageId=${pageId} postId=${postId} sender=${parsed.senderId}`,
     );
+  }
+
+  private async processPageCommentReply(
+    pageId: string,
+    parsed: FeedEventTransform,
+    postId: string,
+    orgId: string | null,
+    rawValue: Record<string, unknown>,
+  ): Promise<void> {
+    const parentId = parsed.parentId;
+    if (!parentId) {
+      this.logger.warn(
+        `[Webhook] Page comment thiếu parent_id, bỏ qua commentId=${parsed.commentId}`,
+      );
+      return;
+    }
+
+    const ctx = await this.resolveCustomerForPageCommentReply(
+      pageId,
+      parentId,
+      orgId,
+    );
+    if (!ctx) {
+      this.logger.warn(
+        `[Webhook] Không xác định được khách cho reply commentId=${parsed.commentId}`,
+      );
+      return;
+    }
+
+    const resolvedPostId = postId || ctx.postId;
+    if (!resolvedPostId) {
+      this.logger.warn(
+        `[Webhook] Page reply thiếu postId, bỏ qua commentId=${parsed.commentId}`,
+      );
+      return;
+    }
+
+    await this.saveAndBroadcast({
+      organizationId: orgId,
+      pageId,
+      eventType: 'FEED_COMMENT',
+      direction: 'OUT',
+      senderId: ctx.customerId,
+      senderName: 'Page',
+      recipientId: pageId,
+      messageId: parsed.messageId,
+      postId: resolvedPostId,
+      commentId: parsed.commentId || null,
+      msgType: 'feed.comment.reply',
+      content: parsed.content,
+      rawPayload: JSON.stringify(rawValue),
+    });
+
+    this.logger.log(
+      `[Webhook] FEED_COMMENT OUT pageId=${pageId} postId=${resolvedPostId} customer=${ctx.customerId}`,
+    );
+  }
+
+  private async resolvePostIdFromComment(
+    pageId: string,
+    commentId: string,
+    orgId: string | null,
+  ): Promise<string> {
+    const token = await this.getPageAccessToken(pageId, orgId);
+    if (!token) return '';
+
+    const meta = await this.facebookOAuth.getCommentMeta(commentId, token);
+    return meta?.postId ?? '';
+  }
+
+  private async resolveCustomerForPageCommentReply(
+    pageId: string,
+    parentCommentId: string,
+    orgId: string | null,
+  ): Promise<{ customerId: string; postId: string | null } | null> {
+    const parentEvent = await this.prisma.webhookEvent.findFirst({
+      where: {
+        pageId,
+        eventType: 'FEED_COMMENT',
+        direction: 'IN',
+        OR: [{ commentId: parentCommentId }, { messageId: parentCommentId }],
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+
+    if (parentEvent?.senderId && parentEvent.senderId !== pageId) {
+      return {
+        customerId: parentEvent.senderId,
+        postId: parentEvent.postId,
+      };
+    }
+
+    const token = await this.getPageAccessToken(pageId, orgId);
+    if (!token) return null;
+
+    let currentId = parentCommentId;
+    for (let depth = 0; depth < 6; depth += 1) {
+      const meta = await this.facebookOAuth.getCommentMeta(currentId, token);
+      if (!meta) return null;
+
+      if (meta.fromId && meta.fromId !== pageId) {
+        return {
+          customerId: meta.fromId,
+          postId: meta.postId ?? null,
+        };
+      }
+
+      if (!meta.parentId) break;
+      currentId = meta.parentId;
+    }
+
+    return null;
+  }
+
+  private async getPageAccessToken(
+    pageId: string,
+    orgId: string | null,
+  ): Promise<string | null> {
+    const resolvedOrgId =
+      orgId ??
+      this.pageMapService.getSocialMap(pageId)?.orgId ??
+      this.configService.get<string>('DEFAULT_ORG_ID', 'default-org');
+
+    const pages = await this.facebookRepo.listPages(resolvedOrgId);
+    const page = pages.find((p) => p.pageId === pageId);
+    return page?.pageAccessToken ?? null;
+  }
+
+  /**
+   * Khi Meta gửi changed_fields=feed nhưng không có changes[] (thiếu include_values),
+   * đồng bộ comment mới từ Graph — chỉ chạy khi nhận webhook, không phải polling.
+   */
+  /** Đồng bộ comment mới từ Graph (gọi từ webhook hoặc client khi tab Bình luận mở). */
+  async syncCommentsForPage(pageId: string): Promise<{
+    ingested: number;
+    threadIds: string[];
+  }> {
+    return this.syncFeedCommentsFromGraph(pageId);
+  }
+
+  private async syncFeedCommentsFromGraph(pageId: string): Promise<{
+    ingested: number;
+    threadIds: string[];
+  }> {
+    const orgId = await this.resolveOrgId(pageId);
+    const token = await this.getPageAccessToken(pageId, orgId);
+    if (!token) {
+      this.logger.warn(
+        `[Webhook] syncFeedCommentsFromGraph: không có page token pageId=${pageId}`,
+      );
+      return { ingested: 0, threadIds: [] };
+    }
+
+    const lastIn = await this.prisma.webhookEvent.findFirst({
+      where: {
+        pageId,
+        eventType: 'FEED_COMMENT',
+        direction: 'IN',
+      },
+      orderBy: { createdAt: 'desc' },
+      select: { createdAt: true },
+    });
+    // Cửa sổ rộng hơn để không bỏ sót comment khi webhook chỉ báo changed_fields
+    const sinceMs = lastIn
+      ? lastIn.createdAt.getTime() - 5 * 60_000
+      : Date.now() - 24 * 60 * 60_000;
+
+    const threadIds = new Set<string>();
+    let ingested = 0;
+
+    try {
+      const posts = await this.facebookOAuth.listPageFeedWithComments(
+        pageId,
+        token,
+        15,
+      );
+
+      const postIds =
+        posts.length > 0
+          ? posts.map((p) => p.id).filter(Boolean)
+          : await this.listKnownCommentPostIds(pageId, orgId);
+
+      for (const post of posts) {
+        if (!post.id) continue;
+        const comments =
+          post.comments?.data?.length
+            ? post.comments.data
+            : await this.facebookOAuth.listAllPostComments(post.id, token, {
+                pageSize: 25,
+                maxComments: 40,
+              });
+
+        for (const comment of comments) {
+          const senderId = comment.from?.id;
+          if (!senderId || senderId === pageId || !comment.id) continue;
+
+          const createdMs = new Date(comment.created_time).getTime();
+          if (!Number.isFinite(createdMs) || createdMs < sinceMs) continue;
+
+          if (!isValidFacebookCommentId(comment.id)) continue;
+
+          const payload = {
+            organizationId: orgId,
+            pageId,
+            eventType: 'FEED_COMMENT' as const,
+            direction: 'IN' as const,
+            senderId,
+            senderName: comment.from?.name ?? 'Facebook User',
+            messageId: comment.id,
+            postId: post.id,
+            commentId: comment.id,
+            msgType: 'feed.comment',
+            content: comment.message ?? '[Bình luận mới trên bài viết]',
+            rawPayload: JSON.stringify({
+              source: 'webhook_changed_fields_sync',
+              comment,
+            }),
+          };
+
+          const existing = await this.findDuplicateEvent(payload);
+          if (existing) {
+            const threadId = buildThreadId(existing);
+            if (threadId) threadIds.add(threadId);
+            continue;
+          }
+
+          const saved = await this.saveAndBroadcast(payload);
+          ingested += 1;
+          const threadId = buildThreadId(saved);
+          if (threadId) threadIds.add(threadId);
+        }
+      }
+
+      if (posts.length === 0) {
+        for (const postId of postIds) {
+          const comments = await this.facebookOAuth.listAllPostComments(
+            postId,
+            token,
+            { pageSize: 25, maxComments: 40 },
+          );
+
+          for (const comment of comments) {
+            const senderId = comment.from?.id;
+            if (!senderId || senderId === pageId || !comment.id) continue;
+
+            const createdMs = new Date(comment.created_time).getTime();
+            if (!Number.isFinite(createdMs) || createdMs < sinceMs) continue;
+
+            if (!isValidFacebookCommentId(comment.id)) continue;
+
+            const payload = {
+              organizationId: orgId,
+              pageId,
+              eventType: 'FEED_COMMENT' as const,
+              direction: 'IN' as const,
+              senderId,
+              senderName: comment.from?.name ?? 'Facebook User',
+              messageId: comment.id,
+              postId,
+              commentId: comment.id,
+              msgType: 'feed.comment',
+              content: comment.message ?? '[Bình luận mới trên bài viết]',
+              rawPayload: JSON.stringify({
+                source: 'webhook_changed_fields_sync',
+                comment,
+              }),
+            };
+
+            const existing = await this.findDuplicateEvent(payload);
+            if (existing) {
+              const threadId = buildThreadId(existing);
+              if (threadId) threadIds.add(threadId);
+              continue;
+            }
+
+            const saved = await this.saveAndBroadcast(payload);
+            ingested += 1;
+            const threadId = buildThreadId(saved);
+            if (threadId) threadIds.add(threadId);
+          }
+        }
+      }
+
+      if (ingested > 0) {
+        this.logger.log(
+          `[Webhook] syncFeedCommentsFromGraph pageId=${pageId} ingested=${ingested} threads=${threadIds.size}`,
+        );
+      }
+    } catch (err: any) {
+      this.logger.warn(
+        `[Webhook] syncFeedCommentsFromGraph failed pageId=${pageId}: ${err?.message ?? err}`,
+      );
+    }
+
+    if (orgId) {
+      await this.redisCache.bumpPageRevision(orgId, pageId);
+    }
+
+    return { ingested, threadIds: [...threadIds] };
+  }
+
+  /** postId đã có trong webhook — dùng khi Graph feed API trả rỗng. */
+  private async listKnownCommentPostIds(
+    pageId: string,
+    orgId: string | null,
+  ): Promise<string[]> {
+    const rows = await this.prisma.webhookEvent.findMany({
+      where: {
+        pageId,
+        eventType: 'FEED_COMMENT',
+        postId: { not: null },
+        OR: [{ organizationId: orgId }, { organizationId: null }],
+      },
+      select: { postId: true },
+      distinct: ['postId'],
+      take: 100,
+    });
+
+    return rows.map((r) => r.postId!).filter(Boolean);
   }
 
   async listRecentEvents(limit = 50, eventType?: string) {
@@ -328,7 +914,67 @@ export class FacebookWebhookService {
     return { inCount, outCount, lastIn, lastAny };
   }
 
+  async countEventsByType(
+    eventType: string,
+    direction?: string,
+  ): Promise<number> {
+    return this.prisma.webhookEvent.count({
+      where: {
+        eventType,
+        ...(direction ? { direction } : {}),
+      },
+    });
+  }
+
   async getEventById(id: string): Promise<WebhookEvent | null> {
     return this.prisma.webhookEvent.findUnique({ where: { id } });
+  }
+
+  /** Thích bình luận qua Graph API (Page like). */
+  async likeCommentOnPage(
+    pageId: string,
+    commentId: string,
+  ): Promise<{ success: boolean }> {
+    if (!pageId?.trim() || !commentId?.trim()) {
+      throw new BadRequestException('Thiếu pageId hoặc commentId');
+    }
+    if (!isValidFacebookCommentId(commentId)) {
+      throw new BadRequestException('commentId không hợp lệ');
+    }
+
+    const token = await this.getPageAccessToken(pageId, null);
+    if (!token) {
+      throw new BadRequestException('Fanpage chưa liên kết hoặc thiếu token');
+    }
+
+    return this.facebookOAuth.likeComment(commentId, token);
+  }
+
+  /** Ẩn / hiện bình luận trên Facebook và cập nhật trạng thái local. */
+  async setCommentHiddenOnPage(
+    pageId: string,
+    commentId: string,
+    hidden: boolean,
+  ): Promise<{ success: boolean }> {
+    if (!pageId?.trim() || !commentId?.trim()) {
+      throw new BadRequestException('Thiếu pageId hoặc commentId');
+    }
+    if (!isValidFacebookCommentId(commentId)) {
+      throw new BadRequestException('commentId không hợp lệ');
+    }
+
+    const token = await this.getPageAccessToken(pageId, null);
+    if (!token) {
+      throw new BadRequestException('Fanpage chưa liên kết hoặc thiếu token');
+    }
+
+    await this.facebookOAuth.setCommentHidden(commentId, token, hidden);
+    await this.markCommentVisibility(
+      pageId,
+      commentId,
+      hidden ? EVENT_STATUS_HIDDEN : EVENT_STATUS_ACTIVE,
+    );
+
+    return { success: true };
   }
 }

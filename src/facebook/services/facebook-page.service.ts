@@ -49,6 +49,12 @@ export class FacebookPageService implements OnModuleInit {
     if (pages.length > 0) {
       this.logger.log(`Restored ${pages.length} page mapping(s) from database`);
     }
+
+    void this.facebookOAuthService.ensureAppWebhookSubscription().catch((err) => {
+      this.logger.warn(
+        `[onModuleInit] App webhook subscription check failed: ${err?.message ?? err}`,
+      );
+    });
   }
 
   getDefaultOrgId(): string {
@@ -172,6 +178,29 @@ export class FacebookPageService implements OnModuleInit {
           webhookSubscribed: page.webhookSubscribed,
           isPinned: page.isPinned,
           platform: 'facebook' as const,
+          ...(page.pageAccessToken
+            ? {
+                ...(await this.facebookOAuthService.inspectPageTokenScopes(
+                  page.pageAccessToken,
+                )),
+                ...(await this.facebookOAuthService.inspectPageWebhookSubscription(
+                  page.pageId,
+                  page.pageAccessToken,
+                )),
+              }
+            : {
+                scopes: [] as string[],
+                missingCommentScopes: [
+                  ...FacebookOAuthService.COMMENT_SCOPES,
+                ],
+                commentPermissionsOk: false,
+                installed: false,
+                subscribedFields: [] as string[],
+                feedSubscribed: false,
+                missingFields: [
+                  ...FacebookOAuthService.COMMENT_WEBHOOK_FIELDS,
+                ],
+              }),
         };
       }),
     );
@@ -198,7 +227,12 @@ export class FacebookPageService implements OnModuleInit {
   async resubscribeWebhook(
     orgId: string,
     pageRecordId: string,
-  ): Promise<{ pageId: string; subscribed: boolean }> {
+  ): Promise<{
+    pageId: string;
+    subscribed: boolean;
+    feedSubscribed: boolean;
+    subscribedFields: string[];
+  }> {
     const page = await this.facebookRepo.findPageByOrgAndId(
       orgId,
       pageRecordId,
@@ -208,8 +242,16 @@ export class FacebookPageService implements OnModuleInit {
       throw new BadRequestException('Page không có access token — hãy OAuth lại');
     }
 
+    await this.facebookOAuthService.ensureAppWebhookSubscription();
+
     const subscribed =
       await this.facebookOAuthService.subscribeToPageWebhook(
+        page.pageId,
+        page.pageAccessToken,
+      );
+
+    const inspection =
+      await this.facebookOAuthService.inspectPageWebhookSubscription(
         page.pageId,
         page.pageAccessToken,
       );
@@ -221,7 +263,12 @@ export class FacebookPageService implements OnModuleInit {
       this.logger.warn(`[resubscribeWebhook] pageId=${page.pageId} failed`);
     }
 
-    return { pageId: page.pageId, subscribed };
+    return {
+      pageId: page.pageId,
+      subscribed,
+      feedSubscribed: inspection.feedSubscribed,
+      subscribedFields: inspection.subscribedFields,
+    };
   }
 
   async unlinkPage(orgId: string, pageRecordId: string) {
@@ -374,6 +421,8 @@ export class FacebookPageService implements OnModuleInit {
     pageTokens: FacebookPageToken[],
   ): Promise<void> {
     if (pageTokens.length === 0) return;
+
+    await this.facebookOAuthService.ensureAppWebhookSubscription();
 
     for (const page of pageTokens) {
       try {

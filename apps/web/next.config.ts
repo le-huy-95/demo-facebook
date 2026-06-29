@@ -7,6 +7,10 @@ const nextConfig: NextConfig = {
   eslint: {
     ignoreDuringBuilds: true,
   },
+  // Tránh redirect 308 /socket.io/ → /socket.io (làm hỏng Socket.IO handshake)
+  skipTrailingSlashRedirect: true,
+  // Cho phép HMR/_next khi truy cập qua ngrok domain
+  allowedDevOrigins: ['even-spindle-collie.ngrok-free.dev', '*.ngrok-free.dev'],
   async rewrites() {
     return [
       {
@@ -27,6 +31,10 @@ const nextConfig: NextConfig = {
         destination: `${backendUrl}/conversations/:threadId/messages`,
       },
       { source: '/conversations', destination: `${backendUrl}/conversations` },
+      {
+        source: '/conversations/sync-comments',
+        destination: `${backendUrl}/conversations/sync-comments`,
+      },
       { source: '/messages', destination: `${backendUrl}/messages` },
       {
         source: '/messages/:path*',
@@ -39,6 +47,15 @@ const nextConfig: NextConfig = {
       { source: '/config/:path*', destination: `${backendUrl}/config/:path*` },
       { source: '/setup/:path*', destination: `${backendUrl}/setup/:path*` },
       { source: '/health', destination: `${backendUrl}/health` },
+      { source: '/uploads', destination: `${backendUrl}/uploads` },
+      { source: '/uploads/:path*', destination: `${backendUrl}/uploads/:path*` },
+      // Socket.IO: backend yêu cầu path có dấu / cuối (/socket.io/)
+      { source: '/socket.io', destination: `${backendUrl}/socket.io/` },
+      { source: '/socket.io/', destination: `${backendUrl}/socket.io/` },
+      {
+        source: '/socket.io/:path*',
+        destination: `${backendUrl}/socket.io/:path*`,
+      },
       { source: '/api-docs', destination: `${backendUrl}/api-docs` },
       {
         source: '/api-docs/:path*',

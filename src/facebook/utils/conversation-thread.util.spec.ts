@@ -19,6 +19,7 @@ function makeEvent(
     msgType: 'text',
     content: `Message ${overrides.id}`,
     rawPayload: '{}',
+    status: 'ACTIVE',
     createdAt: overrides.createdAt,
     ...overrides,
   };
@@ -56,5 +57,26 @@ describe('aggregateConversations', () => {
 
     expect(threads).toHaveLength(1);
     expect(threads[0]?.unreadCount).toBe(2);
+  });
+
+  it('still lists thread when latest event is deleted but keeps unread for active only', () => {
+    const threads = aggregateConversations([
+      makeEvent({
+        id: 'visible',
+        direction: 'IN',
+        createdAt: new Date('2026-06-26T05:00:00.000Z'),
+      }),
+      makeEvent({
+        id: 'deleted',
+        direction: 'IN',
+        status: 'DELETED',
+        createdAt: new Date('2026-06-26T06:00:00.000Z'),
+      }),
+    ]);
+
+    expect(threads).toHaveLength(1);
+    expect(threads[0]?.preview).toBe('Message deleted');
+    expect(threads[0]?.messageCount).toBe(2);
+    expect(threads[0]?.unreadCount).toBe(1);
   });
 });

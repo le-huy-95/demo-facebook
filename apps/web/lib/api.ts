@@ -1,5 +1,21 @@
+/** Kết nối thẳng Nest (NEXT_PUBLIC_API_URL) — tránh Next.js proxy làm hỏng SSE. */
 export const API_BASE =
-  process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:3000';
+  process.env.NEXT_PUBLIC_API_URL ??
+  (typeof window !== 'undefined' ? '' : 'http://localhost:3000');
+
+const API_HEADERS: HeadersInit = {
+  'ngrok-skip-browser-warning': 'true',
+};
+
+async function apiFetch(input: string, init?: RequestInit): Promise<Response> {
+  return globalThis.fetch(input, {
+    ...init,
+    headers: {
+      ...API_HEADERS,
+      ...init?.headers,
+    },
+  });
+}
 
 export interface FacebookPage {
   id: string;
@@ -10,6 +26,14 @@ export interface FacebookPage {
   webhookSubscribed: boolean;
   isPinned?: boolean;
   platform?: 'facebook';
+  /** Token có đủ quyền đọc/trả lời bình luận hay chưa */
+  commentPermissionsOk?: boolean;
+  missingCommentScopes?: string[];
+  /** Page đã cài app và subscribe field feed (webhook comment) */
+  feedSubscribed?: boolean;
+  webhookInstalled?: boolean;
+  subscribedFields?: string[];
+  missingFields?: string[];
 }
 
 export type FacebookShop = FacebookPage;
@@ -31,10 +55,12 @@ export interface WebhookMessage {
   content: string | null;
   rawPayload: string;
   createdAt: string;
+  /** ACTIVE | HIDDEN | DELETED */
+  status?: string | null;
 }
 
 export async function getAuthStatus() {
-  const res = await fetch(`${API_BASE}/messages/auth/status`, {
+  const res = await apiFetch(`${API_BASE}/messages/auth/status`, {
     cache: 'no-store',
   });
   if (!res.ok) throw new Error('Không kiểm tra được trạng thái đăng nhập');
@@ -44,7 +70,7 @@ export async function getAuthStatus() {
 }
 
 export async function logout() {
-  const res = await fetch(`${API_BASE}/messages/auth/logout`, {
+  const res = await apiFetch(`${API_BASE}/messages/auth/logout`, {
     method: 'POST',
   });
   if (!res.ok) throw new Error('Không đăng xuất được');
@@ -54,7 +80,7 @@ export async function logout() {
 }
 
 export async function getFacebookShops() {
-  const res = await fetch(`${API_BASE}/facebook-page/pages`, {
+  const res = await apiFetch(`${API_BASE}/facebook-page/pages`, {
     cache: 'no-store',
   });
   if (!res.ok) throw new Error('Không tải được danh sách shop');
@@ -62,7 +88,7 @@ export async function getFacebookShops() {
 }
 
 export async function toggleShopPin(pageId: string) {
-  const res = await fetch(`${API_BASE}/facebook-page/pages/${pageId}/pin`, {
+  const res = await apiFetch(`${API_BASE}/facebook-page/pages/${pageId}/pin`, {
     method: 'POST',
   });
   if (!res.ok) throw new Error('Không ghim được trang');
@@ -70,7 +96,7 @@ export async function toggleShopPin(pageId: string) {
 }
 
 export async function unlinkShop(pageId: string) {
-  const res = await fetch(`${API_BASE}/facebook-page/pages/${pageId}`, {
+  const res = await apiFetch(`${API_BASE}/facebook-page/pages/${pageId}`, {
     method: 'DELETE',
   });
   if (!res.ok) throw new Error('Không hủy liên kết được trang');
@@ -80,7 +106,7 @@ export async function unlinkShop(pageId: string) {
 }
 
 export async function initiateOAuth(friendlyName: string) {
-  const res = await fetch(`${API_BASE}/facebook-page/oauth-url`, {
+  const res = await apiFetch(`${API_BASE}/facebook-page/oauth-url`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ friendlyName }),
@@ -129,7 +155,7 @@ export async function getConversations(
   if (options?.limit) qs.set('limit', String(options.limit));
   if (options?.before) qs.set('before', options.before);
 
-  const res = await fetch(`${API_BASE}/conversations?${qs}`, {
+  const res = await apiFetch(`${API_BASE}/conversations?${qs}`, {
     cache: 'no-store',
   });
   if (!res.ok) throw new Error('Không tải được danh sách hội thoại');
@@ -148,7 +174,7 @@ export async function getConversationMessages(
   if (options?.limit) qs.set('limit', String(options.limit));
   if (options?.before) qs.set('before', options.before);
 
-  const res = await fetch(
+  const res = await apiFetch(
     `${API_BASE}/conversations/${encodeURIComponent(threadId)}/messages?${qs}`,
     { cache: 'no-store' },
   );
@@ -161,7 +187,7 @@ export async function getConversationMessages(
 
 export async function getPostPreview(pageId: string, postId: string) {
   const qs = new URLSearchParams({ pageId, postId });
-  const res = await fetch(`${API_BASE}/conversations/post?${qs}`, {
+  const res = await apiFetch(`${API_BASE}/conversations/post?${qs}`, {
     cache: 'no-store',
   });
   if (!res.ok) throw new Error('Không tải được bài viết');
@@ -171,18 +197,71 @@ export async function getPostPreview(pageId: string, postId: string) {
 export async function getMessages(type?: string) {
   const qs = new URLSearchParams({ limit: '100' });
   if (type) qs.set('type', type);
-  const res = await fetch(`${API_BASE}/messages?${qs}`, { cache: 'no-store' });
+  const res = await apiFetch(`${API_BASE}/messages?${qs}`, { cache: 'no-store' });
   if (!res.ok) throw new Error('Không tải được tin nhắn');
   return res.json() as Promise<{ data: WebhookMessage[] }>;
 }
 
-export function subscribeMessages(onMessage: (msg: WebhookMessage) => void) {
+export async function syncComments(pageId: string) {
+  const qs = new URLSearchParams({ pageId });
+  const res = await apiFetch(`${API_BASE}/conversations/sync-comments?${qs}`, {
+    method: 'POST',
+    cache: 'no-store',
+  });
+  if (!res.ok) throw new Error('Không đồng bộ được bình luận');
+  return res.json() as Promise<{
+    data: { ingested: number; threadIds: string[] };
+  }>;
+}
+
+export type CommentAction = 'like' | 'hide' | 'unhide';
+
+export async function performCommentAction(
+  pageId: string,
+  commentId: string,
+  action: CommentAction,
+) {
+  const qs = new URLSearchParams({ pageId, action });
+  const res = await apiFetch(
+    `${API_BASE}/conversations/comments/${encodeURIComponent(commentId)}/action?${qs}`,
+    { method: 'POST', cache: 'no-store' },
+  );
+  if (!res.ok) {
+    const body = await res.json().catch(() => null);
+    throw new Error(
+      (body as { message?: string })?.message ??
+        'Không thực hiện được hành động trên bình luận',
+    );
+  }
+  return res.json() as Promise<{ data: { success: boolean } }>;
+}
+
+export interface FeedSyncedPayload {
+  pageId: string;
+  ingested: number;
+  threadIds: string[];
+}
+
+export function subscribeMessages(
+  onMessage: (msg: WebhookMessage) => void,
+  onFeedSynced?: (payload: FeedSyncedPayload) => void,
+) {
   const source = new EventSource(`${API_BASE}/messages/stream`);
 
   source.onmessage = (event) => {
     try {
-      const data = JSON.parse(event.data) as WebhookMessage;
-      onMessage(data);
+      const raw = JSON.parse(event.data) as Record<string, unknown>;
+      if (raw.type === 'feed:synced') {
+        onFeedSynced?.({
+          pageId: String(raw.pageId ?? ''),
+          ingested: Number(raw.ingested ?? 0),
+          threadIds: Array.isArray(raw.threadIds)
+            ? (raw.threadIds as string[])
+            : [],
+        });
+        return;
+      }
+      onMessage(raw as unknown as WebhookMessage);
     } catch {
       // ignore malformed
     }
@@ -195,7 +274,7 @@ export async function uploadFile(file: File) {
   const form = new FormData();
   form.set('file', file);
 
-  const res = await fetch(`${API_BASE}/uploads`, {
+  const res = await apiFetch(`${API_BASE}/uploads`, {
     method: 'POST',
     body: form,
   });

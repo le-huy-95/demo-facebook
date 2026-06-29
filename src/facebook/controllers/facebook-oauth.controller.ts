@@ -111,9 +111,12 @@ export class FacebookOAuthController {
     @Res() res: Response,
   ) {
     if (query.error) {
-      const message = query.error_description ?? query.error;
+      const message =
+        query.error_description ??
+        (query.error_code ? `[${query.error_code}] ` : '') +
+          (query.error_reason ?? query.error);
       this.logger.warn(
-        `OAuth cancelled: error=${query.error}, reason=${query.error_reason ?? 'n/a'}`,
+        `OAuth cancelled: error=${query.error}, code=${query.error_code ?? 'n/a'}, action=${query.action ?? 'n/a'}, reason=${query.error_reason ?? 'n/a'}`,
       );
       return res
         .status(HttpStatus.OK)

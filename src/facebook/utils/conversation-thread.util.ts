@@ -1,5 +1,6 @@
 import type { Prisma, WebhookEvent } from '@prisma/client';
 import { isMessagingReceiptMsgType } from './facebook-payload.util';
+import { isVisibleEvent } from './event-visibility.util';
 
 export type ConversationKind = 'MESSENGER' | 'FEED_COMMENT';
 
@@ -165,7 +166,8 @@ export function aggregateConversations(
     const customerId = resolveCustomerId(event);
     const readAt = readAtByThread.get(threadId)?.getTime();
     const unreadCutoff = readAt ?? latestOutboundByThread.get(threadId) ?? 0;
-    const isUnreadInbound = event.direction === 'IN' && ts > unreadCutoff;
+    const isUnreadInbound =
+      isVisibleEvent(event) && event.direction === 'IN' && ts > unreadCutoff;
 
     if (!existing) {
       const inboundName =
