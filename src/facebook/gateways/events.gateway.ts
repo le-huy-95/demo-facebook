@@ -5,7 +5,7 @@ import {
   MessageBody,
   ConnectedSocket,
 } from '@nestjs/websockets';
-import { Logger } from '@nestjs/common';
+import { Logger, Inject, forwardRef } from '@nestjs/common';
 import { Server, Socket } from 'socket.io';
 import type { WebhookEvent } from '@prisma/client';
 import { buildThreadId } from '../utils/conversation-thread.util';
@@ -24,6 +24,7 @@ export class EventsGateway {
   private readonly logger = new Logger(EventsGateway.name);
 
   constructor(
+    @Inject(forwardRef(() => FacebookMessagingService))
     private readonly facebookMessaging: FacebookMessagingService,
     private readonly eventsService: EventsService,
   ) {}
@@ -102,17 +103,13 @@ export class EventsGateway {
         clientMessageId: data?.clientMessageId,
       });
 
-      // Ack back to the sender.
+      // Broadcast đã xử lý trong FacebookDataService (SENDING → DELIVERED)
       client.emit('message:ack', {
         ok: true,
         clientMessageId: data?.clientMessageId ?? null,
         fbMessageId: result.fb.messageId ?? null,
         savedEventId: result.savedEvent.id,
       });
-
-      // Broadcast the same payload shape as inbound webhook events.
-      this.emitWebhookEvent(result.savedEvent);
-      this.eventsService.emitNewMessage(result.savedEvent);
     } catch (err: any) {
       const message = err instanceof Error ? err.message : 'Send failed';
       client.emit('message:ack', {

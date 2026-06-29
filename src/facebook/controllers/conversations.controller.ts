@@ -14,8 +14,6 @@ import { FacebookPageService } from '../services/facebook-page.service';
 import { ConversationsService } from '../services/conversations.service';
 import { FacebookWebhookService } from '../services/facebook-webhook.service';
 import { FacebookMessagingService } from '../services/facebook-messaging.service';
-import { EventsService } from '../services/events.service';
-import { EventsGateway } from '../gateways/events.gateway';
 
 @ApiTags('conversations')
 @Controller('conversations')
@@ -25,8 +23,6 @@ export class ConversationsController {
     private readonly conversationsService: ConversationsService,
     private readonly webhookService: FacebookWebhookService,
     private readonly facebookMessaging: FacebookMessagingService,
-    private readonly eventsService: EventsService,
-    private readonly eventsGateway: EventsGateway,
   ) {}
 
   @Get()
@@ -66,23 +62,24 @@ export class ConversationsController {
   @Post('sync-comments')
   @ApiOperation({
     summary:
-      'Đồng bộ bình luận mới từ Facebook Graph (fallback khi webhook Meta chậm/thiếu)',
+      '[Deprecated] Không sync/backfill từ Facebook — lịch sử chỉ từ webhook',
   })
   @ApiQuery({ name: 'pageId', required: true })
-  @ApiQuery({ name: 'force', required: false, description: 'Bỏ qua cooldown 30s — dùng khi mở tab lần đầu' })
-  async syncComments(
-    @Query('pageId') pageId: string,
-    @Query('force') force?: string,
-  ) {
+  async syncComments(@Query('pageId') pageId: string) {
     if (!pageId?.trim()) {
       throw new BadRequestException('Thiếu tham số pageId');
     }
 
-    const forceSync = force === 'true' || force === '1';
-    const result = await this.webhookService.syncCommentsForPage(pageId, forceSync);
-    this.eventsGateway.emitFeedSynced(pageId, result);
-
-    return { statusCode: 200, data: result };
+    return {
+      statusCode: 200,
+      data: {
+        deprecated: true,
+        ingested: 0,
+        threadIds: [],
+        message:
+          'Event-driven architecture: không pull lịch sử từ Facebook Graph API.',
+      },
+    };
   }
 
   @Get('post')
@@ -219,9 +216,6 @@ export class ConversationsController {
         replyToMessageId: body.replyToMessageId,
         clientMessageId: body.clientMessageId,
       });
-
-      this.eventsGateway.emitWebhookEvent(result.savedEvent);
-      this.eventsService.emitNewMessage(result.savedEvent);
 
       return {
         statusCode: 200,

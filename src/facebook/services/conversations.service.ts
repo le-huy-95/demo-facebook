@@ -5,6 +5,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import type { WebhookEvent } from '@prisma/client';
+import type { MessageHistoryRecord } from '../../types/message.types';
 import { PrismaService } from '../../prisma/prisma.service';
 import {
   FacebookOAuthService,
@@ -36,7 +37,7 @@ export interface FacebookPostPreview {
   fromName?: string;
 }
 
-export type ConversationMessage = WebhookEvent & {
+export type ConversationMessage = MessageHistoryRecord & {
   senderPictureUrl?: string | null;
 };
 
@@ -150,21 +151,11 @@ export class ConversationsService {
 
     const fromWebhook = aggregateConversations(events, readAtByThread);
 
-    const [fromMessengerGraph, fromCommentGraph] = await Promise.all([
-      this.getCachedMessengerThreads(pageId, orgId, pageRev),
-      this.getCachedCommentThreads(pageId, orgId, pageRev),
-    ]);
-
     this.logger.log(
-      `[Conversations] Merged threads: webhook=${fromWebhook.length}, messenger=${fromMessengerGraph.length}, comments=${fromCommentGraph.length} (Graph từ cache hoặc quét 1 lần)`,
+      `[Conversations] Threads from DB only (event-driven): webhook=${fromWebhook.length}`,
     );
 
-    const merged = this.mergeConversationThreads(
-      this.mergeConversationThreads(fromWebhook, fromMessengerGraph),
-      fromCommentGraph,
-    );
-
-    const filtered = merged.filter((thread) => thread.pageId === pageId);
+    const filtered = fromWebhook.filter((thread) => thread.pageId === pageId);
     await this.redisCache.set(
       cacheKey,
       filtered,
@@ -173,7 +164,7 @@ export class ConversationsService {
     return filtered;
   }
 
-  /** Graph API messenger threads — cache theo page revision, chỉ gọi Facebook khi miss. */
+  /** @deprecated Graph API không dùng để đọc inbox — giữ stub để tránh break import */
   private async getCachedMessengerThreads(
     pageId: string,
     orgId: string,
@@ -608,44 +599,7 @@ export class ConversationsService {
     limit: number,
     before?: string,
   ): Promise<ThreadMessagesPage> {
-    const parsed = parseThreadId(threadId);
-    const adPostId = parsed?.postId;
-    const token = await this.getPageAccessToken(pageId, orgId);
-
-    let graphEvents: ConversationMessage[] = [];
-    let graphPaging: { hasMore: boolean; nextBefore: string | null } = {
-      hasMore: false,
-      nextBefore: null,
-    };
-
-    if (token) {
-      const { messages, paging } =
-        await this.facebookOAuth.getMessengerMessagesByPsid(
-          pageId,
-          customerPsid,
-          token,
-          { limit, before },
-        );
-
-      graphEvents = messages
-        .map((msg) =>
-          this.graphMessageToEvent(msg, pageId, customerPsid, orgId),
-        )
-        .filter((msg) => {
-          if (!adPostId) {
-            return !msg.postId;
-          }
-          return msg.postId === adPostId;
-        });
-
-      const hasMore = messages.length >= limit && !!paging?.cursors?.before;
-      graphPaging = {
-        hasMore,
-        nextBefore: hasMore ? (paging?.cursors?.before ?? null) : null,
-      };
-    }
-
-    const webhookResult = await this.getWebhookThreadMessages(
+    return this.getWebhookThreadMessages(
       threadId,
       pageId,
       orgId,
@@ -653,48 +607,9 @@ export class ConversationsService {
       limit,
       before,
     );
-
-    const merged = this.mergeThreadMessages(
-      webhookResult.messages,
-      graphEvents,
-    );
-    const sorted = merged.sort(
-      (a, b) => a.createdAt.getTime() - b.createdAt.getTime(),
-    );
-
-    const beforeDate = parseDateCursor(before);
-    const eligible = beforeDate
-      ? sorted.filter((m) => m.createdAt.getTime() < beforeDate.getTime())
-      : sorted;
-    const hasMore = eligible.length > limit || graphPaging.hasMore;
-    const pageMessages = eligible.slice(-limit);
-    const oldest = pageMessages[0];
-
-    const enriched = await this.enrichMessagePictures(
-      pageMessages,
-      pageId,
-      orgId,
-      customerPsid,
-    );
-    const withNames = await this.enrichMessageSenderNames(
-      enriched,
-      pageId,
-      orgId,
-      customerPsid,
-    );
-
-    return {
-      messages: withNames,
-      paging: {
-        hasMore,
-        nextBefore:
-          hasMore && oldest
-            ? oldest.createdAt.toISOString()
-            : graphPaging.nextBefore,
-      },
-    };
   }
 
+  /** @deprecated Không đọc comment từ Graph — chỉ DB */
   private commentBelongsToThread(
     comment: GraphPostComment,
     pageId: string,
@@ -719,37 +634,9 @@ export class ConversationsService {
     threadId: string,
     limit: number,
     before?: string,
-    rootCommentId?: string,
+    _rootCommentId?: string,
   ): Promise<ThreadMessagesPage> {
-    const token = await this.getPageAccessToken(pageId, orgId);
-
-    let graphEvents: ConversationMessage[] = [];
-    if (token) {
-      const comments = await this.getCachedPostComments(
-        pageId,
-        orgId,
-        postId,
-        token,
-      );
-      await this.reconcileStaleCommentsForPost(
-        pageId,
-        orgId,
-        postId,
-        comments,
-        token,
-      );
-      const byId = new Map(comments.map((c) => [c.id, c]));
-
-      graphEvents = comments
-        .filter((comment) =>
-          this.commentBelongsToThread(comment, pageId, customerId, byId),
-        )
-        .map((comment) =>
-          this.graphCommentToEvent(comment, pageId, postId, customerId, orgId),
-        );
-    }
-
-    const webhookResult = await this.getWebhookThreadMessages(
+    return this.getWebhookThreadMessages(
       threadId,
       pageId,
       orgId,
@@ -757,87 +644,18 @@ export class ConversationsService {
       limit,
       before,
     );
-
-    const merged = this.mergeThreadMessages(
-      webhookResult.messages,
-      graphEvents,
-    );
-    const sorted = merged.sort(
-      (a, b) => a.createdAt.getTime() - b.createdAt.getTime(),
-    );
-
-    const beforeDate = parseDateCursor(before);
-    const eligible = beforeDate
-      ? sorted.filter((m) => m.createdAt.getTime() < beforeDate.getTime())
-      : sorted;
-    const hasMore = eligible.length > limit;
-    const pageMessages = eligible.slice(-limit);
-    const oldest = pageMessages[0];
-
-    const enriched = await this.enrichMessagePictures(
-      pageMessages,
-      pageId,
-      orgId,
-      customerId,
-    );
-    const withNames = await this.enrichMessageSenderNames(
-      enriched,
-      pageId,
-      orgId,
-      customerId,
-    );
-
-    return {
-      messages: withNames,
-      paging: {
-        hasMore,
-        nextBefore: hasMore && oldest ? oldest.createdAt.toISOString() : null,
-      },
-    };
   }
 
-  /**
-   * Đối chiếu DB với Graph: comment không còn trên Facebook → đánh dấu DELETED.
-   * Trả về tập comment id còn hợp lệ.
-   */
+  /** Webhook-driven only — không reconcile với Graph API */
   private async pruneStaleCommentsForPage(
-    pageId: string,
-    orgId: string,
+    _pageId: string,
+    _orgId: string,
   ): Promise<void> {
-    const token = await this.getPageAccessToken(pageId, orgId);
-    if (!token) return;
-
-    const rows = await this.prisma.webhookEvent.findMany({
-      where: {
-        pageId,
-        eventType: 'FEED_COMMENT',
-        status: { not: EVENT_STATUS_DELETED },
-        postId: { not: null },
-      },
-      select: { postId: true },
-      distinct: ['postId'],
-      take: 20,
-    });
-
-    for (const row of rows) {
-      if (!row.postId) continue;
-      const comments = await this.getCachedPostComments(
-        pageId,
-        orgId,
-        row.postId,
-        token,
-      );
-      await this.reconcileStaleCommentsForPost(
-        pageId,
-        orgId,
-        row.postId,
-        comments,
-        token,
-      );
-    }
+    return;
   }
 
-  private async reconcileStaleCommentsForPost(
+  /** @deprecated */
+  private async reconcileStaleCommentsForPost_UNUSED(
     pageId: string,
     orgId: string,
     postId: string,
@@ -1123,6 +941,26 @@ export class ConversationsService {
     });
   }
 
+  async enrichMessagesForDisplay(
+    messages: ConversationMessage[],
+    pageId: string,
+    orgId: string,
+    customerPsid: string,
+  ): Promise<ConversationMessage[]> {
+    const withPictures = await this.enrichMessagePictures(
+      messages,
+      pageId,
+      orgId,
+      customerPsid,
+    );
+    return this.enrichMessageSenderNames(
+      withPictures,
+      pageId,
+      orgId,
+      customerPsid,
+    );
+  }
+
   async fetchAndCacheCustomerProfile(
     pageId: string,
     senderId: string,
@@ -1244,6 +1082,7 @@ export class ConversationsService {
       content: msg.message ?? '',
       rawPayload: JSON.stringify(msg),
       status: 'ACTIVE',
+      deliveryStatus: null,
       createdAt: new Date(msg.created_time),
     };
   }
@@ -1338,6 +1177,7 @@ export class ConversationsService {
       content,
       rawPayload: JSON.stringify(comment),
       status: comment.is_hidden === true ? 'HIDDEN' : 'ACTIVE',
+      deliveryStatus: null,
       createdAt: new Date(comment.created_time),
       parentCommentId: comment.parent?.id ?? null,
     };

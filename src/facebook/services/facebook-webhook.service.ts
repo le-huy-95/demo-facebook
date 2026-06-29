@@ -23,6 +23,7 @@ import {
   EVENT_STATUS_HIDDEN,
   type EventVisibilityStatus,
 } from '../utils/event-visibility.util';
+import { FacebookDataService } from './facebook-data.service';
 import { RedisCacheService } from '../../redis/redis-cache.service';
 
 type WebhookEventCreateData = Parameters<
@@ -48,6 +49,7 @@ export class FacebookWebhookService implements OnModuleInit {
     private readonly facebookOAuth: FacebookOAuthService,
     private readonly facebookRepo: FacebookRepoService,
     private readonly configService: ConfigService,
+    private readonly dataService: FacebookDataService,
   ) {
     this.logger.setContext(FacebookWebhookService.name);
   }
@@ -230,22 +232,16 @@ export class FacebookWebhookService implements OnModuleInit {
       this.logger.debug(
         `[Webhook] Duplicate skipped pageId=${data.pageId} messageId=${data.messageId} msgType=${data.msgType}`,
       );
-      this.logger.log(
-        `[DEBUG] saveAndBroadcast: DUPLICATE → vẫn emit socket. eventType=${data.eventType} id=${duplicate.id}`,
-      );
       await this.invalidateCachesForEvent(duplicate.pageId ?? '', duplicate);
       this.eventsService.emitNewMessage(duplicate);
       this.eventsGateway.emitWebhookEvent(duplicate);
       return duplicate;
     }
 
-    const saved = await this.prisma.webhookEvent.create({ data });
+    const saved = await this.dataService.saveInboundAndBroadcast(data);
     this.logger.log(
-      `[DEBUG] saveAndBroadcast: SAVED id=${saved.id} eventType=${saved.eventType} pageId=${saved.pageId} postId=${saved.postId} commentId=${saved.commentId} → emitting socket webhook:event`,
+      `[Webhook] SAVED id=${saved.id} eventType=${saved.eventType} → SOCKET_MESSAGE_RECEIVE`,
     );
-    await this.invalidateCachesForEvent(saved.pageId ?? '', saved);
-    this.eventsService.emitNewMessage(saved);
-    this.eventsGateway.emitWebhookEvent(saved);
     return saved;
   }
 
@@ -442,6 +438,22 @@ export class FacebookWebhookService implements OnModuleInit {
     const senderId: string = event.sender?.id ?? '';
     const recipientId: string = event.recipient?.id ?? '';
     const messageId: string = event.message?.mid ?? '';
+    const orgId = map?.orgId ?? resolvedOrgId;
+
+    // Echo từ app đã persist qua outbound — bỏ qua để tránh trùng
+    if (isEcho && messageId) {
+      const dedup = await this.redisCache.getOutboundMessageDedup(
+        orgId || resolvedOrgId || 'default-org',
+        messageId,
+      );
+      if (dedup) {
+        this.logger.debug(
+          `[Webhook] Echo dedup skip messageId=${messageId} cliMsgId=${dedup.cliMsgId}`,
+        );
+        return;
+      }
+    }
+
     const conversationId = isEcho ? recipientId : senderId;
     const direction = isEcho ? 'OUT' : 'IN';
     const postId = await this.resolveMessengerPostIdForEvent(

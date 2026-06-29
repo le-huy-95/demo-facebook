@@ -67,6 +67,8 @@ model WebhookEvent {
   rawPayload     String   @map("raw_payload")
   /// ACTIVE | HIDDEN | DELETED — ẩn/xóa trên Facebook thì không trả ra API list
   status         String   @default("ACTIVE")
+  /// SENDING | DELIVERED | FAILED — chỉ áp dụng tin đi (OUT) từ app
+  deliveryStatus String?  @map("delivery_status")
   createdAt      DateTime @default(now()) @map("created_at")
 
   @@index([pageId])

@@ -17,6 +17,7 @@ import type {
 import {
   buildFacebookCommentUrl,
   extractParentCommentId,
+  findCommentMessageById,
   getMessageCommentKey,
   pickBetterSenderName,
 } from '@/lib/conversation';
@@ -31,6 +32,7 @@ import {
   isFeedCommentReply,
 } from '@/lib/message-content';
 import { UserAvatar } from '@/components/user-avatar';
+import { CommentReplyPreview } from '@/components/comment-reply-preview';
 
 const URL_SPLIT_REGEX = /(https?:\/\/[^\s]+)/g;
 
@@ -996,12 +998,9 @@ export const ThreadMessages = forwardRef<
             );
             const isInactive = !!statusLabel;
             const isReply = isFeedCommentReply(msg);
-            const parentCommentId =
-              isOut && isReply ? extractParentCommentId(msg) : null;
+            const parentCommentId = isReply ? extractParentCommentId(msg) : null;
             const parentMsg = parentCommentId
-              ? messages.find(
-                  (m) => getMessageCommentKey(m) === parentCommentId,
-                )
+              ? findCommentMessageById(messages, parentCommentId)
               : undefined;
             const parentPreview = parentMsg
               ? getCommentPreviewText(parentMsg)
@@ -1087,35 +1086,27 @@ export const ThreadMessages = forwardRef<
                           isInactive ? 'opacity-70' : ''
                         } ${isFlashing ? 'bg-[#fef3c7]' : ''}`}
                       >
-                        {isOut &&
-                          isReply &&
-                          parentCommentId &&
-                          parentPreview && (
-                            <button
-                              type="button"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                scrollToComment(parentCommentId);
-                              }}
-                              className="mb-2 w-full rounded-lg border-l-2 border-[#86efac] bg-[#f0fdf4]/80 px-2 py-1.5 text-left transition hover:bg-[#dcfce7]"
-                            >
-                              <p className="flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wide text-[#166534]">
-                                <ReplyIcon className="h-3 w-3" />
-                                Trả lời bình luận
-                              </p>
-                              <p className="line-clamp-2 text-xs text-[#14532d]">
-                                {parentPreview}
-                              </p>
-                            </button>
-                          )}
-                        {isOut &&
-                          isReply &&
-                          (!parentCommentId || !parentPreview) && (
-                            <p className="mb-1 flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wide text-[#166534]">
-                              <ReplyIcon className="h-3 w-3" />
-                              Trả lời bình luận
-                            </p>
-                          )}
+                        {isReply && parentPreview && (
+                          <CommentReplyPreview
+                            preview={parentPreview}
+                            variant={isOut ? 'bubble-out' : 'bubble-in'}
+                            onClick={
+                              parentCommentId
+                                ? () => scrollToComment(parentCommentId)
+                                : undefined
+                            }
+                          />
+                        )}
+                        {isReply && !parentPreview && (
+                          <p
+                            className={`mb-2 flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wide ${
+                              isOut ? 'text-[#166534]' : 'text-[#1d4ed8]'
+                            }`}
+                          >
+                            <ReplyIcon className="h-3 w-3" />
+                            Trả lời bình luận
+                          </p>
+                        )}
                         {!isOut && (
                           <p className="mb-1 flex items-center gap-1 text-xs font-semibold text-[#3b82f6]">
                             {hasMedia && (

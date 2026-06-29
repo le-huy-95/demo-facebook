@@ -239,6 +239,28 @@ export class RedisCacheService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  /** Dedup webhook echo sau khi app gửi tin — tránh lưu trùng OUT */
+  outboundDedupKey(orgId: string, messageId: string): string {
+    return `outbound:dedup:${orgId}:${messageId}`;
+  }
+
+  async setOutboundMessageDedup(
+    orgId: string,
+    messageId: string,
+    cliMsgId: string,
+    ttlSeconds = 3600,
+  ): Promise<void> {
+    const key = this.outboundDedupKey(orgId, messageId);
+    await this.set(key, { cliMsgId }, ttlSeconds);
+  }
+
+  async getOutboundMessageDedup(
+    orgId: string,
+    messageId: string,
+  ): Promise<{ cliMsgId: string } | null> {
+    return this.get<{ cliMsgId: string }>(this.outboundDedupKey(orgId, messageId));
+  }
+
   private async deleteKeys(keys: string[]): Promise<void> {
     for (const key of keys) {
       this.memory.delete(key);

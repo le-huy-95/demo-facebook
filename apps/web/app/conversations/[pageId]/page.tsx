@@ -40,8 +40,10 @@ import {
   isValidFacebookCommentId,
   mergeThreadMessages,
   pickBetterSenderName,
+  pickDefaultReplyComment,
   resolveCustomerNameFromMessages,
   resolveThreadIdFromEvent,
+  upsertThreadMessage,
 } from '@/lib/conversation';
 import { isActiveContentStatus } from '@/lib/event-status';
 import { getCommentPreviewText, isReceiptMessage } from '@/lib/message-content';
@@ -199,6 +201,8 @@ export default function ConversationsPage() {
   /** Thread user đã mở rõ ràng (sidebar hoặc click vào nội dung cuộc trò chuyện). */
   const explicitlyOpenedThreadIdRef = useRef<string | null>(null);
   const threadMessagesRef = useRef<ThreadMessagesHandle>(null);
+  /** Chặn socket OUT hiển thị tin trước khi HTTP gửi xong (spinner). */
+  const outboundInFlightRef = useRef(false);
 
   useEffect(() => {
     selectedThreadIdRef.current = selected?.id ?? null;
@@ -266,56 +270,8 @@ export default function ConversationsPage() {
   const appendRealtimeMessage = useCallback(
     (event: WebhookMessage, threadId: string) => {
       if (selectedThreadIdRef.current !== threadId) return;
-
-      setMessages((msgs) => {
-        if (msgs.some((m) => m.id === event.id)) return msgs;
-
-        const commentKey = event.commentId ?? event.messageId;
-        if (
-          event.eventType === 'FEED_COMMENT' &&
-          commentKey &&
-          msgs.some(
-            (m) =>
-              m.eventType === 'FEED_COMMENT' &&
-              (m.commentId === commentKey || m.messageId === commentKey),
-          )
-        ) {
-          return msgs;
-        }
-
-        if (
-          event.messageId &&
-          msgs.some(
-            (m) =>
-              m.messageId === event.messageId && m.msgType === event.msgType,
-          )
-        ) {
-          return msgs;
-        }
-
-        let next = msgs;
-        if (event.direction === 'OUT') {
-          const commentKey = event.commentId ?? event.messageId;
-          if (commentKey) {
-            const dup = msgs.some(
-              (m) => m.commentId === commentKey || m.messageId === commentKey,
-            );
-            if (dup) return msgs;
-          }
-          if (event.content) {
-            next = msgs.filter(
-              (m) =>
-                !(
-                  m.id.startsWith('client-') &&
-                  m.direction === 'OUT' &&
-                  m.content === event.content
-                ),
-            );
-          }
-        }
-
-        return [...next, event];
-      });
+      if (event.direction === 'OUT' && outboundInFlightRef.current) return;
+      setMessages((msgs) => upsertThreadMessage(msgs, event));
     },
     [],
   );
@@ -600,6 +556,27 @@ export default function ConversationsPage() {
         setMessages(msgs);
         setMessagesCursor(paging.nextBefore);
         setHasMoreMessages(paging.hasMore);
+
+        if (thread.kind === 'FEED_COMMENT') {
+          const defaultReply = pickDefaultReplyComment(msgs, pageId);
+          if (defaultReply.commentId) {
+            const target = findCommentMessageById(
+              msgs,
+              defaultReply.commentId,
+            );
+            setReplyCommentId(defaultReply.commentId);
+            setReplyPreview(
+              defaultReply.preview ??
+                (target ? getCommentPreviewText(target) : null),
+            );
+            setReplyMentionName(
+              pickBetterSenderName(
+                target?.senderName,
+                resolvedName || thread.senderName,
+              ),
+            );
+          }
+        }
 
         // Auto-detect postId from latest message (Messenger threads) so the post panel shows up without requiring a click.
         if (thread.kind !== 'FEED_COMMENT') {
@@ -1147,9 +1124,17 @@ export default function ConversationsPage() {
                       pageId={pageId}
                       threadId={selected.id}
                       shopPictureUrl={pagePictureUrl}
-                      onSent={({ clientMessageId, text }) => {
-                        const optimistic: WebhookMessage = {
-                          id: clientMessageId,
+                      onBusyChange={(busy) => {
+                        outboundInFlightRef.current = busy;
+                      }}
+                      onSent={({
+                        clientMessageId,
+                        text,
+                        savedEventId,
+                        fbMessageId,
+                      }) => {
+                        const sent: WebhookMessage = {
+                          id: savedEventId ?? clientMessageId,
                           organizationId: null,
                           pageId,
                           eventType: 'MESSENGER',
@@ -1157,18 +1142,18 @@ export default function ConversationsPage() {
                           senderId: pageId,
                           senderName: pageName || 'Page',
                           recipientId: selected.senderId,
-                          messageId: null,
+                          messageId: fbMessageId ?? null,
                           postId: null,
                           commentId: null,
                           msgType: 'webchat',
                           content: text,
                           rawPayload: JSON.stringify({
-                            source: 'optimistic',
+                            source: 'app_send',
                             clientMessageId,
                           }),
                           createdAt: new Date().toISOString(),
                         };
-                        setMessages((msgs) => [...msgs, optimistic]);
+                        setMessages((msgs) => upsertThreadMessage(msgs, sent));
                         setConversations((prev) =>
                           [...prev]
                             .map((c) =>
@@ -1176,7 +1161,7 @@ export default function ConversationsPage() {
                                 ? {
                                     ...c,
                                     preview: text,
-                                    lastMessageAt: optimistic.createdAt,
+                                    lastMessageAt: sent.createdAt,
                                     unreadCount: 0,
                                   }
                                 : c,
@@ -1188,12 +1173,8 @@ export default function ConversationsPage() {
                             ),
                         );
                       }}
-                      onAck={({ clientMessageId, ok }) => {
-                        if (!ok) {
-                          setMessages((msgs) =>
-                            msgs.filter((m) => m.id !== clientMessageId),
-                          );
-                        }
+                      onAck={({ ok }) => {
+                        if (!ok) return;
                       }}
                     />
                   ) : (
@@ -1208,10 +1189,18 @@ export default function ConversationsPage() {
                       onClearReply={clearReplyComment}
                       iconOnlyActions
                       allowAttachments={false}
-                      onSent={({ clientMessageId, text }) => {
+                      onBusyChange={(busy) => {
+                        outboundInFlightRef.current = busy;
+                      }}
+                      onSent={({
+                        clientMessageId,
+                        text,
+                        savedEventId,
+                        fbMessageId,
+                      }) => {
                         const isReply = Boolean(replyCommentId);
-                        const optimistic: WebhookMessage = {
-                          id: clientMessageId,
+                        const sent: WebhookMessage = {
+                          id: savedEventId ?? clientMessageId,
                           organizationId: null,
                           pageId,
                           eventType: 'FEED_COMMENT',
@@ -1219,20 +1208,21 @@ export default function ConversationsPage() {
                           senderId: selected.senderId,
                           senderName: pageName || 'Page',
                           recipientId: pageId,
-                          messageId: null,
+                          messageId: fbMessageId ?? null,
                           postId: selected.postId,
-                          commentId: null,
+                          commentId: fbMessageId ?? null,
+                          parentCommentId: isReply ? replyCommentId : null,
                           msgType: isReply
                             ? 'feed.comment.reply'
                             : 'feed.comment',
                           content: text,
                           rawPayload: JSON.stringify({
-                            source: 'optimistic',
+                            source: 'app_send',
                             clientMessageId,
                           }),
                           createdAt: new Date().toISOString(),
                         };
-                        setMessages((msgs) => [...msgs, optimistic]);
+                        setMessages((msgs) => upsertThreadMessage(msgs, sent));
                         setConversations((prev) =>
                           [...prev]
                             .map((c) =>
@@ -1240,7 +1230,7 @@ export default function ConversationsPage() {
                                 ? {
                                     ...c,
                                     preview: text,
-                                    lastMessageAt: optimistic.createdAt,
+                                    lastMessageAt: sent.createdAt,
                                     unreadCount: 0,
                                   }
                                 : c,
@@ -1252,33 +1242,9 @@ export default function ConversationsPage() {
                             ),
                         );
                       }}
-                      onAck={({
-                        clientMessageId,
-                        ok,
-                        fbMessageId,
-                        savedEventId,
-                      }) => {
-                        if (!ok) {
-                          setMessages((msgs) =>
-                            msgs.filter((m) => m.id !== clientMessageId),
-                          );
-                          return;
-                        }
+                      onAck={({ ok }) => {
+                        if (!ok) return;
 
-                        setMessages((msgs) =>
-                          msgs.map((m) =>
-                            m.id === clientMessageId
-                              ? {
-                                  ...m,
-                                  id: savedEventId ?? m.id,
-                                  messageId: fbMessageId ?? m.messageId,
-                                  commentId: fbMessageId ?? m.commentId,
-                                }
-                              : m,
-                          ),
-                        );
-
-                        // Đồng bộ lại từ server sau khi gửi (phòng socket/event bị miss)
                         void getConversationMessages(pageId, selected.id, {
                           limit: 15,
                         })

@@ -36,6 +36,87 @@ function parseRawPayload(
   }
 }
 
+function parseClientMessageId(msg: WebhookMessage): string | null {
+  const raw = parseRawPayload(msg.rawPayload);
+  const id = raw?.clientMessageId;
+  return typeof id === 'string' && id.trim() ? id.trim() : null;
+}
+
+function outboundContentMatches(a: string | null, b: string | null): boolean {
+  const left = a?.trim();
+  const right = b?.trim();
+  if (!left || !right) return false;
+  if (left === right) return true;
+  return left.includes(right) || right.includes(left);
+}
+
+/** Loại bỏ trùng id (optimistic + socket + refetch). */
+export function dedupeThreadMessagesById(
+  messages: WebhookMessage[],
+): WebhookMessage[] {
+  const map = new Map<string, WebhookMessage>();
+  for (const msg of messages) {
+    const existing = map.get(msg.id);
+    map.set(msg.id, existing ? { ...existing, ...msg } : msg);
+  }
+  return [...map.values()].sort(
+    (a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime(),
+  );
+}
+
+/** Gộp/cập nhật 1 tin — tránh duplicate khi gửi OUT (optimistic + socket + ack). */
+export function upsertThreadMessage(
+  messages: WebhookMessage[],
+  incoming: WebhookMessage,
+): WebhookMessage[] {
+  const incomingClientId = parseClientMessageId(incoming);
+  const incomingCommentKey = incoming.commentId ?? incoming.messageId;
+
+  let replaced = false;
+  const next = messages.map((msg) => {
+    if (msg.id === incoming.id) {
+      replaced = true;
+      return { ...msg, ...incoming };
+    }
+
+    const msgClientId = parseClientMessageId(msg);
+    if (incomingClientId && msg.id === incomingClientId) {
+      replaced = true;
+      return { ...msg, ...incoming, id: incoming.id };
+    }
+    if (incomingClientId && msgClientId === incomingClientId) {
+      replaced = true;
+      return { ...msg, ...incoming, id: incoming.id };
+    }
+
+    const msgCommentKey = msg.commentId ?? msg.messageId;
+    if (
+      incomingCommentKey &&
+      msgCommentKey &&
+      incomingCommentKey === msgCommentKey
+    ) {
+      replaced = true;
+      return { ...msg, ...incoming, id: incoming.id };
+    }
+
+    if (
+      incoming.direction === 'OUT' &&
+      msg.id.startsWith('client-') &&
+      msg.direction === 'OUT' &&
+      outboundContentMatches(msg.content, incoming.content)
+    ) {
+      replaced = true;
+      return { ...msg, ...incoming, id: incoming.id };
+    }
+
+    return msg;
+  });
+
+  return dedupeThreadMessagesById(
+    replaced ? next : [...messages, incoming],
+  );
+}
+
 function normalizeFbPostId(raw: string): string | null {
   if (/^\d+_\d+$/.test(raw)) return raw;
   const m = raw.match(/(\d+_\d+)/);
@@ -212,8 +293,12 @@ export function getMessageCommentKey(
   return isValidFacebookCommentId(id) ? id! : null;
 }
 
-/** Lấy id bình luận cha từ rawPayload Graph/webhook. */
+/** Lấy id bình luận cha từ DB hoặc rawPayload Graph/webhook. */
 export function extractParentCommentId(msg: WebhookMessage): string | null {
+  if (isValidFacebookCommentId(msg.parentCommentId)) {
+    return msg.parentCommentId!.trim();
+  }
+
   const raw = parseRawPayload(msg.rawPayload);
   if (!raw) return null;
 
@@ -224,11 +309,26 @@ export function extractParentCommentId(msg: WebhookMessage): string | null {
   return isValidFacebookCommentId(parentId) ? parentId : null;
 }
 
+function commentIdsMatch(a: string, b: string): boolean {
+  if (a === b) return true;
+  const suffixA = a.split('_').at(-1);
+  const suffixB = b.split('_').at(-1);
+  return Boolean(suffixA && suffixB && suffixA === suffixB);
+}
+
 export function findCommentMessageById(
   messages: WebhookMessage[],
   commentId: string,
 ): WebhookMessage | undefined {
-  return messages.find((msg) => getMessageCommentKey(msg) === commentId);
+  const direct = messages.find(
+    (msg) => getMessageCommentKey(msg) === commentId,
+  );
+  if (direct) return direct;
+
+  return messages.find((msg) => {
+    const key = getMessageCommentKey(msg);
+    return key ? commentIdsMatch(key, commentId) : false;
+  });
 }
 
 /** rootCommentId nhúng trong threadId FEED_COMMENT. */
@@ -311,20 +411,11 @@ export function mergeThreadMessages(
   prev: WebhookMessage[],
   incoming: WebhookMessage[],
 ): WebhookMessage[] {
-  const map = new Map<string, WebhookMessage>();
-
-  for (const msg of prev) {
-    map.set(msg.messageId ?? msg.id, msg);
-  }
+  let merged = prev;
   for (const msg of incoming) {
-    const key = msg.messageId ?? msg.id;
-    const existing = map.get(key);
-    map.set(key, existing ? { ...existing, ...msg } : msg);
+    merged = upsertThreadMessage(merged, msg);
   }
-
-  return [...map.values()].sort(
-    (a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime(),
-  );
+  return merged;
 }
 
 export function buildThreadFromEvent(

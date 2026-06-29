@@ -8,6 +8,8 @@ import {
   type ReactNode,
 } from 'react';
 import { uploadFile, sendThreadMessage } from '@/lib/api';
+import { isValidFacebookCommentId } from '@/lib/conversation';
+import { CommentReplyPreview } from '@/components/comment-reply-preview';
 import { UserAvatar } from '@/components/user-avatar';
 
 interface MessageComposerProps {
@@ -33,6 +35,8 @@ interface MessageComposerProps {
     clientMessageId: string;
     text: string;
     pending: boolean;
+    savedEventId?: string;
+    fbMessageId?: string | null;
   }) => void;
   onAck?: (payload: {
     clientMessageId: string;
@@ -41,19 +45,8 @@ interface MessageComposerProps {
     savedEventId?: string;
     error?: string;
   }) => void;
-}
-
-function ReplyIcon({ className }: { className?: string }) {
-  return (
-    <svg
-      className={className}
-      viewBox="0 0 20 20"
-      fill="currentColor"
-      aria-hidden
-    >
-      <path d="M6.5 4.5 3 8v1.5h3.25A4.75 4.75 0 0 1 11 14.25V16l3.5-3.5L11 9v1.75A3.25 3.25 0 0 0 6.5 4.5Z" />
-    </svg>
-  );
+  /** Báo parent đang gửi/upload — chặn hiển thị tin OUT từ socket trước khi xong. */
+  onBusyChange?: (busy: boolean) => void;
 }
 
 function SendIcon({ className }: { className?: string }) {
@@ -104,6 +97,31 @@ function CloseIcon({ className }: { className?: string }) {
       aria-hidden
     >
       <path d="M6.28 5.22a.75.75 0 0 0-1.06 1.06L8.94 10l-3.72 3.72a.75.75 0 1 0 1.06 1.06L10 11.06l3.72 3.72a.75.75 0 1 0 1.06-1.06L11.06 10l3.72-3.72a.75.75 0 0 0-1.06-1.06L10 8.94 6.28 5.22Z" />
+    </svg>
+  );
+}
+
+function LoadingSpinner({ className }: { className?: string }) {
+  return (
+    <svg
+      className={`animate-spin ${className ?? ''}`}
+      viewBox="0 0 24 24"
+      fill="none"
+      aria-hidden
+    >
+      <circle
+        className="opacity-25"
+        cx="12"
+        cy="12"
+        r="10"
+        stroke="currentColor"
+        strokeWidth="4"
+      />
+      <path
+        className="opacity-75"
+        fill="currentColor"
+        d="M4 12a8 8 0 0 1 14.93-4.06"
+      />
     </svg>
   );
 }
@@ -171,6 +189,7 @@ export function MessageComposer({
   allowAttachments = true,
   onSent,
   onAck,
+  onBusyChange,
 }: MessageComposerProps) {
   const [text, setText] = useState('');
   const [sending, setSending] = useState(false);
@@ -179,6 +198,10 @@ export function MessageComposer({
   const lastMentionKeyRef = useRef<string | null>(null);
 
   const [uploading, setUploading] = useState(false);
+
+  useEffect(() => {
+    onBusyChange?.(sending || uploading);
+  }, [sending, uploading, onBusyChange]);
 
   // Prefill @tên khi chọn bình luận để trả lời
   useEffect(() => {
@@ -219,17 +242,18 @@ export function MessageComposer({
     if (!trimmed || sending || disabled) return;
 
     const isCommentThread = threadId.startsWith('comment:');
+    const replyCommentId =
+      commentId && isValidFacebookCommentId(commentId) ? commentId : undefined;
 
     const clientMessageId = `client-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     setSending(true);
     setError(null);
-    onSent?.({ clientMessageId, text: trimmed, pending: true });
 
     void sendThreadMessage({
       pageId,
       threadId,
-      commentId: commentId ?? undefined,
-      ...(isCommentThread || commentId
+      commentId: replyCommentId,
+      ...(isCommentThread || replyCommentId
         ? {}
         : { replyToMessageId: replyToMessageId ?? undefined }),
       text: trimmed,
@@ -245,14 +269,16 @@ export function MessageComposer({
           error: ack.error,
         });
         if (ack.ok) {
+          onSent?.({
+            clientMessageId,
+            text: trimmed,
+            pending: false,
+            savedEventId: ack.savedEventId,
+            fbMessageId: ack.fbMessageId,
+          });
           setText('');
         } else {
-          const msg = ack.error ?? 'Gửi tin nhắn thất bại';
-          setError(
-            msg.includes('commentId')
-              ? 'Không tìm thấy comment để trả lời. Hãy chọn một bình luận trong thread trước.'
-              : msg,
-          );
+          setError(ack.error ?? 'Gửi tin nhắn thất bại');
         }
       })
       .catch((e: unknown) => {
@@ -279,20 +305,20 @@ export function MessageComposer({
 
       const clientMessageId = `client-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       const type = inferAttachmentType(file.type || '');
-
-      onSent?.({
-        clientMessageId,
-        text: text.trim() || file.name,
-        pending: true,
-      });
+      const sentText = text.trim() || file.name;
 
       try {
         const { data } = await uploadFile(file);
+        setSending(true);
         const ack = await sendThreadMessage({
           pageId,
           threadId,
-          commentId: commentId ?? undefined,
-          ...(threadId.startsWith('comment:') || commentId
+          commentId:
+            commentId && isValidFacebookCommentId(commentId)
+              ? commentId
+              : undefined,
+          ...(threadId.startsWith('comment:') ||
+          (commentId && isValidFacebookCommentId(commentId))
             ? {}
             : { replyToMessageId: replyToMessageId ?? undefined }),
           text: text.trim() || '',
@@ -308,10 +334,20 @@ export function MessageComposer({
         });
         if (!ack.ok) {
           setError(ack.error ?? 'Gửi file thất bại');
+        } else {
+          onSent?.({
+            clientMessageId,
+            text: sentText,
+            pending: false,
+            savedEventId: ack.savedEventId,
+            fbMessageId: ack.fbMessageId,
+          });
+          setText('');
         }
       } catch (e: unknown) {
         setError(e instanceof Error ? e.message : 'Upload file thất bại');
       } finally {
+        setSending(false);
         setUploading(false);
       }
     },
@@ -331,52 +367,44 @@ export function MessageComposer({
   );
 
   const isReplyingComment = Boolean(commentId);
-  const isReplyingMessage = Boolean(replyToMessageId);
   const isCommentThread = threadId.startsWith('comment:');
   const canSend = Boolean(text.trim());
+  const isBusy = sending || uploading;
 
   return (
     <div className="space-y-2">
       {commentId && (
-        <div className="flex w-full items-start gap-2 rounded-xl border border-[#fcd34d] bg-[#fffbeb] px-3 py-2">
-          <button
-            type="button"
-            onClick={onReplyPreviewClick}
-            className="flex min-w-0 flex-1 items-start gap-2 text-left transition hover:opacity-90"
-          >
-            <ReplyIcon className="mt-0.5 h-4 w-4 shrink-0 text-[#b45309]" />
-            <span className="min-w-0 flex-1">
-              <span className="block text-[10px] font-semibold uppercase tracking-wide text-[#b45309]">
-                Đang trả lời bình luận
-              </span>
-              <span className="block truncate text-sm text-[#78350f]">
-                {replyPreview?.trim() || 'Bình luận'}
-              </span>
-            </span>
-          </button>
-          {onReplyPreviewClick && (
-            <IconTooltip label="Xem bình luận gốc">
-              <button
-                type="button"
-                onClick={onReplyPreviewClick}
-                className="mt-0.5 inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-[#d97706] transition hover:bg-[#fde68a]"
-              >
-                <EyeIcon className="h-4 w-4" />
-              </button>
-            </IconTooltip>
-          )}
-          {onClearReply && (
-            <IconTooltip label="Bỏ chọn">
-              <button
-                type="button"
-                onClick={onClearReply}
-                className="mt-0.5 inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-[#b45309] transition hover:bg-[#fde68a]"
-              >
-                <CloseIcon className="h-4 w-4" />
-              </button>
-            </IconTooltip>
-          )}
-        </div>
+        <CommentReplyPreview
+          preview={replyPreview?.trim() || 'Bình luận'}
+          variant="composer"
+          onClick={onReplyPreviewClick}
+          actions={
+            <>
+              {onReplyPreviewClick && (
+                <IconTooltip label="Xem bình luận gốc">
+                  <button
+                    type="button"
+                    onClick={onReplyPreviewClick}
+                    className="mt-0.5 inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-[#d97706] transition hover:bg-[#fde68a]"
+                  >
+                    <EyeIcon className="h-4 w-4" />
+                  </button>
+                </IconTooltip>
+              )}
+              {onClearReply && (
+                <IconTooltip label="Bỏ chọn">
+                  <button
+                    type="button"
+                    onClick={onClearReply}
+                    className="mt-0.5 inline-flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-[#b45309] transition hover:bg-[#fde68a]"
+                  >
+                    <CloseIcon className="h-4 w-4" />
+                  </button>
+                </IconTooltip>
+              )}
+            </>
+          }
+        />
       )}
       <div className="rounded-2xl border border-[#e5e7eb] bg-white px-3 py-3">
         <div className="flex items-end gap-2">
@@ -386,27 +414,44 @@ export function MessageComposer({
             size="sm"
             className="mt-1"
           />
-          <textarea
-            ref={textareaRef}
-            value={text}
-            onChange={(e) => setText(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter' && !e.shiftKey) {
-                e.preventDefault();
-                handleSend();
+          <div className="relative min-w-0 flex-1">
+            <textarea
+              ref={textareaRef}
+              value={text}
+              onChange={(e) => setText(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && !e.shiftKey) {
+                  e.preventDefault();
+                  handleSend();
+                }
+              }}
+              disabled={disabled || isBusy}
+              rows={2}
+              aria-busy={isBusy}
+              placeholder={
+                sending
+                  ? 'Đang gửi...'
+                  : uploading
+                    ? 'Đang upload...'
+                    : commentId
+                      ? 'Trả lời bình luận... (Enter để gửi)'
+                      : isCommentThread
+                        ? 'Viết bình luận mới trên bài viết... (Enter để gửi)'
+                        : 'Nhập tin nhắn... (Enter để gửi, Shift+Enter xuống dòng)'
               }
-            }}
-            disabled={disabled || sending || uploading}
-            rows={2}
-            placeholder={
-              commentId
-                ? 'Trả lời bình luận... (Enter để gửi)'
-                : isCommentThread
-                  ? 'Viết bình luận mới trên bài viết... (Enter để gửi)'
-                  : 'Nhập tin nhắn... (Enter để gửi, Shift+Enter xuống dòng)'
-            }
-            className="min-h-[44px] flex-1 resize-none rounded-xl border border-[#e5e7eb] bg-white px-4 py-3 text-sm text-[#111827] outline-none ring-[#3b82f6] focus:ring-2 disabled:bg-[#f3f4f6]"
-          />
+              className={`min-h-[44px] w-full resize-none rounded-xl border border-[#e5e7eb] bg-white py-3 text-sm text-[#111827] outline-none ring-[#3b82f6] focus:ring-2 disabled:bg-[#f3f4f6] ${
+                isBusy ? 'pr-11 pl-4' : 'px-4'
+              }`}
+            />
+            {isBusy && (
+              <span
+                className="pointer-events-none absolute top-1/2 right-3 -translate-y-1/2 text-[#3b82f6]"
+                aria-hidden
+              >
+                <LoadingSpinner className="h-5 w-5" />
+              </span>
+            )}
+          </div>
           {iconOnlyActions ? (
             <ComposerIconButton
               label={
@@ -420,17 +465,24 @@ export function MessageComposer({
                         ? 'Gửi bình luận mới'
                         : 'Gửi'
               }
-              icon={<SendIcon className="h-5 w-5" />}
+              icon={
+                isBusy ? (
+                  <LoadingSpinner className="h-5 w-5" />
+                ) : (
+                  <SendIcon className="h-5 w-5" />
+                )
+              }
               onClick={handleSend}
-              disabled={disabled || sending || uploading || !canSend}
+              disabled={disabled || isBusy || !canSend}
             />
           ) : (
             <button
               type="button"
               onClick={handleSend}
-              disabled={disabled || sending || uploading || !canSend}
-              className="rounded-xl bg-[#3b82f6] px-4 py-3 text-sm font-medium text-white hover:bg-[#2563eb] disabled:cursor-not-allowed disabled:bg-[#93c5fd]"
+              disabled={disabled || isBusy || !canSend}
+              className="inline-flex min-w-[88px] items-center justify-center gap-2 rounded-xl bg-[#3b82f6] px-4 py-3 text-sm font-medium text-white hover:bg-[#2563eb] disabled:cursor-not-allowed disabled:bg-[#93c5fd]"
             >
+              {isBusy && <LoadingSpinner className="h-4 w-4" />}
               {sending ? 'Đang gửi...' : uploading ? 'Đang upload...' : 'Gửi'}
             </button>
           )}

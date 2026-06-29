@@ -1,4 +1,5 @@
 import type { WebhookMessage } from './api';
+import { extractParentCommentId } from './conversation';
 
 export interface ParsedAttachment {
   title?: string;
@@ -197,10 +198,10 @@ export function parseMessageContent(msg: WebhookMessage): ParsedMessageContent {
 }
 
 export function isFeedCommentReply(msg: WebhookMessage): boolean {
-  return (
-    msg.eventType === 'FEED_COMMENT' &&
-    (msg.direction === 'OUT' || msg.msgType?.includes('reply') === true)
-  );
+  if (msg.eventType !== 'FEED_COMMENT') return false;
+  if (msg.msgType?.includes('reply')) return true;
+  if (msg.parentCommentId?.trim()) return true;
+  return !!extractParentCommentId(msg);
 }
 
 /** Rút gọn nội dung bình luận để hiển thị preview trả lời. */

@@ -1,6 +1,18 @@
 /** Facebook comment id: `{postId}_{fbid}` hoặc `{pageId}_{postFbid}_{commentFbid}`. */
 const FACEBOOK_COMMENT_ID_RE = /^\d+(?:_\d+)+$/;
 
+/** Chuẩn hóa post id Graph (`pageId_postFbid` hoặc số thuần). */
+export function normalizeFacebookPostId(
+  raw: string | null | undefined,
+): string | null {
+  if (!raw?.trim()) return null;
+  const value = raw.trim();
+  if (/^\d+_\d+$/.test(value)) return value;
+  const match = value.match(/(\d+_\d+)/);
+  if (match?.[1]) return match[1];
+  return /^\d+$/.test(value) ? value : null;
+}
+
 export function isValidFacebookCommentId(
   commentId: string | null | undefined,
 ): boolean {

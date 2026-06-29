@@ -8,12 +8,16 @@ import {
 import type { WebhookEvent } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
 import { FacebookRepoService } from './facebook-repo.service';
-import { FacebookOAuthService } from './facebook-oauth.service';
+import { FacebookGraphApiService } from './facebook-graph-api.service';
+import { FacebookDataService } from './facebook-data.service';
 import { PageMapService } from './page-map.service';
 import { ConfigService } from '@nestjs/config';
 import { RedisCacheService } from '../../redis/redis-cache.service';
 import { parseThreadId } from '../utils/conversation-thread.util';
-import { isValidFacebookCommentId } from '../utils/facebook-comment-id.util';
+import {
+  isValidFacebookCommentId,
+  normalizeFacebookPostId,
+} from '../utils/facebook-comment-id.util';
 import { resolvePublicAssetUrl } from '../../common/public-url.util';
 
 export interface OutboundAttachment {
@@ -21,12 +25,17 @@ export interface OutboundAttachment {
   url: string;
 }
 
+/**
+ * Orchestrator gửi tin Facebook:
+ * persist-first (SENDING) → Graph API → Redis dedup → DELIVERED/FAILED
+ */
 @Injectable()
 export class FacebookMessagingService {
   constructor(
     private readonly prisma: PrismaService,
     private readonly facebookRepo: FacebookRepoService,
-    private readonly facebookOAuth: FacebookOAuthService,
+    private readonly graphApi: FacebookGraphApiService,
+    private readonly dataService: FacebookDataService,
     private readonly pageMapService: PageMapService,
     private readonly configService: ConfigService,
     private readonly redisCache: RedisCacheService,
@@ -66,7 +75,7 @@ export class FacebookMessagingService {
         (requiredTask === 'MODERATE' && normalized.includes('CREATE_CONTENT'));
       if (!hasAllowedTask) {
         throw new ForbiddenException(
-          `Tài khoản Facebook hiện không có task phù hợp trên Page để phản hồi bình luận. Required=${requiredTask}, current=[${normalized.join(', ') || 'none'}]. Vui lòng liên kết lại bằng tài khoản có quyền MANAGE/MODERATE.`,
+          `Tài khoản Facebook hiện không có task phù hợp trên Page để phản hồi bình luận. Required=${requiredTask}, current=[${normalized.join(', ') || 'none'}].`,
         );
       }
     }
@@ -149,175 +158,225 @@ export class FacebookMessagingService {
 
     const map = this.pageMapService.getSocialMap(pageId);
     const orgId = map?.orgId ?? this.getDefaultOrgId();
+
     if (parsed.kind === 'FEED_COMMENT') {
-      const pageAccessToken = await this.resolvePageAccessToken(
+      return this.sendFeedComment({
         pageId,
         orgId,
-        'MODERATE',
-      );
-      const commentText = text;
-      if (!commentText) {
-        throw new BadRequestException('Comment text is required');
-      }
-      if (!parsed.postId) {
-        throw new BadRequestException('Thiếu postId cho bình luận');
-      }
-
-      const requestedCommentId = input.commentId?.trim() || undefined;
-
-      if (requestedCommentId) {
-        const targetCommentId = await this.resolveValidReplyTargetCommentId({
-          pageId,
-          postId: parsed.postId,
-          customerId: parsed.senderId,
-          requestedCommentId,
-          threadRootCommentId: parsed.commentId,
-          pageAccessToken,
-        });
-
-        this.logger.log(
-          `[Messaging] Replying to comment ${targetCommentId} on post ${parsed.postId} for customer ${parsed.senderId}`,
-        );
-        const fbResp = await this.facebookOAuth.replyToComment(
-          targetCommentId,
-          pageAccessToken,
-          commentText,
-        );
-
-        const saved = await this.prisma.webhookEvent.create({
-          data: {
-            organizationId: orgId,
-            pageId,
-            eventType: 'FEED_COMMENT',
-            direction: 'OUT',
-            senderId: parsed.senderId,
-            senderName: 'Page',
-            recipientId: pageId,
-            messageId: fbResp.id ?? null,
-            postId: parsed.postId,
-            commentId: fbResp.id ?? null,
-            parentCommentId: parsed.commentId ?? targetCommentId ?? null,
-            msgType: 'feed.comment.reply',
-            content: commentText,
-            rawPayload: JSON.stringify({
-              source: 'socket_send',
-              clientMessageId: input.clientMessageId ?? null,
-              targetCommentId,
-              fb: fbResp,
-            }),
-          },
-        });
-
-        await this.redisCache.bumpPageRevision(orgId, pageId);
-        await this.redisCache.bumpThreadRevision(pageId, threadId);
-
-        return {
-          savedEvent: saved,
-          fb: { recipientId: undefined, messageId: fbResp.id },
-        };
-      }
-
-      this.logger.log(
-        `[Messaging] Creating post comment on ${parsed.postId} for customer thread ${parsed.senderId}`,
-      );
-      const fbResp = await this.facebookOAuth.createPostComment(
-        parsed.postId,
-        pageAccessToken,
-        commentText,
-      );
-
-      const saved = await this.prisma.webhookEvent.create({
-        data: {
-          organizationId: orgId,
-          pageId,
-          eventType: 'FEED_COMMENT',
-          direction: 'OUT',
-          senderId: parsed.senderId,
-          senderName: 'Page',
-          recipientId: pageId,
-          messageId: fbResp.id ?? null,
-          postId: parsed.postId,
-          commentId: fbResp.id ?? null,
-          parentCommentId: null,
-          msgType: 'feed.comment',
-          content: commentText,
-          rawPayload: JSON.stringify({
-            source: 'socket_send',
-            clientMessageId: input.clientMessageId ?? null,
-            mode: 'post_comment',
-            fb: fbResp,
-          }),
-        },
+        parsed,
+        text,
+        commentId: input.commentId,
+        clientMessageId: input.clientMessageId,
       });
-
-      await this.redisCache.bumpPageRevision(orgId, pageId);
-      await this.redisCache.bumpThreadRevision(pageId, threadId);
-
-      return {
-        savedEvent: saved,
-        fb: { recipientId: undefined, messageId: fbResp.id },
-      };
     }
 
     if (parsed.kind !== 'MESSENGER') {
       throw new BadRequestException('Thread kind không được hỗ trợ');
     }
 
-    const pageAccessToken = await this.resolvePageAccessToken(
+    return this.sendMessenger({
       pageId,
       orgId,
+      parsed,
+      text,
+      attachment,
+      replyToMessageId,
+      clientMessageId: input.clientMessageId,
+      threadId,
+    });
+  }
+
+  private async sendMessenger(input: {
+    pageId: string;
+    orgId: string;
+    parsed: NonNullable<ReturnType<typeof parseThreadId>>;
+    text: string;
+    attachment?: OutboundAttachment;
+    replyToMessageId?: string;
+    clientMessageId?: string;
+    threadId: string;
+  }) {
+    const pageAccessToken = await this.resolvePageAccessToken(
+      input.pageId,
+      input.orgId,
       'CREATE_CONTENT',
     );
 
-    const fbResp = attachment
-      ? await this.facebookOAuth.sendAttachmentMessageToPsid(
-          parsed.senderId,
-          pageAccessToken,
-          {
-            ...attachment,
-            url: this.resolveAttachmentUrl(attachment.url),
-          },
-        )
-      : await this.facebookOAuth.sendTextMessageToPsid(
-          parsed.senderId,
-          pageAccessToken,
-          text,
-          replyToMessageId,
-        );
+    const { msgType, content } = this.buildOutboundContent(
+      input.text,
+      input.attachment,
+    );
 
-    const { msgType, content } = this.buildOutboundContent(text, attachment);
-
-    const saved = await this.prisma.webhookEvent.create({
-      data: {
-        organizationId: orgId,
-        pageId,
-        eventType: 'MESSENGER',
-        direction: 'OUT',
-        senderId: pageId,
-        senderName: 'Page',
-        recipientId: parsed.senderId,
-        messageId: fbResp.message_id ?? null,
-        postId: parsed.postId ?? null,
-        commentId: null,
-        msgType,
-        content: attachment ? content : text,
-        rawPayload: JSON.stringify({
-          source: 'socket_send',
-          clientMessageId: input.clientMessageId ?? null,
-          replyToMessageId: replyToMessageId ?? null,
-          attachment: attachment ?? null,
-          fb: fbResp,
-        }),
-      },
+    // Step 1: Lưu SENDING trước khi gọi Graph API
+    const record = await this.dataService.saveAndBroadcastOutbound({
+      organizationId: input.orgId,
+      pageId: input.pageId,
+      eventType: 'MESSENGER',
+      direction: 'OUT',
+      senderId: input.pageId,
+      senderName: 'Page',
+      recipientId: input.parsed.senderId,
+      msgType,
+      content: input.attachment ? content : input.text,
+      rawPayload: JSON.stringify({
+        source: 'app_send',
+        clientMessageId: input.clientMessageId ?? null,
+        replyToMessageId: input.replyToMessageId ?? null,
+        attachment: input.attachment ?? null,
+        status: 'SENDING',
+      }),
+      clientMessageId: input.clientMessageId,
     });
 
-    await this.redisCache.bumpPageRevision(orgId, pageId);
-    await this.redisCache.bumpThreadRevision(pageId, threadId);
+    try {
+      const fbResp = input.attachment
+        ? await this.graphApi.sendAttachmentMessage(
+            input.parsed.senderId,
+            pageAccessToken,
+            {
+              ...input.attachment,
+              url: this.resolveAttachmentUrl(input.attachment.url),
+            },
+            input.replyToMessageId,
+          )
+        : await this.graphApi.sendTextMessage(
+            input.parsed.senderId,
+            pageAccessToken,
+            input.text,
+            input.replyToMessageId,
+          );
 
-    return {
-      savedEvent: saved,
-      fb: { recipientId: fbResp.recipient_id, messageId: fbResp.message_id },
-    };
+      // Step 4: Redis dedup NGAY sau messageId — trước webhook echo
+      if (fbResp.message_id) {
+        await this.redisCache.setOutboundMessageDedup(
+          input.orgId,
+          fbResp.message_id,
+          record.id,
+        );
+      }
+
+      // Step 5: Cập nhật DELIVERED
+      const saved = await this.dataService.applySendResult(
+        record.id,
+        'DELIVERED',
+        fbResp.message_id ?? null,
+      );
+
+      return {
+        savedEvent: saved,
+        fb: {
+          recipientId: fbResp.recipient_id,
+          messageId: fbResp.message_id,
+        },
+      };
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : 'Send failed';
+      this.logger.error(`[Messaging] Messenger send failed: ${message}`);
+      const saved = await this.dataService.applySendResult(
+        record.id,
+        'FAILED',
+        null,
+      );
+      throw err;
+    }
+  }
+
+  private async sendFeedComment(input: {
+    pageId: string;
+    orgId: string;
+    parsed: NonNullable<ReturnType<typeof parseThreadId>>;
+    text: string;
+    commentId?: string;
+    clientMessageId?: string;
+  }) {
+    const pageAccessToken = await this.resolvePageAccessToken(
+      input.pageId,
+      input.orgId,
+      'MODERATE',
+    );
+    const commentText = input.text;
+    if (!commentText) {
+      throw new BadRequestException('Comment text is required');
+    }
+    const postId =
+      normalizeFacebookPostId(input.parsed.postId) ?? input.parsed.postId;
+    if (!postId) {
+      throw new BadRequestException('Thiếu postId cho bình luận');
+    }
+
+    const requestedCommentId = input.commentId?.trim() || undefined;
+    const isReply =
+      !!requestedCommentId && isValidFacebookCommentId(requestedCommentId);
+
+    const record = await this.dataService.saveAndBroadcastOutbound({
+      organizationId: input.orgId,
+      pageId: input.pageId,
+      eventType: 'FEED_COMMENT',
+      direction: 'OUT',
+      senderId: input.parsed.senderId,
+      senderName: 'Page',
+      recipientId: input.pageId,
+      postId,
+      parentCommentId: input.parsed.commentId ?? requestedCommentId ?? null,
+      msgType: isReply ? 'feed.comment.reply' : 'feed.comment',
+      content: commentText,
+      rawPayload: JSON.stringify({
+        source: 'app_send',
+        clientMessageId: input.clientMessageId ?? null,
+        mode: isReply ? 'reply' : 'post_comment',
+        status: 'SENDING',
+      }),
+      clientMessageId: input.clientMessageId,
+    });
+
+    try {
+      let fbResp: { id?: string };
+      if (isReply) {
+        const targetCommentId =
+          requestedCommentId ??
+          (await this.resolveValidReplyTargetCommentId({
+            pageId: input.pageId,
+            postId,
+            customerId: input.parsed.senderId,
+            requestedCommentId,
+            threadRootCommentId: input.parsed.commentId,
+          }));
+        fbResp = await this.graphApi.replyToComment(
+          targetCommentId,
+          pageAccessToken,
+          commentText,
+        );
+      } else {
+        fbResp = await this.graphApi.createPostComment(
+          postId,
+          pageAccessToken,
+          commentText,
+        );
+      }
+
+      if (fbResp.id) {
+        await this.redisCache.setOutboundMessageDedup(
+          input.orgId,
+          fbResp.id,
+          record.id,
+        );
+      }
+
+      const saved = await this.dataService.applySendResult(
+        record.id,
+        'DELIVERED',
+        fbResp.id ?? null,
+        fbResp.id ?? null,
+      );
+
+      return {
+        savedEvent: { ...saved, commentId: fbResp.id ?? saved.commentId },
+        fb: { messageId: fbResp.id },
+      };
+    } catch (err: unknown) {
+      await this.dataService.applySendResult(record.id, 'FAILED', null);
+      throw err;
+    }
   }
 
   async sendTextToThread(input: {
@@ -329,180 +388,68 @@ export class FacebookMessagingService {
     return this.sendToThread(input);
   }
 
-  /** Chọn comment parent còn tồn tại trên Graph — tránh reply vào ID cũ/đã xóa. */
+  /** Chọn comment parent từ DB — không gọi Graph API để đọc history */
   private async resolveValidReplyTargetCommentId(input: {
     pageId: string;
     postId: string;
     customerId: string;
     requestedCommentId?: string;
     threadRootCommentId?: string;
-    pageAccessToken: string;
   }): Promise<string> {
     const candidates: string[] = [];
-    const trustedInboundIds = new Set<string>();
-
     const pushCandidate = (id: string | null | undefined) => {
       if (!id || !isValidFacebookCommentId(id)) return;
       if (!candidates.includes(id)) candidates.push(id);
     };
 
-    if (
-      input.requestedCommentId &&
-      isValidFacebookCommentId(input.requestedCommentId)
-    ) {
-      const pageOwned = await this.prisma.webhookEvent.findFirst({
-        where: {
-          pageId: input.pageId,
-          eventType: 'FEED_COMMENT',
-          direction: 'OUT',
-          OR: [
-            { commentId: input.requestedCommentId },
-            { messageId: input.requestedCommentId },
-          ],
-        },
-        select: { id: true },
-      });
-      if (!pageOwned) {
-        pushCandidate(input.requestedCommentId);
-      }
-    }
-
+    pushCandidate(input.requestedCommentId);
     pushCandidate(input.threadRootCommentId);
 
-    const inboundRows = await this.prisma.webhookEvent.findMany({
+    const threadCommentFilter = input.threadRootCommentId
+      ? [
+          { commentId: input.threadRootCommentId },
+          { parentCommentId: input.threadRootCommentId },
+        ]
+      : [];
+
+    const rows = await this.prisma.webhookEvent.findMany({
       where: {
         pageId: input.pageId,
         eventType: 'FEED_COMMENT',
-        direction: 'IN',
         postId: input.postId,
-        senderId: input.customerId,
         commentId: { not: null },
+        status: 'ACTIVE',
+        OR: [
+          { direction: 'IN', senderId: input.customerId },
+          { direction: 'IN', senderId: { not: input.pageId } },
+          ...threadCommentFilter,
+        ],
       },
       orderBy: { createdAt: 'desc' },
-      take: 20,
-      select: { commentId: true },
+      take: 30,
+      select: { commentId: true, direction: true, senderId: true },
     });
-    for (const row of inboundRows) {
-      if (row.commentId && isValidFacebookCommentId(row.commentId)) {
-        trustedInboundIds.add(row.commentId);
+
+    for (const row of rows) {
+      if (
+        row.direction === 'IN' &&
+        row.senderId &&
+        row.senderId !== input.pageId
+      ) {
         pushCandidate(row.commentId);
       }
     }
-
-    const graphFallback = await this.resolveLatestInboundCommentId({
-      pageId: input.pageId,
-      postId: input.postId,
-      customerId: input.customerId,
-      pageAccessToken: input.pageAccessToken,
-    });
-    if (graphFallback) {
-      pushCandidate(graphFallback);
+    for (const row of rows) {
+      pushCandidate(row.commentId);
     }
 
-    const seen = new Set<string>();
-    for (const id of candidates) {
-      if (seen.has(id)) continue;
-      seen.add(id);
-
-      const meta = await this.facebookOAuth.getCommentMeta(
-        id,
-        input.pageAccessToken,
-        { postId: input.postId, silent: true },
+    if (candidates.length === 0) {
+      throw new NotFoundException(
+        'Không tìm thấy bình luận khách hàng trong DB. Chỉ thấy tin từ lúc webhook hoạt động.',
       );
-      if (meta?.id && meta.fromId !== input.pageId) {
-        if (id !== input.requestedCommentId) {
-          this.logger.warn(
-            `[Messaging] commentId ${input.requestedCommentId ?? 'none'} không hợp lệ, dùng ${meta.id}`,
-          );
-        }
-        return meta.id;
-      }
     }
 
-    for (const id of candidates) {
-      if (
-        trustedInboundIds.has(id) ||
-        id === input.threadRootCommentId ||
-        id === input.requestedCommentId
-      ) {
-        this.logger.warn(
-          `[Messaging] getCommentMeta thất bại, thử reply trực tiếp commentId=${id}`,
-        );
-        return id;
-      }
-    }
-
-    throw new NotFoundException(
-      'Không tìm thấy bình luận khách hàng còn tồn tại trên Facebook. Tải lại thread hoặc chọn bình luận khác.',
-    );
-  }
-
-  private async resolveLatestInboundCommentId(input: {
-    pageId: string;
-    postId: string;
-    rootCommentId?: string;
-    customerId: string;
-    pageAccessToken?: string;
-  }): Promise<string | null> {
-    const inbound = await this.prisma.webhookEvent.findFirst({
-      where: {
-        pageId: input.pageId,
-        eventType: 'FEED_COMMENT',
-        direction: 'IN',
-        postId: input.postId,
-        senderId: input.customerId,
-        commentId: { not: null },
-      },
-      orderBy: { createdAt: 'desc' },
-      select: { commentId: true },
-    });
-    if (inbound?.commentId && isValidFacebookCommentId(inbound.commentId)) {
-      return inbound.commentId;
-    }
-
-    // Fallback: comment gần nhất trong thread (kể cả từ Graph sync)
-    const anyInThread = await this.prisma.webhookEvent.findFirst({
-      where: {
-        pageId: input.pageId,
-        eventType: 'FEED_COMMENT',
-        postId: input.postId,
-        senderId: input.customerId,
-        commentId: { not: null },
-      },
-      orderBy: { createdAt: 'desc' },
-      select: { commentId: true },
-    });
-    if (
-      anyInThread?.commentId &&
-      isValidFacebookCommentId(anyInThread.commentId)
-    ) {
-      return anyInThread.commentId;
-    }
-
-    // Fallback cuối: lấy từ Graph API comment mới nhất của khách trên post
-    try {
-      const token =
-        input.pageAccessToken ??
-        (await this.resolvePageAccessToken(
-          input.pageId,
-          this.getDefaultOrgId(),
-        ));
-      const { comments } = await this.facebookOAuth.getPostComments(
-        input.postId,
-        token,
-        { limit: 50 },
-      );
-      const customerComment = comments
-        .filter((c) => c.from?.id === input.customerId && c.id)
-        .sort(
-          (a, b) =>
-            new Date(b.created_time).getTime() -
-            new Date(a.created_time).getTime(),
-        )[0];
-      return customerComment?.id ?? null;
-    } catch {
-      return null;
-    }
+    return candidates[0];
   }
 
   private resolveAttachmentUrl(url: string): string {
