@@ -142,6 +142,21 @@ function CommentHeaderIconButton({
   );
 }
 
+const MESSENGER_MESSAGE_PAGE_SIZE = 15;
+const FEED_COMMENT_MESSAGE_PAGE_SIZE = 50;
+
+function threadMessagePageSize(kind?: ConversationKind): number {
+  return kind === 'FEED_COMMENT'
+    ? FEED_COMMENT_MESSAGE_PAGE_SIZE
+    : MESSENGER_MESSAGE_PAGE_SIZE;
+}
+
+function threadMessagePageSizeFromId(threadId: string): number {
+  return threadId.startsWith('comment:')
+    ? FEED_COMMENT_MESSAGE_PAGE_SIZE
+    : MESSENGER_MESSAGE_PAGE_SIZE;
+}
+
 export default function ConversationsPage() {
   const params = useParams();
   const pageId = params.pageId as string;
@@ -368,7 +383,7 @@ export default function ConversationsPage() {
         pageId,
         threadId,
         {
-          limit: 15,
+          limit: threadMessagePageSizeFromId(threadId),
         },
       );
       setMessages((prev) => mergeThreadMessages(prev, msgs));
@@ -655,10 +670,18 @@ export default function ConversationsPage() {
       setThreadLoadError(null);
 
       try {
+        if (normalizedThread.kind === 'FEED_COMMENT') {
+          try {
+            await syncComments(pageId, false);
+          } catch {
+            // vẫn load thread nếu sync thất bại
+          }
+        }
+
         const { data: msgs, paging, meta } = await getConversationMessages(
           pageId,
           normalizedId,
-          { limit: 15 },
+          { limit: threadMessagePageSize(normalizedThread.kind) },
         );
         if (threadLoadSeqRef.current !== loadSeq) return;
 
@@ -1187,7 +1210,7 @@ export default function ConversationsPage() {
         pageId,
         selected.id,
         {
-          limit: 15,
+          limit: threadMessagePageSize(selected.kind),
           before: messagesCursor,
         },
       );
@@ -1656,7 +1679,7 @@ export default function ConversationsPage() {
                         if (!ok) return;
 
                         void getConversationMessages(pageId, selected.id, {
-                          limit: 15,
+                          limit: threadMessagePageSize(selected.kind),
                         })
                           .then(({ data }) => {
                             if (selectedThreadIdRef.current !== selected.id)

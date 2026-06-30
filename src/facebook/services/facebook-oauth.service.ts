@@ -8,6 +8,10 @@ import {
   facebookCommentIdsMatch,
   isValidFacebookCommentId,
 } from '../utils/facebook-comment-id.util';
+import {
+  GRAPH_COMMENT_FIELDS_WITH_REPLIES,
+  flattenGraphComments,
+} from '../utils/graph-comment.util';
 
 export interface OAuthStateData {
   orgId: string;
@@ -82,9 +86,8 @@ export interface GraphPostComment {
   };
 }
 
-/** Fields Graph API cho comment — gồm ảnh/sticker đính kèm. */
-export const GRAPH_COMMENT_FIELDS =
-  'id,message,from{id,name,picture},created_time,parent{id},is_hidden,attachment{type,url,title,media,target}';
+/** Fields Graph API cho comment — gồm ảnh/sticker đính kèm + reply lồng nhau. */
+export const GRAPH_COMMENT_FIELDS = GRAPH_COMMENT_FIELDS_WITH_REPLIES;
 
 export interface GraphFeedPost {
   id: string;
@@ -735,7 +738,7 @@ export class FacebookOAuthService {
           paging?: { cursors?: { before?: string; after?: string } };
         }>();
 
-      const flat = this.flattenComments(response.data ?? []);
+      const flat = flattenGraphComments(response.data ?? []);
       return {
         comments: flat,
         paging: response.paging,
@@ -748,24 +751,6 @@ export class FacebookOAuthService {
       );
       return { comments: [] };
     }
-  }
-
-  private flattenComments(comments: GraphPostComment[]): GraphPostComment[] {
-    const flat: GraphPostComment[] = [];
-    const stack = [...comments];
-
-    while (stack.length > 0) {
-      const current = stack.shift();
-      if (!current?.id) continue;
-      flat.push(current);
-
-      const children = current.comments?.data ?? [];
-      if (children.length > 0) {
-        stack.push(...children);
-      }
-    }
-
-    return flat;
   }
 
   /** Lấy comment của bài viết qua phân trang (tối đa maxComments). */

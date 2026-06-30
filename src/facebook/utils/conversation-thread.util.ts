@@ -200,6 +200,18 @@ export function buildThreadEventWhere(
           OR: [
             { commentId: parsed.commentId },
             { parentCommentId: parsed.commentId },
+            { senderId: parsed.senderId },
+            {
+              senderId: parsed.pageId,
+              direction: 'OUT',
+              recipientId: parsed.senderId,
+            },
+            {
+              senderId: parsed.pageId,
+              direction: 'OUT',
+              recipientId: null,
+            },
+            { direction: 'OUT', senderId: parsed.senderId },
           ],
         },
       ],

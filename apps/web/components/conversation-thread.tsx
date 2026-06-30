@@ -642,10 +642,23 @@ function AttachmentBlock({
   attachment: { title?: string; href?: string; thumb?: string; type?: string };
 }) {
   const url = attachment.href || attachment.thumb;
+  const isSticker = attachment.type === 'sticker';
   const isImage =
     attachment.type === 'image' ||
-    attachment.type === 'sticker' ||
+    isSticker ||
     /\.(png|jpe?g|gif|webp)(\?|$)/i.test(url ?? '');
+
+  if (url && attachment.type === 'video') {
+    return (
+      <video
+        src={url}
+        controls
+        playsInline
+        className="max-h-64 max-w-full rounded-lg"
+        referrerPolicy="no-referrer"
+      />
+    );
+  }
 
   if (url && isImage) {
     return (
@@ -658,30 +671,17 @@ function AttachmentBlock({
         <img
           src={url}
           alt={attachment.title ?? 'Đính kèm'}
-          className="max-h-64 max-w-full rounded-lg object-cover"
+          className={`max-w-full rounded-lg object-contain ${
+            isSticker ? 'max-h-48' : 'max-h-64'
+          }`}
           referrerPolicy="no-referrer"
         />
-        {attachment.type === 'sticker' && (
+        {isSticker && (
           <p className="mt-1 flex items-center gap-1 text-[10px] text-[#6b7280]">
             <ImageIcon className="h-3 w-3" />
-            Sticker
+            Sticker / GIF
           </p>
         )}
-      </a>
-    );
-  }
-
-  if (url && attachment.type === 'video') {
-    return (
-      <a
-        href={url}
-        target="_blank"
-        rel="noopener noreferrer"
-        className="flex items-center gap-2 rounded-lg bg-[#f3f4f6] px-3 py-2 text-sm text-[#2563eb] underline"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <span aria-hidden>▶</span>
-        {attachment.title ?? 'Xem video'}
       </a>
     );
   }

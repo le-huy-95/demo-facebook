@@ -63,6 +63,18 @@ function extractAttachmentFromPayload(
     return { type: 'photo', url, media: { image: { src: url } } };
   }
 
+  const gif = payload.gif;
+  if (typeof gif === 'string' && gif.trim()) {
+    const url = gif.trim();
+    return { type: 'animated_image', url, media: { image: { src: url } } };
+  }
+
+  const sticker = payload.sticker;
+  if (typeof sticker === 'string' && sticker.trim()) {
+    const url = sticker.trim();
+    return { type: 'sticker', url, media: { image: { src: url } } };
+  }
+
   const link = payload.link;
   if (typeof link === 'string' && link.trim()) {
     const url = link.trim();
@@ -74,21 +86,58 @@ function extractAttachmentFromPayload(
   return null;
 }
 
+function isStickerAttachmentType(type?: string): boolean {
+  if (!type) return false;
+  const lower = type.toLowerCase();
+  return (
+    lower === 'sticker' ||
+    lower === 'animated_image' ||
+    lower === 'animated_image_share' ||
+    lower === 'gif' ||
+    lower.includes('sticker') ||
+    lower.includes('animated')
+  );
+}
+
+function isDirectMediaUrl(url: string): boolean {
+  return (
+    /\.(png|jpe?g|gif|webp|mp4|webm)(\?|$)/i.test(url) ||
+    url.includes('fbcdn.net') ||
+    url.includes('fbsbx.com')
+  );
+}
+
 function serializeAttachment(
   att: NonNullable<ReturnType<typeof extractAttachmentFromPayload>>,
   text: string,
 ): { text: string; attachment: ParsedAttachment } {
-  const imageUrl = att.media?.image?.src ?? att.url;
-  const videoUrl = att.media?.source;
+  const imageUrl =
+    att.media?.image?.src?.trim() ||
+    (att.url && isDirectMediaUrl(att.url) ? att.url.trim() : '');
+  const videoUrl = att.media?.source?.trim() || '';
+  const isSticker =
+    isStickerAttachmentType(att.type) || /\.gif(\?|$)/i.test(imageUrl);
+
+  if (videoUrl && (att.type === 'video' || !imageUrl)) {
+    return {
+      text,
+      attachment: {
+        href: videoUrl,
+        type: 'video',
+        title: att.title ?? 'Video',
+      },
+    };
+  }
 
   if (imageUrl) {
+    const mediaType = isSticker ? 'sticker' : 'image';
     return {
       text,
       attachment: {
         href: imageUrl,
         thumb: imageUrl,
-        type: 'image',
-        title: att.title ?? 'Ảnh',
+        type: mediaType,
+        title: att.title ?? (isSticker ? 'Sticker' : 'Ảnh'),
       },
     };
   }
@@ -105,7 +154,7 @@ function serializeAttachment(
     };
   }
 
-  if (videoUrl || att.type === 'video') {
+  if (att.type === 'video') {
     return {
       text,
       attachment: {

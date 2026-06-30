@@ -15,6 +15,7 @@ import {
 } from '../utils/facebook-payload.util';
 import { transformFeedChange, extractFeedCommentKey, extractFeedPostKey, type FeedEventTransform } from '../utils/facebook-feed.util';
 import { buildThreadId } from '../utils/conversation-thread.util';
+import { flattenGraphComments } from '../utils/graph-comment.util';
 import { extractPostIdFromMessengerPayload } from '../utils/messenger-thread.util';
 import { isValidFacebookCommentId, facebookCommentIdsMatch, buildFacebookCommentIdCandidates, facebookCommentIdSuffix } from '../utils/facebook-comment-id.util';
 import {
@@ -1140,13 +1141,14 @@ export class FacebookWebhookService implements OnModuleInit {
 
       for (const post of posts) {
         if (!post.id) continue;
-        const comments =
+        const rawComments =
           post.comments?.data?.length
             ? post.comments.data
             : await this.facebookOAuth.listAllPostComments(post.id, token, {
                 pageSize: force || totalEvents === 0 ? 100 : 25,
                 maxComments: force || totalEvents === 0 ? 500 : 40,
               });
+        const comments = flattenGraphComments(rawComments);
 
         for (const comment of comments) {
           if (comment.id) graphCommentsById.set(comment.id, comment);
