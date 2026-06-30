@@ -1,4 +1,4 @@
-import { BadRequestException, Injectable, OnModuleInit } from '@nestjs/common';
+import { BadRequestException, Inject, Injectable, OnModuleInit, forwardRef } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import type { WebhookEvent } from '@prisma/client';
 import { PrismaService } from '../../prisma/prisma.service';
@@ -7,7 +7,7 @@ import { PageMapService } from '../services/page-map.service';
 import { EventsService } from '../services/events.service';
 import { EventsGateway } from '../gateways/events.gateway';
 import { ConversationsService } from '../services/conversations.service';
-import { FacebookOAuthService } from '../services/facebook-oauth.service';
+import { FacebookOAuthService, type GraphPostComment } from '../services/facebook-oauth.service';
 import { FacebookRepoService } from '../services/facebook-repo.service';
 import {
   transformInboundMessage,
@@ -16,7 +16,12 @@ import {
 import { transformFeedChange, extractFeedCommentKey, extractFeedPostKey, type FeedEventTransform } from '../utils/facebook-feed.util';
 import { buildThreadId } from '../utils/conversation-thread.util';
 import { extractPostIdFromMessengerPayload } from '../utils/messenger-thread.util';
-import { isValidFacebookCommentId } from '../utils/facebook-comment-id.util';
+import { isValidFacebookCommentId, facebookCommentIdsMatch, buildFacebookCommentIdCandidates, facebookCommentIdSuffix } from '../utils/facebook-comment-id.util';
+import {
+  serializeFeedCommentContent,
+  serializeFeedCommentFromRawPayload,
+  feedCommentContentHasMedia,
+} from '../utils/feed-comment-content.util';
 import {
   EVENT_STATUS_ACTIVE,
   EVENT_STATUS_DELETED,
@@ -44,6 +49,7 @@ export class FacebookWebhookService implements OnModuleInit {
     private readonly pageMapService: PageMapService,
     private readonly eventsService: EventsService,
     private readonly eventsGateway: EventsGateway,
+    @Inject(forwardRef(() => ConversationsService))
     private readonly conversationsService: ConversationsService,
     private readonly redisCache: RedisCacheService,
     private readonly facebookOAuth: FacebookOAuthService,
@@ -206,13 +212,11 @@ export class FacebookWebhookService implements OnModuleInit {
       const commentKey = data.commentId ?? data.messageId;
       if (!commentKey) return null;
 
-      return this.prisma.webhookEvent.findFirst({
-        where: {
-          pageId: data.pageId,
-          eventType: 'FEED_COMMENT',
-          OR: [{ messageId: commentKey }, { commentId: commentKey }],
-        },
-      });
+      return this.findExistingFeedCommentEvent(
+        data.pageId,
+        commentKey,
+        data.postId,
+      );
     }
 
     if (!data.messageId) return null;
@@ -224,6 +228,145 @@ export class FacebookWebhookService implements OnModuleInit {
         eventType: { in: ['MESSENGER', 'MESSENGER_POSTBACK'] },
       },
     });
+  }
+
+  private async findExistingFeedCommentEvent(
+    pageId: string,
+    commentId: string,
+    postId?: string | null,
+  ): Promise<WebhookEvent | null> {
+    const candidates = buildFacebookCommentIdCandidates(commentId, postId);
+    const exact = await this.prisma.webhookEvent.findFirst({
+      where: {
+        pageId,
+        eventType: 'FEED_COMMENT',
+        OR: [
+          { commentId: { in: candidates } },
+          { messageId: { in: candidates } },
+        ],
+      },
+    });
+    if (exact) return exact;
+
+    const suffix = facebookCommentIdSuffix(commentId);
+    if (!suffix) return null;
+
+    const recent = await this.prisma.webhookEvent.findMany({
+      where: {
+        pageId,
+        eventType: 'FEED_COMMENT',
+        ...(postId ? { postId } : {}),
+      },
+      orderBy: { createdAt: 'desc' },
+      take: 400,
+    });
+
+    return (
+      recent.find((row) =>
+        facebookCommentIdsMatch(row.commentId ?? row.messageId, commentId),
+      ) ?? null
+    );
+  }
+
+  private async upgradeFeedCommentFromGraph(
+    existing: WebhookEvent,
+    comment: GraphPostComment,
+    parentCommentId: string | null,
+    pageId: string,
+  ): Promise<boolean> {
+    let serialized = serializeFeedCommentContent(
+      {
+        message: comment.message,
+        attachment: comment.attachment,
+      },
+      { isReply: !!parentCommentId },
+    );
+
+    if (!feedCommentContentHasMedia(serialized.content) && existing.rawPayload) {
+      const fromRaw = serializeFeedCommentFromRawPayload(existing.rawPayload, {
+        content: existing.content,
+        msgType: existing.msgType,
+        isReply: !!parentCommentId,
+      });
+      if (fromRaw && feedCommentContentHasMedia(fromRaw.content)) {
+        serialized = fromRaw;
+      }
+    }
+
+    const hasGraphMedia = feedCommentContentHasMedia(serialized.content);
+    const hasExistingMedia = feedCommentContentHasMedia(existing.content);
+    const needsMsgType =
+      existing.msgType === 'feed.comment' &&
+      serialized.msgType !== existing.msgType;
+    const needsRaw =
+      !existing.rawPayload?.includes('"attachment"') &&
+      !existing.rawPayload?.includes('"photo"') &&
+      hasGraphMedia;
+    const needsWebhookPhoto =
+      !hasExistingMedia &&
+      Boolean(existing.rawPayload?.includes('"photo"'));
+    const needsText =
+      existing.content?.includes('[Bình luận mới trên bài viết]') &&
+      Boolean(comment.message?.trim());
+
+    const graphStatus =
+      comment.is_hidden === true
+        ? EVENT_STATUS_HIDDEN
+        : existing.status === EVENT_STATUS_DELETED
+          ? EVENT_STATUS_DELETED
+          : EVENT_STATUS_ACTIVE;
+    const needsVisibility =
+      (existing.status ?? EVENT_STATUS_ACTIVE) !== graphStatus;
+
+    const needsContentUpgrade =
+      hasGraphMedia ||
+      needsMsgType ||
+      needsRaw ||
+      needsText ||
+      needsWebhookPhoto;
+
+    if (!needsContentUpgrade && !needsVisibility) {
+      if (hasExistingMedia) return false;
+    }
+
+    if (
+      hasExistingMedia &&
+      !needsContentUpgrade &&
+      !needsVisibility &&
+      existing.commentId === comment.id
+    ) {
+      return false;
+    }
+
+    const updated = await this.prisma.webhookEvent.update({
+      where: { id: existing.id },
+      data: {
+        ...(needsContentUpgrade
+          ? {
+              content: serialized.content,
+              msgType: serialized.msgType,
+              commentId: comment.id,
+              messageId: comment.id,
+              parentCommentId: parentCommentId ?? existing.parentCommentId,
+              rawPayload: JSON.stringify({
+                source: 'webhook_changed_fields_sync',
+                comment,
+              }),
+            }
+          : {
+              rawPayload: JSON.stringify({
+                source: 'webhook_visibility_sync',
+                comment,
+              }),
+            }),
+        status: graphStatus,
+      },
+    });
+
+    await this.invalidateCachesForEvent(pageId, updated);
+    this.eventsService.emitNewMessage(updated);
+    this.eventsGateway.emitWebhookEvent(updated);
+    return true;
   }
 
   private async saveAndBroadcast(data: WebhookEventCreateData) {
@@ -273,14 +416,37 @@ export class FacebookWebhookService implements OnModuleInit {
     commentKey: string,
     status: EventVisibilityStatus,
   ): Promise<void> {
-    const updated = await this.prisma.webhookEvent.updateMany({
+    const candidates = buildFacebookCommentIdCandidates(commentKey);
+    let updated = await this.prisma.webhookEvent.updateMany({
       where: {
         pageId,
         eventType: 'FEED_COMMENT',
-        OR: [{ commentId: commentKey }, { messageId: commentKey }],
+        OR: [
+          { commentId: { in: candidates } },
+          { messageId: { in: candidates } },
+        ],
       },
       data: { status },
     });
+
+    if (updated.count === 0) {
+      const rows = await this.prisma.webhookEvent.findMany({
+        where: { pageId, eventType: 'FEED_COMMENT' },
+        select: { id: true, commentId: true, messageId: true },
+      });
+      const matchedIds = rows
+        .filter((row) =>
+          facebookCommentIdsMatch(row.commentId, commentKey) ||
+          facebookCommentIdsMatch(row.messageId, commentKey),
+        )
+        .map((row) => row.id);
+      if (matchedIds.length > 0) {
+        updated = await this.prisma.webhookEvent.updateMany({
+          where: { id: { in: matchedIds } },
+          data: { status },
+        });
+      }
+    }
 
     if (updated.count === 0) {
       this.logger.debug(
@@ -300,7 +466,10 @@ export class FacebookWebhookService implements OnModuleInit {
     const sample = await this.prisma.webhookEvent.findFirst({
       where: {
         pageId,
-        OR: [{ commentId: commentKey }, { messageId: commentKey }],
+        OR: [
+          { commentId: { in: candidates } },
+          { messageId: { in: candidates } },
+        ],
       },
     });
     const threadId = sample ? buildThreadId(sample) : null;
@@ -752,17 +921,31 @@ export class FacebookWebhookService implements OnModuleInit {
       return;
     }
 
+    if (parsed.commentId && orgId) {
+      const dedup = await this.redisCache.getOutboundMessageDedup(
+        orgId,
+        parsed.commentId,
+      );
+      if (dedup) {
+        this.logger.debug(
+          `[Webhook] Feed comment echo dedup skip commentId=${parsed.commentId}`,
+        );
+        return;
+      }
+    }
+
     await this.saveAndBroadcast({
       organizationId: orgId,
       pageId,
       eventType: 'FEED_COMMENT',
       direction: 'OUT',
       senderId: ctx.customerId,
-      senderName: 'Page',
+      senderName: parsed.senderName || 'Page',
       recipientId: pageId,
       messageId: parsed.messageId,
       postId: resolvedPostId,
       commentId: parsed.commentId || null,
+      parentCommentId: parsed.parentCommentId || null,
       msgType: 'feed.comment.reply',
       content: parsed.content,
       rawPayload: JSON.stringify(rawValue),
@@ -829,6 +1012,15 @@ export class FacebookWebhookService implements OnModuleInit {
     return null;
   }
 
+  private resolveGraphParentCommentId(
+    comment: { parent?: { id?: string } },
+    postId: string,
+  ): string | null {
+    const parentId = comment.parent?.id;
+    if (!parentId || parentId === postId) return null;
+    return isValidFacebookCommentId(parentId) ? parentId : null;
+  }
+
   private async getPageAccessToken(
     pageId: string,
     orgId: string | null,
@@ -853,6 +1045,7 @@ export class FacebookWebhookService implements OnModuleInit {
     force = false,
   ): Promise<{
     ingested: number;
+    updated: number;
     threadIds: string[];
   }> {
     return this.syncFeedCommentsFromGraph(pageId, force);
@@ -867,30 +1060,35 @@ export class FacebookWebhookService implements OnModuleInit {
     force = false,
   ): Promise<{
     ingested: number;
+    updated: number;
     threadIds: string[];
   }> {
     // Luôn giữ lock để tránh 2 sync chạy song song cho cùng page
     if (this.syncInProgress.has(pageId)) {
-      return { ingested: 0, threadIds: [] };
+      return { ingested: 0, updated: 0, threadIds: [] };
     }
     // Cooldown chỉ áp dụng cho client polling (force=false)
     if (!force) {
       const last = this.syncLastAt.get(pageId) ?? 0;
       if (Date.now() - last < FacebookWebhookService.SYNC_COOLDOWN_MS) {
-        return { ingested: 0, threadIds: [] };
+        return { ingested: 0, updated: 0, threadIds: [] };
       }
     }
     this.syncInProgress.add(pageId);
     try {
-      return await this._doSyncFeedCommentsFromGraph(pageId);
+      return await this._doSyncFeedCommentsFromGraph(pageId, force);
     } finally {
       this.syncLastAt.set(pageId, Date.now());
       this.syncInProgress.delete(pageId);
     }
   }
 
-  private async _doSyncFeedCommentsFromGraph(pageId: string): Promise<{
+  private async _doSyncFeedCommentsFromGraph(
+    pageId: string,
+    force = false,
+  ): Promise<{
     ingested: number;
+    updated: number;
     threadIds: string[];
   }> {
     const orgId = await this.resolveOrgId(pageId);
@@ -899,7 +1097,7 @@ export class FacebookWebhookService implements OnModuleInit {
       this.logger.warn(
         `[Webhook] syncFeedCommentsFromGraph: không có page token pageId=${pageId}`,
       );
-      return { ingested: 0, threadIds: [] };
+      return { ingested: 0, updated: 0, threadIds: [] };
     }
 
     const lastIn = await this.prisma.webhookEvent.findFirst({
@@ -911,19 +1109,28 @@ export class FacebookWebhookService implements OnModuleInit {
       orderBy: { createdAt: 'desc' },
       select: { createdAt: true },
     });
-    // Cửa sổ rộng hơn để không bỏ sót comment khi webhook chỉ báo changed_fields
-    const sinceMs = lastIn
-      ? lastIn.createdAt.getTime() - 5 * 60_000
-      : Date.now() - 24 * 60 * 60_000;
+    const totalEvents = await this.prisma.webhookEvent.count({
+      where: { pageId },
+    });
+    // Cửa sổ rộng hơn khi DB trống (sau migrate) để backfill lịch sử bình luận
+    const sinceMs = force
+      ? Date.now() - 30 * 24 * 60 * 60_000
+      : lastIn
+        ? lastIn.createdAt.getTime() - 5 * 60_000
+        : totalEvents === 0
+          ? Date.now() - 30 * 24 * 60 * 60_000
+          : Date.now() - 24 * 60 * 60_000;
 
     const threadIds = new Set<string>();
     let ingested = 0;
+    let updated = 0;
+    const graphCommentsById = new Map<string, GraphPostComment>();
 
     try {
       const posts = await this.facebookOAuth.listPageFeedWithComments(
         pageId,
         token,
-        15,
+        force || totalEvents === 0 ? 50 : 15,
       );
 
       const postIds =
@@ -937,18 +1144,36 @@ export class FacebookWebhookService implements OnModuleInit {
           post.comments?.data?.length
             ? post.comments.data
             : await this.facebookOAuth.listAllPostComments(post.id, token, {
-                pageSize: 25,
-                maxComments: 40,
+                pageSize: force || totalEvents === 0 ? 100 : 25,
+                maxComments: force || totalEvents === 0 ? 500 : 40,
               });
 
         for (const comment of comments) {
+          if (comment.id) graphCommentsById.set(comment.id, comment);
           const senderId = comment.from?.id;
           if (!senderId || senderId === pageId || !comment.id) continue;
 
           const createdMs = new Date(comment.created_time).getTime();
-          if (!Number.isFinite(createdMs) || createdMs < sinceMs) continue;
+          if (
+            !force &&
+            (!Number.isFinite(createdMs) || createdMs < sinceMs)
+          ) {
+            continue;
+          }
 
           if (!isValidFacebookCommentId(comment.id)) continue;
+
+          const parentCommentId = this.resolveGraphParentCommentId(
+            comment,
+            post.id,
+          );
+          const serialized = serializeFeedCommentContent(
+            {
+              message: comment.message,
+              attachment: comment.attachment,
+            },
+            { isReply: !!parentCommentId },
+          );
 
           const payload = {
             organizationId: orgId,
@@ -960,8 +1185,9 @@ export class FacebookWebhookService implements OnModuleInit {
             messageId: comment.id,
             postId: post.id,
             commentId: comment.id,
-            msgType: 'feed.comment',
-            content: comment.message ?? '[Bình luận mới trên bài viết]',
+            parentCommentId,
+            msgType: serialized.msgType,
+            content: serialized.content,
             rawPayload: JSON.stringify({
               source: 'webhook_changed_fields_sync',
               comment,
@@ -970,6 +1196,16 @@ export class FacebookWebhookService implements OnModuleInit {
 
           const existing = await this.findDuplicateEvent(payload);
           if (existing) {
+            if (
+              await this.upgradeFeedCommentFromGraph(
+                existing,
+                comment,
+                parentCommentId,
+                pageId,
+              )
+            ) {
+              updated += 1;
+            }
             const threadId = buildThreadId(existing);
             if (threadId) threadIds.add(threadId);
             continue;
@@ -987,17 +1223,38 @@ export class FacebookWebhookService implements OnModuleInit {
           const comments = await this.facebookOAuth.listAllPostComments(
             postId,
             token,
-            { pageSize: 25, maxComments: 40 },
+            {
+              pageSize: force || totalEvents === 0 ? 100 : 25,
+              maxComments: force || totalEvents === 0 ? 500 : 40,
+            },
           );
 
           for (const comment of comments) {
+            if (comment.id) graphCommentsById.set(comment.id, comment);
             const senderId = comment.from?.id;
             if (!senderId || senderId === pageId || !comment.id) continue;
 
             const createdMs = new Date(comment.created_time).getTime();
-            if (!Number.isFinite(createdMs) || createdMs < sinceMs) continue;
+            if (
+              !force &&
+              (!Number.isFinite(createdMs) || createdMs < sinceMs)
+            ) {
+              continue;
+            }
 
             if (!isValidFacebookCommentId(comment.id)) continue;
+
+            const parentCommentId = this.resolveGraphParentCommentId(
+              comment,
+              postId,
+            );
+            const serialized = serializeFeedCommentContent(
+              {
+                message: comment.message,
+                attachment: comment.attachment,
+              },
+              { isReply: !!parentCommentId },
+            );
 
             const payload = {
               organizationId: orgId,
@@ -1009,8 +1266,9 @@ export class FacebookWebhookService implements OnModuleInit {
               messageId: comment.id,
               postId,
               commentId: comment.id,
-              msgType: 'feed.comment',
-              content: comment.message ?? '[Bình luận mới trên bài viết]',
+              parentCommentId,
+              msgType: serialized.msgType,
+              content: serialized.content,
               rawPayload: JSON.stringify({
                 source: 'webhook_changed_fields_sync',
                 comment,
@@ -1019,6 +1277,16 @@ export class FacebookWebhookService implements OnModuleInit {
 
             const existing = await this.findDuplicateEvent(payload);
             if (existing) {
+              if (
+                await this.upgradeFeedCommentFromGraph(
+                  existing,
+                  comment,
+                  parentCommentId,
+                  pageId,
+                )
+              ) {
+                updated += 1;
+              }
               const threadId = buildThreadId(existing);
               if (threadId) threadIds.add(threadId);
               continue;
@@ -1032,9 +1300,23 @@ export class FacebookWebhookService implements OnModuleInit {
         }
       }
 
-      if (ingested > 0) {
+      if (force) {
+        if (graphCommentsById.size > 0) {
+          updated += await this.backfillFeedCommentMediaFromGraph(
+            pageId,
+            graphCommentsById,
+            threadIds,
+          );
+        }
+        updated += await this.backfillFeedCommentMediaFromRawPayload(
+          pageId,
+          threadIds,
+        );
+      }
+
+      if (ingested > 0 || updated > 0) {
         this.logger.log(
-          `[Webhook] syncFeedCommentsFromGraph pageId=${pageId} ingested=${ingested} threads=${threadIds.size}`,
+          `[Webhook] syncFeedCommentsFromGraph pageId=${pageId} ingested=${ingested} updated=${updated} threads=${threadIds.size}`,
         );
       }
     } catch (err: any) {
@@ -1047,7 +1329,103 @@ export class FacebookWebhookService implements OnModuleInit {
       await this.redisCache.bumpPageRevision(orgId, pageId);
     }
 
-    return { ingested, threadIds: [...threadIds] };
+    return { ingested, updated, threadIds: [...threadIds] };
+  }
+
+  private async backfillFeedCommentMediaFromGraph(
+    pageId: string,
+    graphCommentsById: Map<string, GraphPostComment>,
+    threadIds: Set<string>,
+  ): Promise<number> {
+    const stale = await this.prisma.webhookEvent.findMany({
+      where: {
+        pageId,
+        eventType: 'FEED_COMMENT',
+      },
+      orderBy: { createdAt: 'desc' },
+      take: 800,
+    });
+
+    let updated = 0;
+    for (const row of stale) {
+      if (feedCommentContentHasMedia(row.content)) continue;
+
+      const key = row.commentId ?? row.messageId;
+      if (!key) continue;
+
+      let comment = graphCommentsById.get(key);
+      if (!comment) {
+        for (const [id, candidate] of graphCommentsById) {
+          if (facebookCommentIdsMatch(id, key)) {
+            comment = candidate;
+            break;
+          }
+        }
+      }
+      if (!comment?.id) continue;
+
+      const parentCommentId = this.resolveGraphParentCommentId(
+        comment,
+        row.postId ?? '',
+      );
+      if (
+        await this.upgradeFeedCommentFromGraph(
+          row,
+          comment,
+          parentCommentId,
+          pageId,
+        )
+      ) {
+        updated += 1;
+        const threadId = buildThreadId(row);
+        if (threadId) threadIds.add(threadId);
+      }
+    }
+
+    return updated;
+  }
+
+  private async backfillFeedCommentMediaFromRawPayload(
+    pageId: string,
+    threadIds: Set<string>,
+  ): Promise<number> {
+    const stale = await this.prisma.webhookEvent.findMany({
+      where: {
+        pageId,
+        eventType: 'FEED_COMMENT',
+        rawPayload: { contains: '"photo"' },
+      },
+      orderBy: { createdAt: 'desc' },
+      take: 500,
+    });
+
+    let updated = 0;
+    for (const row of stale) {
+      if (feedCommentContentHasMedia(row.content)) continue;
+
+      const serialized = serializeFeedCommentFromRawPayload(row.rawPayload, {
+        content: row.content,
+        msgType: row.msgType,
+        isReply: row.msgType?.includes('reply'),
+      });
+      if (!serialized || !feedCommentContentHasMedia(serialized.content)) {
+        continue;
+      }
+
+      const saved = await this.prisma.webhookEvent.update({
+        where: { id: row.id },
+        data: {
+          content: serialized.content,
+          msgType: serialized.msgType,
+        },
+      });
+      await this.invalidateCachesForEvent(pageId, saved);
+      updated += 1;
+      const threadId = buildThreadId(saved);
+      if (threadId) threadIds.add(threadId);
+    }
+
+    return updated;
   }
 
   /** postId đã có trong webhook — dùng khi Graph feed API trả rỗng. */
@@ -1129,7 +1507,37 @@ export class FacebookWebhookService implements OnModuleInit {
       throw new BadRequestException('Fanpage chưa liên kết hoặc thiếu token');
     }
 
-    return this.facebookOAuth.likeComment(commentId, token);
+    const resolvedId = await this.resolveCanonicalCommentId(
+      pageId,
+      commentId,
+      token,
+    );
+    return this.facebookOAuth.likeComment(resolvedId, token);
+  }
+
+  /** Bỏ thích bình luận qua Graph API. */
+  async unlikeCommentOnPage(
+    pageId: string,
+    commentId: string,
+  ): Promise<{ success: boolean }> {
+    if (!pageId?.trim() || !commentId?.trim()) {
+      throw new BadRequestException('Thiếu pageId hoặc commentId');
+    }
+    if (!isValidFacebookCommentId(commentId)) {
+      throw new BadRequestException('commentId không hợp lệ');
+    }
+
+    const token = await this.getPageAccessToken(pageId, null);
+    if (!token) {
+      throw new BadRequestException('Fanpage chưa liên kết hoặc thiếu token');
+    }
+
+    const resolvedId = await this.resolveCanonicalCommentId(
+      pageId,
+      commentId,
+      token,
+    );
+    return this.facebookOAuth.unlikeComment(resolvedId, token);
   }
 
   /** Ẩn / hiện bình luận trên Facebook và cập nhật trạng thái local. */
@@ -1150,13 +1558,95 @@ export class FacebookWebhookService implements OnModuleInit {
       throw new BadRequestException('Fanpage chưa liên kết hoặc thiếu token');
     }
 
-    await this.facebookOAuth.setCommentHidden(commentId, token, hidden);
-    await this.markCommentVisibility(
+    const resolvedId = await this.resolveCanonicalCommentId(
       pageId,
       commentId,
-      hidden ? EVENT_STATUS_HIDDEN : EVENT_STATUS_ACTIVE,
+      token,
     );
 
+    const sample = await this.prisma.webhookEvent.findFirst({
+      where: {
+        pageId,
+        eventType: 'FEED_COMMENT',
+        OR: [{ commentId }, { messageId: commentId }],
+      },
+      select: { postId: true },
+    });
+
+    await this.facebookOAuth.setCommentHidden(
+      resolvedId,
+      token,
+      hidden,
+      sample?.postId,
+    );
+    await this.markCommentVisibility(
+      pageId,
+      resolvedId,
+      hidden ? EVENT_STATUS_HIDDEN : EVENT_STATUS_ACTIVE,
+    );
+    if (resolvedId !== commentId) {
+      await this.markCommentVisibility(
+        pageId,
+        commentId,
+        hidden ? EVENT_STATUS_HIDDEN : EVENT_STATUS_ACTIVE,
+      );
+    }
+
     return { success: true };
+  }
+
+  /** Chuẩn hóa comment id trước khi gọi Graph (webhook id đôi khi khác format). */
+  private async resolveCanonicalCommentId(
+    pageId: string,
+    commentId: string,
+    token: string,
+  ): Promise<string> {
+    const sample = await this.prisma.webhookEvent.findFirst({
+      where: {
+        pageId,
+        eventType: 'FEED_COMMENT',
+        OR: [{ commentId }, { messageId: commentId }],
+      },
+      select: { postId: true, commentId: true, messageId: true },
+    });
+
+    const postId = sample?.postId?.trim();
+    for (const candidate of buildFacebookCommentIdCandidates(commentId, postId)) {
+      const direct = await this.facebookOAuth.getCommentMeta(candidate, token, {
+        silent: true,
+      });
+      if (direct?.id) return direct.id;
+    }
+
+    if (postId) {
+      for (const candidate of buildFacebookCommentIdCandidates(commentId, postId)) {
+        const fromPost = await this.facebookOAuth.getCommentMeta(
+          candidate,
+          token,
+          {
+            postId,
+            silent: true,
+          },
+        );
+        if (fromPost?.id) return fromPost.id;
+      }
+    }
+
+    if (sample) {
+      for (const candidate of [sample.commentId, sample.messageId]) {
+        if (!candidate || candidate === commentId) continue;
+        for (const lookupId of buildFacebookCommentIdCandidates(candidate, postId)) {
+          const meta = await this.facebookOAuth.getCommentMeta(lookupId, token, {
+            postId: postId ?? undefined,
+            silent: true,
+          });
+          if (meta?.id && facebookCommentIdsMatch(meta.id, commentId)) {
+            return meta.id;
+          }
+        }
+      }
+    }
+
+    return commentId;
   }
 }

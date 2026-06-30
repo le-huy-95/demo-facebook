@@ -17,8 +17,10 @@ import { parseThreadId } from '../utils/conversation-thread.util';
 import {
   isValidFacebookCommentId,
   normalizeFacebookPostId,
+  facebookCommentIdsMatch,
 } from '../utils/facebook-comment-id.util';
 import { resolvePublicAssetUrl } from '../../common/public-url.util';
+import { ConversationsService } from './conversations.service';
 
 export interface OutboundAttachment {
   type: 'image' | 'video' | 'audio' | 'file';
@@ -39,6 +41,7 @@ export class FacebookMessagingService {
     private readonly pageMapService: PageMapService,
     private readonly configService: ConfigService,
     private readonly redisCache: RedisCacheService,
+    private readonly conversationsService: ConversationsService,
     private readonly logger: AppLogger,
   ) {
     this.logger.setContext(FacebookMessagingService.name);
@@ -127,6 +130,68 @@ export class FacebookMessagingService {
     };
   }
 
+  /** Nội dung lưu DB cho bình luận có media (mirror Graph comment serializer). */
+  private buildFeedCommentOutboundContent(
+    text: string,
+    attachment: OutboundAttachment | undefined,
+    isReply: boolean,
+  ): { msgType: string; content: string } {
+    if (!attachment) {
+      return {
+        msgType: isReply ? 'feed.comment.reply' : 'feed.comment',
+        content: text,
+      };
+    }
+
+    const publicUrl = this.resolveAttachmentUrl(attachment.url);
+    const trimmedText = text.trim();
+
+    if (attachment.type === 'image') {
+      const payload = trimmedText
+        ? { text: trimmedText, href: publicUrl, type: 'image', title: 'Ảnh' }
+        : { href: publicUrl, type: 'image', title: 'Ảnh' };
+      return {
+        msgType: isReply ? 'feed.comment.reply.photo' : 'feed.comment.photo',
+        content: JSON.stringify(payload),
+      };
+    }
+
+    if (attachment.type === 'video') {
+      const payload = trimmedText
+        ? { text: trimmedText, href: publicUrl, type: 'video', title: 'Video' }
+        : { href: publicUrl, type: 'video', title: 'Video' };
+      return {
+        msgType: isReply ? 'feed.comment.reply.video' : 'feed.comment.video',
+        content: JSON.stringify(payload),
+      };
+    }
+
+    const label = attachment.type === 'audio' ? 'Audio' : 'Tệp đính kèm';
+    const payload = trimmedText
+      ? {
+          text: trimmedText,
+          href: publicUrl,
+          type: attachment.type,
+          title: label,
+        }
+      : { href: publicUrl, type: attachment.type, title: label };
+    return {
+      msgType: isReply ? 'feed.comment.reply' : 'feed.comment',
+      content: JSON.stringify(payload),
+    };
+  }
+
+  private resolveCommentAttachmentUrl(
+    attachment: OutboundAttachment,
+  ): string | undefined {
+    if (attachment.type !== 'image' && attachment.type !== 'video') {
+      throw new BadRequestException(
+        'Bình luận Facebook chỉ hỗ trợ đính kèm ảnh hoặc video qua URL công khai.',
+      );
+    }
+    return this.resolveAttachmentUrl(attachment.url);
+  }
+
   async sendToThread(input: {
     pageId: string;
     threadId: string;
@@ -165,6 +230,7 @@ export class FacebookMessagingService {
         orgId,
         parsed,
         text,
+        attachment: input.attachment,
         commentId: input.commentId,
         clientMessageId: input.clientMessageId,
       });
@@ -183,6 +249,8 @@ export class FacebookMessagingService {
       replyToMessageId,
       clientMessageId: input.clientMessageId,
       threadId,
+      sourceCommentId: input.commentId,
+      senderName: undefined,
     });
   }
 
@@ -195,12 +263,111 @@ export class FacebookMessagingService {
     replyToMessageId?: string;
     clientMessageId?: string;
     threadId: string;
+    sourceCommentId?: string;
+    senderName?: string;
   }) {
     const pageAccessToken = await this.resolvePageAccessToken(
       input.pageId,
       input.orgId,
       'CREATE_CONTENT',
     );
+
+    const commentAuthorId = input.parsed.senderId;
+
+    const resolved = await this.conversationsService.resolveMessengerPsid(
+      input.pageId,
+      input.orgId,
+      {
+        commentAuthorId,
+        senderName:
+          input.senderName ??
+          (await this.lookupCommentAuthorName(input.pageId, commentAuthorId)) ??
+          undefined,
+      },
+    );
+
+    let sourceCommentId = input.sourceCommentId?.trim() || undefined;
+    if (!sourceCommentId || !isValidFacebookCommentId(sourceCommentId)) {
+      const fromDb = await this.resolveSourceCommentIdForPrivateReply(
+        input.pageId,
+        commentAuthorId,
+      );
+      if (fromDb) sourceCommentId = fromDb;
+    } else {
+      sourceCommentId = await this.ensureCustomerCommentIdForPrivateReply(
+        input.pageId,
+        sourceCommentId,
+        commentAuthorId,
+      );
+      if (
+        sourceCommentId &&
+        (await this.hasPrivateReplyBeenSent(input.pageId, sourceCommentId))
+      ) {
+        sourceCommentId = undefined;
+      }
+    }
+
+    // Có commentId → private reply lần đầu (mỗi comment chỉ được 1 tin).
+    const shouldUsePrivateReply = Boolean(
+      sourceCommentId &&
+        isValidFacebookCommentId(sourceCommentId) &&
+        (input.text.trim() || input.attachment),
+    );
+
+    if (shouldUsePrivateReply && sourceCommentId) {
+      const postId = await this.lookupPostIdForComment(
+        input.pageId,
+        sourceCommentId,
+      );
+      const canonicalCommentId =
+        await this.conversationsService.resolveCanonicalCommentId(
+          input.pageId,
+          input.orgId,
+          sourceCommentId,
+          postId,
+        );
+      try {
+        return await this.sendMessengerPrivateReply({
+          pageId: input.pageId,
+          orgId: input.orgId,
+          commentId: canonicalCommentId,
+          postId,
+          text: input.text,
+          attachment: input.attachment,
+          clientMessageId: input.clientMessageId,
+          threadId: input.threadId,
+          commentAuthorId,
+        });
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err);
+        const canFallbackToPsid =
+          resolved.psid &&
+          resolved.hasExistingConversation &&
+          resolved.psid !== commentAuthorId;
+        if (!canFallbackToPsid) {
+          throw err;
+        }
+        this.logger.warn(
+          `[Messaging] Private reply failed, fallback to PSID ${resolved.psid}: ${message}`,
+        );
+      }
+    }
+
+    let recipientPsid = resolved.psid;
+    if (!recipientPsid || recipientPsid === commentAuthorId) {
+      const privateReplySent = await this.hasPrivateReplyForAuthor(
+        input.pageId,
+        commentAuthorId,
+      );
+      if (privateReplySent) {
+        throw new BadRequestException(
+          'Đã gửi tin nhắn riêng từ bình luận. Chờ khách trả lời trên Messenger để tiếp tục nhắn tin.',
+        );
+      }
+      throw new BadRequestException(
+        'Không tìm được hội thoại Messenger với khách này. Hãy dùng nút Nhắn tin từ bình luận để gửi tin nhắn riêng lần đầu.',
+      );
+    }
 
     const { msgType, content } = this.buildOutboundContent(
       input.text,
@@ -215,7 +382,7 @@ export class FacebookMessagingService {
       direction: 'OUT',
       senderId: input.pageId,
       senderName: 'Page',
-      recipientId: input.parsed.senderId,
+      recipientId: recipientPsid,
       msgType,
       content: input.attachment ? content : input.text,
       rawPayload: JSON.stringify({
@@ -231,7 +398,7 @@ export class FacebookMessagingService {
     try {
       const fbResp = input.attachment
         ? await this.graphApi.sendAttachmentMessage(
-            input.parsed.senderId,
+            recipientPsid,
             pageAccessToken,
             {
               ...input.attachment,
@@ -240,7 +407,7 @@ export class FacebookMessagingService {
             input.replyToMessageId,
           )
         : await this.graphApi.sendTextMessage(
-            input.parsed.senderId,
+            recipientPsid,
             pageAccessToken,
             input.text,
             input.replyToMessageId,
@@ -281,11 +448,129 @@ export class FacebookMessagingService {
     }
   }
 
+  private async sendMessengerPrivateReply(input: {
+    pageId: string;
+    orgId: string;
+    commentId: string;
+    postId?: string | null;
+    text: string;
+    attachment?: OutboundAttachment;
+    clientMessageId?: string;
+    threadId: string;
+    commentAuthorId: string;
+  }) {
+    const pageAccessToken = await this.resolvePageAccessToken(
+      input.pageId,
+      input.orgId,
+      'CREATE_CONTENT',
+    );
+
+    const attachment = input.attachment
+      ? {
+          ...input.attachment,
+          url: this.resolveAttachmentUrl(input.attachment.url),
+        }
+      : undefined;
+
+    const { msgType, content } = this.buildOutboundContent(
+      input.text,
+      attachment,
+    );
+
+    const record = await this.dataService.saveAndBroadcastOutbound({
+      organizationId: input.orgId,
+      pageId: input.pageId,
+      eventType: 'MESSENGER',
+      direction: 'OUT',
+      senderId: input.pageId,
+      senderName: 'Page',
+      recipientId: input.commentAuthorId,
+      msgType,
+      content: attachment ? content : input.text,
+      rawPayload: JSON.stringify({
+        source: 'app_send_private_reply',
+        clientMessageId: input.clientMessageId ?? null,
+        sourceCommentId: input.commentId,
+        commentAuthorId: input.commentAuthorId,
+        attachment: attachment ?? null,
+        status: 'SENDING',
+      }),
+      clientMessageId: input.clientMessageId,
+    });
+
+    this.logger.log(
+      `[Messaging] Private reply → pageId=${input.pageId} commentId=${input.commentId}`,
+    );
+
+    try {
+      const fbResp = await this.graphApi.sendPrivateReplyToComment(
+        input.pageId,
+        input.commentId,
+        pageAccessToken,
+        {
+          text: input.text,
+          attachment,
+          postId: input.postId ?? undefined,
+        },
+      );
+
+      const messageId = fbResp.message_id ?? null;
+      const resolvedPsid = fbResp.recipient_id?.trim() || null;
+      if (messageId) {
+        await this.redisCache.setOutboundMessageDedup(
+          input.orgId,
+          messageId,
+          record.id,
+        );
+      }
+
+      const deliveredPayload = JSON.stringify({
+        source: 'app_send_private_reply',
+        clientMessageId: input.clientMessageId ?? null,
+        sourceCommentId: input.commentId,
+        commentAuthorId: input.commentAuthorId,
+        resolvedPsid,
+        attachment: attachment ?? null,
+        status: 'DELIVERED',
+      });
+
+      await this.prisma.webhookEvent.update({
+        where: { id: record.id },
+        data: {
+          recipientId: resolvedPsid ?? input.commentAuthorId,
+          rawPayload: deliveredPayload,
+        },
+      });
+
+      const saved = await this.dataService.applySendResult(
+        record.id,
+        'DELIVERED',
+        messageId,
+      );
+
+      return {
+        savedEvent: saved,
+        fb: {
+          recipientId: fbResp.recipient_id ?? input.commentAuthorId,
+          messageId: messageId ?? undefined,
+        },
+      };
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : 'Send failed';
+      this.logger.error(
+        `[Messaging] Messenger private reply failed: ${message}`,
+      );
+      await this.dataService.applySendResult(record.id, 'FAILED', null);
+      throw err;
+    }
+  }
+
   private async sendFeedComment(input: {
     pageId: string;
     orgId: string;
     parsed: NonNullable<ReturnType<typeof parseThreadId>>;
     text: string;
+    attachment?: OutboundAttachment;
     commentId?: string;
     clientMessageId?: string;
   }) {
@@ -295,8 +580,11 @@ export class FacebookMessagingService {
       'MODERATE',
     );
     const commentText = input.text;
-    if (!commentText) {
-      throw new BadRequestException('Comment text is required');
+    const attachmentUrl = input.attachment
+      ? this.resolveCommentAttachmentUrl(input.attachment)
+      : undefined;
+    if (!commentText.trim() && !attachmentUrl) {
+      throw new BadRequestException('Comment text or attachment is required');
     }
     const postId =
       normalizeFacebookPostId(input.parsed.postId) ?? input.parsed.postId;
@@ -308,6 +596,12 @@ export class FacebookMessagingService {
     const isReply =
       !!requestedCommentId && isValidFacebookCommentId(requestedCommentId);
 
+    const { msgType, content } = this.buildFeedCommentOutboundContent(
+      commentText,
+      input.attachment,
+      isReply,
+    );
+
     const record = await this.dataService.saveAndBroadcastOutbound({
       organizationId: input.orgId,
       pageId: input.pageId,
@@ -318,12 +612,13 @@ export class FacebookMessagingService {
       recipientId: input.pageId,
       postId,
       parentCommentId: input.parsed.commentId ?? requestedCommentId ?? null,
-      msgType: isReply ? 'feed.comment.reply' : 'feed.comment',
-      content: commentText,
+      msgType,
+      content,
       rawPayload: JSON.stringify({
         source: 'app_send',
         clientMessageId: input.clientMessageId ?? null,
         mode: isReply ? 'reply' : 'post_comment',
+        attachment: input.attachment ?? null,
         status: 'SENDING',
       }),
       clientMessageId: input.clientMessageId,
@@ -341,16 +636,26 @@ export class FacebookMessagingService {
             requestedCommentId,
             threadRootCommentId: input.parsed.commentId,
           }));
+        const canonicalTarget =
+          await this.conversationsService.resolveCanonicalCommentId(
+            input.pageId,
+            input.orgId,
+            targetCommentId,
+            postId,
+          );
         fbResp = await this.graphApi.replyToComment(
-          targetCommentId,
+          canonicalTarget,
           pageAccessToken,
           commentText,
+          attachmentUrl,
+          postId,
         );
       } else {
         fbResp = await this.graphApi.createPostComment(
           postId,
           pageAccessToken,
           commentText,
+          attachmentUrl,
         );
       }
 
@@ -458,5 +763,145 @@ export class FacebookMessagingService {
       'http://localhost:3000',
     );
     return resolvePublicAssetUrl(url, publicBaseUrl);
+  }
+
+  /** Bình luận inbound mới nhất của khách — dùng private reply khi FE chưa gửi commentId. */
+  private async resolveSourceCommentIdForPrivateReply(
+    pageId: string,
+    commentAuthorId: string,
+  ): Promise<string | null> {
+    if (!commentAuthorId?.trim()) return null;
+    const row = await this.prisma.webhookEvent.findFirst({
+      where: {
+        pageId,
+        eventType: 'FEED_COMMENT',
+        direction: 'IN',
+        senderId: commentAuthorId.trim(),
+        commentId: { not: null },
+        status: 'ACTIVE',
+      },
+      orderBy: { createdAt: 'desc' },
+      select: { commentId: true },
+    });
+    const id = row?.commentId?.trim();
+    if (!id || !isValidFacebookCommentId(id)) return null;
+    if (await this.hasPrivateReplyBeenSent(pageId, id)) return null;
+    return id;
+  }
+
+  /** Facebook chỉ cho 1 private reply / comment. */
+  private async hasPrivateReplyBeenSent(
+    pageId: string,
+    commentId: string,
+  ): Promise<boolean> {
+    const rows = await this.prisma.webhookEvent.findMany({
+      where: {
+        pageId,
+        eventType: 'MESSENGER',
+        direction: 'OUT',
+        deliveryStatus: { in: ['DELIVERED', 'SENDING'] },
+      },
+      orderBy: { createdAt: 'desc' },
+      take: 100,
+      select: { rawPayload: true },
+    });
+    for (const row of rows) {
+      try {
+        const raw = JSON.parse(row.rawPayload ?? '{}') as {
+          source?: string;
+          sourceCommentId?: string;
+        };
+        if (
+          raw.source === 'app_send_private_reply' &&
+          raw.sourceCommentId &&
+          facebookCommentIdsMatch(raw.sourceCommentId, commentId)
+        ) {
+          return true;
+        }
+      } catch {
+        // ignore malformed payload
+      }
+    }
+    return false;
+  }
+
+  private async hasPrivateReplyForAuthor(
+    pageId: string,
+    commentAuthorId: string,
+  ): Promise<boolean> {
+    const row = await this.prisma.webhookEvent.findFirst({
+      where: {
+        pageId,
+        eventType: 'MESSENGER',
+        direction: 'OUT',
+        recipientId: commentAuthorId.trim(),
+        rawPayload: { contains: 'app_send_private_reply' },
+      },
+      select: { id: true },
+    });
+    return !!row;
+  }
+
+  private async lookupCommentAuthorName(
+    pageId: string,
+    commentAuthorId: string,
+  ): Promise<string | null> {
+    const row = await this.prisma.webhookEvent.findFirst({
+      where: {
+        pageId,
+        eventType: 'FEED_COMMENT',
+        direction: 'IN',
+        senderId: commentAuthorId.trim(),
+        senderName: { not: null },
+      },
+      orderBy: { createdAt: 'desc' },
+      select: { senderName: true },
+    });
+    return row?.senderName?.trim() ?? null;
+  }
+
+  /** Đảm bảo private reply nhắm đúng bình luận IN của khách, không phải parent/Page. */
+  private async ensureCustomerCommentIdForPrivateReply(
+    pageId: string,
+    commentId: string,
+    commentAuthorId: string,
+  ): Promise<string | undefined> {
+    const owner = await this.prisma.webhookEvent.findFirst({
+      where: {
+        pageId,
+        eventType: 'FEED_COMMENT',
+        OR: [{ commentId }, { messageId: commentId }],
+      },
+      select: { senderId: true, direction: true },
+    });
+
+    if (
+      owner?.direction === 'IN' &&
+      owner.senderId === commentAuthorId.trim()
+    ) {
+      return commentId;
+    }
+
+    const fromDb = await this.resolveSourceCommentIdForPrivateReply(
+      pageId,
+      commentAuthorId,
+    );
+    return fromDb ?? commentId;
+  }
+
+  private async lookupPostIdForComment(
+    pageId: string,
+    commentId: string,
+  ): Promise<string | null> {
+    const row = await this.prisma.webhookEvent.findFirst({
+      where: {
+        pageId,
+        eventType: 'FEED_COMMENT',
+        OR: [{ commentId }, { messageId: commentId }],
+      },
+      orderBy: { createdAt: 'desc' },
+      select: { postId: true },
+    });
+    return normalizeFacebookPostId(row?.postId) ?? row?.postId?.trim() ?? null;
   }
 }

@@ -13,13 +13,17 @@ import type {
   CommentAction,
   FacebookPostPreview,
   WebhookMessage,
+  MessageReactionView,
 } from '@/lib/api';
+import { MESSENGER_REACTION_EMOJIS } from '@/lib/api';
 import {
   buildFacebookCommentUrl,
   extractParentCommentId,
   findCommentMessageById,
   getMessageCommentKey,
+  isValidMessengerMessageId,
   pickBetterSenderName,
+  resolveMessengerReplyTarget,
 } from '@/lib/conversation';
 import { formatDateTime } from '@/lib/datetime';
 import {
@@ -30,9 +34,11 @@ import {
   getCommentPreviewText,
   parseMessageContent,
   isFeedCommentReply,
+  isReceiptMessage,
 } from '@/lib/message-content';
 import { UserAvatar } from '@/components/user-avatar';
 import { CommentReplyPreview } from '@/components/comment-reply-preview';
+import { MentionText } from '@/components/mention-text';
 
 const URL_SPLIT_REGEX = /(https?:\/\/[^\s]+)/g;
 
@@ -164,6 +170,33 @@ function EyeOffIcon({ className }: { className?: string }) {
   );
 }
 
+function PinIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      className={className}
+      viewBox="0 0 20 20"
+      fill="currentColor"
+      aria-hidden
+    >
+      <path d="M9.43 2.5a1.25 1.25 0 0 1 2.14 0l1.02 1.7a1.25 1.25 0 0 0 .95.62l1.98.2a1.25 1.25 0 0 1 .69 2.16l-1.45 1.35a1.25 1.25 0 0 0-.36.98l.35 1.97a1.25 1.25 0 0 1-1.82 1.32L10 11.9l-1.88.9a1.25 1.25 0 0 1-1.82-1.32l.35-1.97a1.25 1.25 0 0 0-.36-.98L5.84 7.18a1.25 1.25 0 0 1 .69-2.16l1.98-.2a1.25 1.25 0 0 0 .95-.62l1.02-1.7ZM10 4.1 9.2 5.43a2.75 2.75 0 0 1-2.09 1.36l-1.3.13 1.01.94a2.75 2.75 0 0 1 .79 2.16l-.24 1.3 1.23-.59a2.75 2.75 0 0 1 2.36 0l1.23.59-.24-1.3a2.75 2.75 0 0 1 .79-2.16l1.01-.94-1.3-.13A2.75 2.75 0 0 1 10.8 5.43L10 4.1Z" />
+      <path d="M8.75 12.5a.75.75 0 0 1 .75-.75h1a.75.75 0 0 1 .75.75V16.5h1.25a.75.75 0 0 1 0 1.5h-4.5a.75.75 0 0 1 0-1.5H9.5v-4Z" />
+    </svg>
+  );
+}
+
+function SmileIcon({ className }: { className?: string }) {
+  return (
+    <svg
+      className={className}
+      viewBox="0 0 20 20"
+      fill="currentColor"
+      aria-hidden
+    >
+      <path d="M10 2.5a7.5 7.5 0 1 0 0 15 7.5 7.5 0 0 0 0-15ZM6.5 8.25a1.25 1.25 0 1 1 2.5 0 1.25 1.25 0 0 1-2.5 0Zm4.75 0a1.25 1.25 0 1 1 2.5 0 1.25 1.25 0 0 1-2.5 0ZM7.25 12.5c.55.95 1.55 1.5 2.75 1.5s2.2-.55 2.75-1.5a.75.75 0 1 1 1.3.75c-.85 1.45-2.35 2.25-4.05 2.25s-3.2-.8-4.05-2.25a.75.75 0 1 1 1.3-.75Z" />
+    </svg>
+  );
+}
+
 function ImageIcon({ className }: { className?: string }) {
   return (
     <svg
@@ -255,6 +288,178 @@ function CommentActionIcon({
   );
 }
 
+function MessageReactions({
+  reactions,
+  pageId,
+}: {
+  reactions?: MessageReactionView[];
+  pageId?: string;
+}) {
+  if (!reactions?.length) return null;
+
+  const grouped = new Map<string, number>();
+  for (const reaction of reactions) {
+    grouped.set(reaction.emoji, (grouped.get(reaction.emoji) ?? 0) + 1);
+  }
+
+  return (
+    <div className="mt-1 flex flex-wrap gap-1">
+      {[...grouped.entries()].map(([emoji, count]) => (
+        <span
+          key={emoji}
+          className="inline-flex items-center gap-0.5 rounded-full border border-[#e5e7eb] bg-white px-1.5 py-0.5 text-xs shadow-sm"
+          title={pageId ? 'Reaction từ Page' : 'Reaction'}
+        >
+          <span>{emoji}</span>
+          {count > 1 && <span className="text-[10px] text-[#6b7280]">{count}</span>}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+interface MessengerActionBarProps {
+  messageId: string;
+  isPinned: boolean;
+  pageReaction?: string | null;
+  actionLoading: boolean;
+  onReact: (emoji: string) => void;
+  onUnreact: () => void;
+  onTogglePin: () => void;
+}
+
+function MessengerActionBar({
+  messageId,
+  isPinned,
+  pageReaction,
+  actionLoading,
+  onReact,
+  onUnreact,
+  onTogglePin,
+}: MessengerActionBarProps) {
+  const [showEmojiPicker, setShowEmojiPicker] = useState(false);
+
+  return (
+    <div className="mt-1 flex items-center gap-1">
+      <div className="relative">
+        <CommentActionIcon
+          label="Thả emoji"
+          icon={<SmileIcon className="h-4 w-4" />}
+          onClick={() => setShowEmojiPicker((v) => !v)}
+          disabled={actionLoading}
+          active={showEmojiPicker || !!pageReaction}
+        />
+        {showEmojiPicker && (
+          <div
+            className="absolute bottom-full left-0 z-20 mb-1 flex gap-0.5 rounded-full border border-[#e5e7eb] bg-white px-1.5 py-1 shadow-lg"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {MESSENGER_REACTION_EMOJIS.map((emoji) => (
+              <button
+                key={`${messageId}-${emoji}`}
+                type="button"
+                disabled={actionLoading}
+                aria-label={`Reaction ${emoji}`}
+                className={`rounded-full px-1.5 py-0.5 text-base transition hover:bg-[#eff6ff] ${
+                  pageReaction === emoji ? 'bg-[#dbeafe]' : ''
+                }`}
+                onClick={() => {
+                  setShowEmojiPicker(false);
+                  if (pageReaction === emoji) {
+                    onUnreact();
+                  } else {
+                    onReact(emoji);
+                  }
+                }}
+              >
+                {emoji}
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+      <CommentActionIcon
+        label={isPinned ? 'Bỏ ghim' : 'Ghim tin nhắn'}
+        icon={<PinIcon className="h-4 w-4" />}
+        onClick={onTogglePin}
+        disabled={actionLoading}
+        active={isPinned}
+      />
+    </div>
+  );
+}
+
+function PinnedMessagesPanel({
+  messages,
+  pinnedMessageIds,
+  customerName,
+  onScrollToMessage,
+  onUnpin,
+}: {
+  messages: WebhookMessage[];
+  pinnedMessageIds: string[];
+  customerName: string;
+  onScrollToMessage: (messageId: string) => void;
+  onUnpin?: (messageId: string) => void;
+}) {
+  if (!pinnedMessageIds.length) return null;
+
+  const pinnedSet = new Set(pinnedMessageIds);
+  const pinnedMessages = pinnedMessageIds
+    .map((id) => messages.find((m) => m.messageId === id))
+    .filter((m): m is WebhookMessage => !!m);
+
+  if (!pinnedMessages.length) {
+    return (
+      <div className="shrink-0 border-b border-[#fde68a] bg-[#fffbeb] px-4 py-2 text-xs text-[#92400e]">
+        <span className="font-semibold">📌 Tin đã ghim</span>
+        <span className="ml-2">{pinnedMessageIds.length} tin — cuộn để xem</span>
+      </div>
+    );
+  }
+
+  return (
+    <div className="shrink-0 border-b border-[#fde68a] bg-[#fffbeb] px-4 py-3">
+      <p className="text-xs font-semibold text-[#92400e]">📌 Tin đã ghim</p>
+      <div className="mt-2 max-h-40 space-y-2 overflow-y-auto">
+        {pinnedMessages.map((msg) => {
+          const preview = getCommentPreviewText(msg);
+          const messageId = msg.messageId?.trim();
+          return (
+            <div
+              key={`pinned-${msg.id}`}
+              className="flex items-start justify-between gap-2 rounded-lg bg-white/80 px-3 py-2 text-sm shadow-sm"
+            >
+              <button
+                type="button"
+                className="min-w-0 flex-1 text-left hover:text-[#2563eb]"
+                onClick={() => {
+                  if (messageId) onScrollToMessage(messageId);
+                }}
+              >
+                <p className="truncate font-medium text-[#111827]">
+                  {pickBetterSenderName(msg.senderName, customerName)}
+                </p>
+                <p className="truncate text-xs text-[#6b7280]">{preview || 'Tin nhắn'}</p>
+              </button>
+              {onUnpin && messageId && pinnedSet.has(messageId) && (
+                <button
+                  type="button"
+                  aria-label="Bỏ ghim"
+                  className="shrink-0 rounded-full p-1 text-[#92400e] hover:bg-[#fef3c7]"
+                  onClick={() => onUnpin(messageId)}
+                >
+                  <PinIcon className="h-4 w-4" />
+                </button>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 interface CommentActionBarProps {
   msg: WebhookMessage;
   pageId?: string;
@@ -265,6 +470,7 @@ interface CommentActionBarProps {
   onReply: () => void;
   onMessage: () => void;
   onLike: () => void;
+  onUnlike: () => void;
   onHide: () => void;
   onUnhide: () => void;
 }
@@ -279,11 +485,17 @@ function CommentActionBar({
   onReply,
   onMessage,
   onLike,
+  onUnlike,
   onHide,
   onUnhide,
 }: CommentActionBarProps) {
   const commentKey = getMessageCommentKey(msg);
   const isHidden = msg.status === 'HIDDEN';
+  const canHideCustomerComment =
+    !isOut &&
+    msg.direction === 'IN' &&
+    msg.senderId !== pageId &&
+    !!commentKey;
   const canReply =
     !isOut &&
     msg.direction === 'IN' &&
@@ -303,10 +515,10 @@ function CommentActionBar({
       {!isOut && (
         <>
           <CommentActionIcon
-            label={liked ? 'Đã thích' : 'Thích'}
+            label={liked ? 'Bỏ thích' : 'Thích'}
             icon={<LikeIcon className="h-4 w-4" />}
-            onClick={onLike}
-            disabled={actionLoading || liked || !commentKey}
+            onClick={liked ? onUnlike : onLike}
+            disabled={actionLoading || !commentKey}
             active={liked}
           />
           <CommentActionIcon
@@ -332,7 +544,7 @@ function CommentActionBar({
           href={fbUrl}
         />
       )}
-      {commentKey && isActiveContentStatus(msg.status) && (
+      {canHideCustomerComment && isActiveContentStatus(msg.status) && (
         <CommentActionIcon
           label="Ẩn bình luận"
           icon={<EyeOffIcon className="h-4 w-4" />}
@@ -340,7 +552,7 @@ function CommentActionBar({
           disabled={actionLoading}
         />
       )}
-      {commentKey && isHidden && (
+      {canHideCustomerComment && isHidden && (
         <CommentActionIcon
           label="Hiện bình luận"
           icon={<EyeIcon className="h-4 w-4" />}
@@ -352,8 +564,32 @@ function CommentActionBar({
   );
 }
 
-function MessageBody({ msg }: { msg: WebhookMessage }) {
+function MessageBody({
+  msg,
+  pageId,
+  pageName,
+  customerName,
+  customerSenderId,
+  messages,
+  postPermalinkUrl,
+}: {
+  msg: WebhookMessage;
+  pageId?: string;
+  pageName?: string;
+  customerName?: string;
+  customerSenderId?: string;
+  messages?: WebhookMessage[];
+  postPermalinkUrl?: string | null;
+}) {
   const parsed = parseMessageContent(msg);
+  const mentionProps = {
+    pageId,
+    pageName,
+    customerName,
+    customerSenderId,
+    postPermalinkUrl,
+    messages,
+  };
 
   if (parsed.kind === 'receipt') {
     return null;
@@ -364,7 +600,7 @@ function MessageBody({ msg }: { msg: WebhookMessage }) {
       <div className="space-y-2">
         {parsed.text ? (
           <p className="whitespace-pre-wrap break-words">
-            <LinkifiedText text={parsed.text} />
+            <MentionText text={parsed.text} {...mentionProps} />
           </p>
         ) : null}
         {parsed.attachment ? (
@@ -395,7 +631,7 @@ function MessageBody({ msg }: { msg: WebhookMessage }) {
 
   return (
     <p className="whitespace-pre-wrap break-words">
-      <LinkifiedText text={parsed.text} />
+      <MentionText text={parsed.text} {...mentionProps} />
     </p>
   );
 }
@@ -588,6 +824,9 @@ interface PostPreviewPanelProps {
   loading: boolean;
   highlightComment?: string;
   senderName?: string;
+  pageId?: string;
+  pageName?: string;
+  messages?: WebhookMessage[];
   emptyState?: 'hidden' | 'hint' | 'error';
   expanded?: boolean;
   onToggleExpanded?: () => void;
@@ -599,6 +838,9 @@ export function PostPreviewPanel({
   loading,
   highlightComment,
   senderName,
+  pageId,
+  pageName,
+  messages,
   emptyState = 'error',
   expanded = false,
   onToggleExpanded,
@@ -708,7 +950,14 @@ export function PostPreviewPanel({
         <div className="border-t border-[#fde68a] bg-[#fffbeb] px-4 py-3">
           <p className="text-sm text-[#92400e]">
             <span className="font-semibold">{senderName}:</span>{' '}
-            <LinkifiedText text={highlightComment} />
+            <MentionText
+              text={highlightComment}
+              pageId={pageId}
+              pageName={pageName}
+              postPermalinkUrl={post?.permalinkUrl}
+              customerName={senderName}
+              messages={messages}
+            />
           </p>
         </div>
       )}
@@ -754,6 +1003,7 @@ interface ThreadMessagesProps {
   pageName?: string;
   pagePictureUrl?: string | null;
   selectedCommentId?: string | null;
+  selectedReplyMessageId?: string | null;
   loading?: boolean;
   hasMore?: boolean;
   loadingMore?: boolean;
@@ -770,15 +1020,24 @@ interface ThreadMessagesProps {
   postExpanded?: boolean;
   onTogglePostExpanded?: () => void;
   /** Hiển thị thanh hành động bình luận (thích, nhắn tin, trả lời, ẩn). */
+  /** Hiển thị nút trả lời tin nhắn Messenger. */
+  showMessengerReply?: boolean;
   showCommentActions?: boolean;
   postPermalinkUrl?: string | null;
   onReplyComment?: (msg: WebhookMessage) => void;
-  onMessageCustomer?: () => void;
+  onMessageCustomer?: (commentId?: string) => void;
   onCommentAction?: (commentId: string, action: CommentAction) => Promise<void>;
+  /** Hành động trên tin nhắn Messenger (emoji, ghim) — chỉ áp dụng tab tin nhắn. */
+  showMessengerActions?: boolean;
+  pinnedMessageIds?: string[];
+  onMessengerReact?: (messageId: string, emoji: string) => Promise<void>;
+  onMessengerUnreact?: (messageId: string) => Promise<void>;
+  onMessengerTogglePin?: (messageId: string, pinned: boolean) => Promise<void>;
 }
 
 export interface ThreadMessagesHandle {
   scrollToComment: (commentId: string) => void;
+  scrollToMessage: (messageId: string) => void;
 }
 
 export const ThreadMessages = forwardRef<
@@ -794,11 +1053,13 @@ export const ThreadMessages = forwardRef<
     pageName,
     pagePictureUrl = null,
     selectedCommentId = null,
+    selectedReplyMessageId = null,
     loading = false,
     hasMore = false,
     loadingMore = false,
     onLoadMore,
     onSelectMessage,
+    onReplyMessage,
     post,
     postLoading = false,
     initialLoading = false,
@@ -809,10 +1070,16 @@ export const ThreadMessages = forwardRef<
     postExpanded = false,
     onTogglePostExpanded,
     showCommentActions = false,
+    showMessengerReply = false,
     postPermalinkUrl = null,
     onReplyComment,
     onMessageCustomer,
     onCommentAction,
+    showMessengerActions = false,
+    pinnedMessageIds = [],
+    onMessengerReact,
+    onMessengerUnreact,
+    onMessengerTogglePin,
   }: ThreadMessagesProps,
   ref,
 ) {
@@ -822,10 +1089,26 @@ export const ThreadMessages = forwardRef<
   const loadMoreLock = useRef(false);
   const canRequestOlder = useRef(false);
   const [flashCommentId, setFlashCommentId] = useState<string | null>(null);
+  const [flashMessageId, setFlashMessageId] = useState<string | null>(null);
   const [likedCommentIds, setLikedCommentIds] = useState<Set<string>>(
     () => new Set(),
   );
   const [actionLoadingId, setActionLoadingId] = useState<string | null>(null);
+  const [messengerActionLoadingId, setMessengerActionLoadingId] = useState<
+    string | null
+  >(null);
+
+  const runMessengerAction = useCallback(
+    async (messageId: string, action: () => Promise<void>) => {
+      setMessengerActionLoadingId(messageId);
+      try {
+        await action();
+      } finally {
+        setMessengerActionLoadingId(null);
+      }
+    },
+    [],
+  );
 
   const runCommentAction = useCallback(
     async (commentId: string, action: CommentAction) => {
@@ -835,6 +1118,12 @@ export const ThreadMessages = forwardRef<
         await onCommentAction(commentId, action);
         if (action === 'like') {
           setLikedCommentIds((prev) => new Set(prev).add(commentId));
+        } else if (action === 'unlike') {
+          setLikedCommentIds((prev) => {
+            const next = new Set(prev);
+            next.delete(commentId);
+            return next;
+          });
         }
       } finally {
         setActionLoadingId(null);
@@ -860,7 +1149,28 @@ export const ThreadMessages = forwardRef<
     return true;
   }, []);
 
-  useImperativeHandle(ref, () => ({ scrollToComment }), [scrollToComment]);
+  const scrollToMessage = useCallback((messageId: string) => {
+    const root = scrollRef.current;
+    if (!root) return false;
+
+    const el = root.querySelector<HTMLElement>(
+      `[data-message-id="${CSS.escape(messageId)}"]`,
+    );
+    if (!el) return false;
+
+    el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    setFlashMessageId(messageId);
+    window.setTimeout(() => {
+      setFlashMessageId((current) => (current === messageId ? null : current));
+    }, 2000);
+    return true;
+  }, []);
+
+  useImperativeHandle(
+    ref,
+    () => ({ scrollToComment, scrollToMessage }),
+    [scrollToComment, scrollToMessage],
+  );
 
   useEffect(() => {
     isInitialScroll.current = true;
@@ -924,31 +1234,56 @@ export const ThreadMessages = forwardRef<
   }, [handleLoadMore, initialLoading]);
 
   const showPost = postLoading || !!post || showPostHintWhenEmpty;
-  const displayMessages = buildDisplayMessages(messages);
+  const pinnedIdSet = new Set(pinnedMessageIds);
+  const displayMessages = buildDisplayMessages(
+    messages.filter((msg) => {
+      const mid = msg.messageId?.trim();
+      return !mid || !pinnedIdSet.has(mid);
+    }),
+  );
   const showInitialSkeleton = initialLoading && displayMessages.length === 0;
 
   return (
-    <div
-      ref={scrollRef}
-      onScroll={handleScroll}
-      className="min-h-0 flex-1 overflow-y-auto bg-[#f3f4f6]"
-    >
-      {loadingMore && (
-        <div className="flex justify-center py-2">
-          <span className="text-xs text-[#6b7280]">
-            Đang tải tin nhắn cũ hơn...
-          </span>
-        </div>
+    <div className="flex min-h-0 flex-1 flex-col bg-[#f3f4f6]">
+      {showMessengerActions && pinnedMessageIds.length > 0 && (
+        <PinnedMessagesPanel
+          messages={messages}
+          pinnedMessageIds={pinnedMessageIds}
+          customerName={customerName}
+          onScrollToMessage={scrollToMessage}
+          onUnpin={
+            onMessengerTogglePin
+              ? (messageId) => {
+                  void runMessengerAction(messageId, () =>
+                    onMessengerTogglePin(messageId, false),
+                  );
+                }
+              : undefined
+          }
+        />
       )}
 
-      {showFeedCommentBanner && (
-        <div className="border-b border-[#a7f3d0] bg-[#ecfdf5] px-4 py-2 text-xs text-[#047857]">
-          Bạn có thể viết bình luận mới trên bài viết hoặc chọn một bình luận
-          để trả lời.
-        </div>
-      )}
+      <div
+        ref={scrollRef}
+        onScroll={handleScroll}
+        className="min-h-0 flex-1 overflow-y-auto"
+      >
+        {loadingMore && (
+          <div className="flex justify-center py-2">
+            <span className="text-xs text-[#6b7280]">
+              Đang tải tin nhắn cũ hơn...
+            </span>
+          </div>
+        )}
 
-      {loading && messages.length === 0 ? (
+        {showFeedCommentBanner && (
+          <div className="border-b border-[#a7f3d0] bg-[#ecfdf5] px-4 py-2 text-xs text-[#047857]">
+            Bạn có thể viết bình luận mới trên bài viết hoặc chọn một bình luận
+            để trả lời.
+          </div>
+        )}
+
+        {loading && messages.length === 0 ? (
         <MessagesSkeletonGroup />
       ) : (
       <div className="space-y-3 p-4">
@@ -960,6 +1295,9 @@ export const ThreadMessages = forwardRef<
                 loading={postLoading}
                 highlightComment={highlightComment}
                 senderName={highlightSenderName ?? customerName}
+                pageId={pageId}
+                pageName={pageName}
+                messages={messages}
                 emptyState={showPostHintWhenEmpty ? 'hint' : 'error'}
                 expanded={postExpanded}
                 onToggleExpanded={onTogglePostExpanded}
@@ -971,11 +1309,11 @@ export const ThreadMessages = forwardRef<
 
         {showInitialSkeleton ? (
           <ThreadMessagesSkeleton />
-        ) : displayMessages.length === 0 ? (
+        ) : displayMessages.length === 0 && pinnedMessageIds.length === 0 ? (
           <p className="text-center text-sm text-[#6b7280]">
             Chưa có tin nhắn trong cuộc trò chuyện này
           </p>
-        ) : (
+        ) : displayMessages.length === 0 ? null : (
           displayMessages.map(({ msg, status, showDateSeparator }) => {
             const isOut = msg.direction === 'OUT';
             const avatarUrl =
@@ -989,9 +1327,16 @@ export const ThreadMessages = forwardRef<
               : (msg.senderId ?? customerSenderId);
             const avatarPageId = isOut ? undefined : (msg.pageId ?? pageId);
             const commentKey = getMessageCommentKey(msg);
+            const messageKey = msg.messageId?.trim() || null;
             const isSelected =
               !!selectedCommentId && commentKey === selectedCommentId;
-            const isFlashing = !!commentKey && flashCommentId === commentKey;
+            const isReplySelected =
+              !!selectedReplyMessageId &&
+              !!messageKey &&
+              messageKey === selectedReplyMessageId;
+            const isFlashing =
+              (!!commentKey && flashCommentId === commentKey) ||
+              (!!messageKey && flashMessageId === messageKey);
             const statusLabel = formatContentStatusLabel(
               msg.status,
               msg.eventType,
@@ -1005,6 +1350,13 @@ export const ThreadMessages = forwardRef<
             const parentPreview = parentMsg
               ? getCommentPreviewText(parentMsg)
               : null;
+            const messengerReply = resolveMessengerReplyTarget(messages, msg);
+            const messengerReplyMid = messengerReply.mid;
+            const messengerReplyPreview = messengerReply.target
+              ? getCommentPreviewText(messengerReply.target)
+              : messengerReplyMid
+                ? 'Tin nhắn'
+                : null;
             const hasMedia =
               msg.msgType?.includes('photo') ||
               msg.msgType?.includes('sticker') ||
@@ -1019,6 +1371,25 @@ export const ThreadMessages = forwardRef<
               msg.direction === 'IN' &&
               msg.senderId !== pageId &&
               isActiveContentStatus(msg.status);
+            const canHoverMessengerReply =
+              showMessengerReply &&
+              !!onReplyMessage &&
+              !!messageKey &&
+              msg.eventType === 'MESSENGER' &&
+              !isReceiptMessage(msg);
+            const showMessengerMessageActions =
+              showMessengerActions &&
+              !!messageKey &&
+              isValidMessengerMessageId(messageKey) &&
+              !isOut &&
+              msg.eventType === 'MESSENGER' &&
+              !isReceiptMessage(msg) &&
+              msg.senderId !== pageId;
+            const pageReaction =
+              msg.reactions?.find((r) => r.reactorId === pageId)?.emoji ?? null;
+            const isPinnedMsg =
+              msg.isPinned ||
+              (!!messageKey && pinnedIdSet.has(messageKey));
 
             return (
               <div key={msg.id} className="space-y-2">
@@ -1058,8 +1429,22 @@ export const ThreadMessages = forwardRef<
                           />
                         </div>
                       )}
+                      {canHoverMessengerReply && (
+                        <div
+                          className={`absolute -top-3 z-10 hidden group-hover:block ${
+                            isOut ? 'left-2' : 'right-2'
+                          }`}
+                        >
+                          <CommentActionIcon
+                            label="Trả lời tin nhắn"
+                            icon={<ReplyIcon className="h-4 w-4" />}
+                            onClick={() => onReplyMessage?.(msg)}
+                          />
+                        </div>
+                      )}
                       <div
                         data-comment-id={commentKey ?? undefined}
+                        data-message-id={messageKey ?? undefined}
                         role={onSelectMessage ? 'button' : undefined}
                         tabIndex={onSelectMessage ? 0 : undefined}
                         onClick={
@@ -1082,10 +1467,18 @@ export const ThreadMessages = forwardRef<
                           isOut
                             ? 'rounded-br-md bg-[#dcf8c6] text-[#111827]'
                             : 'rounded-bl-md bg-white text-[#111827]'
-                        } ${isSelected || isFlashing ? 'ring-2 ring-[#f59e0b]' : ''} ${
+                        } ${isSelected || isReplySelected || isFlashing ? 'ring-2 ring-[#f59e0b]' : ''} ${
                           isInactive ? 'opacity-70' : ''
                         } ${isFlashing ? 'bg-[#fef3c7]' : ''}`}
                       >
+                        {messengerReplyMid && (
+                          <CommentReplyPreview
+                            preview={messengerReplyPreview ?? 'Tin nhắn'}
+                            label="Trả lời tin nhắn"
+                            variant={isOut ? 'bubble-out' : 'bubble-in'}
+                            onClick={() => scrollToMessage(messengerReplyMid)}
+                          />
+                        )}
                         {isReply && parentPreview && (
                           <CommentReplyPreview
                             preview={parentPreview}
@@ -1115,7 +1508,16 @@ export const ThreadMessages = forwardRef<
                             <span>{displayName}</span>
                           </p>
                         )}
-                        <MessageBody msg={msg} />
+                        <MessageBody
+                          msg={msg}
+                          pageId={pageId}
+                          pageName={pageName}
+                          customerName={customerName}
+                          customerSenderId={customerSenderId}
+                          messages={messages}
+                          postPermalinkUrl={postPermalinkUrl}
+                        />
+                        <MessageReactions reactions={msg.reactions} pageId={pageId} />
                         <div className="mt-1 flex items-center justify-end gap-1 text-[10px] text-[#9ca3af]">
                           <span>{formatDateTime(msg.createdAt)}</span>
                           {isOut && status && (
@@ -1135,12 +1537,43 @@ export const ThreadMessages = forwardRef<
                         liked={likedCommentIds.has(commentKey)}
                         actionLoading={actionLoadingId === commentKey}
                         onReply={() => onReplyComment?.(msg)}
-                        onMessage={() => onMessageCustomer?.()}
+                        onMessage={() =>
+                          onMessageCustomer?.(commentKey ?? undefined)
+                        }
                         onLike={() => void runCommentAction(commentKey, 'like')}
+                        onUnlike={() =>
+                          void runCommentAction(commentKey, 'unlike')
+                        }
                         onHide={() => void runCommentAction(commentKey, 'hide')}
                         onUnhide={() =>
                           void runCommentAction(commentKey, 'unhide')
                         }
+                      />
+                    )}
+                    {showMessengerMessageActions && messageKey && (
+                      <MessengerActionBar
+                        messageId={messageKey}
+                        isPinned={isPinnedMsg}
+                        pageReaction={pageReaction}
+                        actionLoading={messengerActionLoadingId === messageKey}
+                        onReact={(emoji) => {
+                          if (!onMessengerReact) return;
+                          void runMessengerAction(messageKey, () =>
+                            onMessengerReact(messageKey, emoji),
+                          );
+                        }}
+                        onUnreact={() => {
+                          if (!onMessengerUnreact) return;
+                          void runMessengerAction(messageKey, () =>
+                            onMessengerUnreact(messageKey),
+                          );
+                        }}
+                        onTogglePin={() => {
+                          if (!onMessengerTogglePin) return;
+                          void runMessengerAction(messageKey, () =>
+                            onMessengerTogglePin(messageKey, !isPinnedMsg),
+                          );
+                        }}
                       />
                     )}
                   </div>
@@ -1159,7 +1592,8 @@ export const ThreadMessages = forwardRef<
           })
         )}
       </div>
-      )}
+        )}
+      </div>
     </div>
   );
 });

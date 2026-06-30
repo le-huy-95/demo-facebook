@@ -5,6 +5,7 @@ import {
   buildMessengerThreadId,
   parseMessengerThreadParts,
 } from './messenger-thread.util';
+import { formatConversationThreadPreview } from './thread-preview.util';
 
 export type ConversationKind = 'MESSENGER' | 'FEED_COMMENT';
 
@@ -51,6 +52,28 @@ export function resolveRootCommentId(event: WebhookEvent): string | null {
   return event.parentCommentId ?? event.commentId ?? null;
 }
 
+/** Một hội thoại bình luận = khách + bài viết (gộp mọi reply trong cùng chuỗi). */
+export function buildFeedCommentThreadId(
+  pageId: string,
+  postId: string,
+  customerId: string,
+): string {
+  return `comment:${pageId}:${postId}:${customerId}`;
+}
+
+/** Gộp thread id cũ (có rootCommentId) về định dạng chuẩn. */
+export function normalizeCommentThreadId(threadId: string): string {
+  const parsed = parseThreadId(threadId);
+  if (!parsed || parsed.kind !== 'FEED_COMMENT' || !parsed.postId) {
+    return threadId;
+  }
+  return buildFeedCommentThreadId(
+    parsed.pageId,
+    parsed.postId,
+    parsed.senderId,
+  );
+}
+
 export function buildThreadId(event: WebhookEvent): string | null {
   if (!event.pageId) return null;
 
@@ -67,9 +90,6 @@ export function buildThreadId(event: WebhookEvent): string | null {
   if (event.eventType === 'FEED_COMMENT') {
     if (!event.postId) return null;
 
-    const rootCommentId = resolveRootCommentId(event);
-    if (!rootCommentId) return null;
-
     let customerId: string | null;
     if (event.direction === 'OUT') {
       if (event.senderId && event.senderId !== event.pageId) {
@@ -82,7 +102,7 @@ export function buildThreadId(event: WebhookEvent): string | null {
     }
 
     if (!customerId || customerId === event.pageId) return null;
-    return `comment:${event.pageId}:${event.postId}:${customerId}:${rootCommentId}`;
+    return buildFeedCommentThreadId(event.pageId, event.postId, customerId);
   }
 
   return null;
@@ -236,9 +256,10 @@ export function aggregateConversations(
     if (isMessagingReceiptMsgType(event.msgType)) continue;
     if (event.direction !== 'OUT') continue;
 
-    const threadId = buildThreadId(event);
-    if (!threadId) continue;
+    const rawThreadId = buildThreadId(event);
+    if (!rawThreadId) continue;
 
+    const threadId = normalizeCommentThreadId(rawThreadId);
     const ts = new Date(event.createdAt).getTime();
     const current = latestOutboundByThread.get(threadId) ?? 0;
     if (ts > current) latestOutboundByThread.set(threadId, ts);
@@ -247,22 +268,24 @@ export function aggregateConversations(
   for (const event of events) {
     if (isMessagingReceiptMsgType(event.msgType)) continue;
 
-    const threadId = buildThreadId(event);
-    if (!threadId) continue;
+    const rawThreadId = buildThreadId(event);
+    if (!rawThreadId) continue;
 
+    const threadId = normalizeCommentThreadId(rawThreadId);
     const ts = new Date(event.createdAt).getTime();
     const kind: ConversationKind =
       event.eventType === 'FEED_COMMENT' ? 'FEED_COMMENT' : 'MESSENGER';
 
     const existing = map.get(threadId);
     const customerId = resolveCustomerId(event);
-    const readAt = readAtByThread.get(threadId)?.getTime();
+    const readAt =
+      readAtByThread.get(threadId)?.getTime() ??
+      readAtByThread.get(rawThreadId)?.getTime();
     const unreadCutoff = readAt ?? latestOutboundByThread.get(threadId) ?? 0;
     const isUnreadInbound =
       isVisibleEvent(event) && event.direction === 'IN' && ts > unreadCutoff;
 
     if (!existing) {
-      const rootCommentId = resolveRootCommentId(event);
       const inboundName =
         event.direction === 'IN' &&
         event.senderName &&
@@ -276,10 +299,24 @@ export function aggregateConversations(
         pageId: event.pageId!,
         senderId: customerId,
         senderName: inboundName,
-        preview: event.content ?? '',
+        preview: formatConversationThreadPreview({
+          content: event.content,
+          msgType: event.msgType,
+          eventType: event.eventType,
+          direction: event.direction,
+          senderName:
+            event.direction === 'OUT'
+              ? null
+              : inboundName,
+        }),
         lastMessageAt: event.createdAt.toISOString(),
         postId: event.postId,
-        commentId: rootCommentId ?? event.commentId,
+        commentId:
+          event.direction === 'IN' &&
+          event.senderId &&
+          event.senderId !== event.pageId
+            ? event.commentId
+            : resolveRootCommentId(event),
         messageCount: 1,
         unreadCount: isUnreadInbound ? 1 : 0,
         _latest: ts,
@@ -294,13 +331,28 @@ export function aggregateConversations(
     if (ts >= existing._latest) {
       existing._latest = ts;
       existing.lastMessageAt = event.createdAt.toISOString();
-      existing.preview = event.content ?? existing.preview;
+      existing.preview = formatConversationThreadPreview({
+        content: event.content,
+        msgType: event.msgType,
+        eventType: event.eventType,
+        direction: event.direction,
+        senderName:
+          event.direction === 'OUT' ? null : existing.senderName,
+      });
       if (
         event.direction === 'IN' &&
         event.senderName &&
         !isGenericSenderName(event.senderName)
       ) {
         existing.senderName = event.senderName;
+      }
+      if (
+        event.direction === 'IN' &&
+        event.senderId &&
+        event.senderId !== event.pageId &&
+        event.commentId
+      ) {
+        existing.commentId = event.commentId;
       }
     }
   }

@@ -42,3 +42,41 @@ export function facebookCommentIdsMatch(
   const suffixB = facebookCommentIdSuffix(right);
   return Boolean(suffixA && suffixB && suffixA === suffixB);
 }
+
+/** Các biến thể id để gọi Graph (webhook vs Graph API đôi khi khác format). */
+export function buildFacebookCommentIdCandidates(
+  commentId: string | null | undefined,
+  postId?: string | null,
+): string[] {
+  const trimmed = commentId?.trim();
+  if (!trimmed) return [];
+
+  const candidates = new Set<string>([trimmed]);
+  const suffix = facebookCommentIdSuffix(trimmed);
+  if (suffix) candidates.add(suffix);
+
+  const normalizedPostId = normalizeFacebookPostId(postId);
+  if (normalizedPostId) {
+    const idForPost = suffix ?? (/^\d+$/.test(trimmed) ? trimmed : null);
+    if (idForPost) {
+      candidates.add(`${normalizedPostId}_${idForPost}`);
+    }
+  }
+
+  const parts = trimmed.split('_');
+  if (parts.length >= 3) {
+    candidates.add(`${parts.at(-2)}_${parts.at(-1)}`);
+  }
+
+  return [...candidates];
+}
+
+/** Chỉ id đủ segment — bỏ suffix số thuần (Graph API không chấp nhận). */
+export function buildGraphCommentIdCandidates(
+  commentId: string | null | undefined,
+  postId?: string | null,
+): string[] {
+  return buildFacebookCommentIdCandidates(commentId, postId).filter(
+    isValidFacebookCommentId,
+  );
+}

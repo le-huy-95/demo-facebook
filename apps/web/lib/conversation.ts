@@ -1,5 +1,6 @@
 import type { ConversationThread, WebhookMessage } from './api';
 import { isActiveContentStatus } from '@/lib/event-status';
+import { formatConversationThreadPreview } from '@/lib/message-content';
 
 const GENERIC_SENDER_NAMES = new Set(['Khách hàng', 'Page', 'Facebook User']);
 
@@ -14,6 +15,14 @@ export function isValidFacebookCommentId(
 ): boolean {
   if (!commentId?.trim()) return false;
   return /^\d+(?:_\d+)+$/.test(commentId.trim());
+}
+
+/** Facebook Messenger message id (mid) từ webhook — dùng cho reaction/ghim. */
+export function isValidMessengerMessageId(
+  messageId: string | null | undefined,
+): boolean {
+  const id = messageId?.trim();
+  return !!id && id.startsWith('m_');
 }
 
 export function pickBetterSenderName(
@@ -218,8 +227,25 @@ export function enrichEventForThread(event: WebhookMessage): WebhookMessage {
  * Tính threadId từ event — mirror CHÍNH XÁC logic backend `buildThreadId`.
  *
  * MESSENGER/POSTBACK : `messenger:{pageId}:{customerId}` hoặc `...:{postId}` (quảng cáo)
- * FEED_COMMENT       : `comment:{pageId}:{postId}:{customerId}:{rootCommentId}`
+ * FEED_COMMENT       : `comment:{pageId}:{postId}:{customerId}`
  */
+export function buildFeedCommentThreadId(
+  pageId: string,
+  postId: string,
+  customerId: string,
+): string {
+  return `comment:${pageId}:${postId}:${customerId}`;
+}
+
+/** Gộp thread id cũ (có rootCommentId) về định dạng chuẩn. */
+export function normalizeCommentThreadId(threadId: string): string {
+  if (!threadId.startsWith('comment:')) return threadId;
+  const parts = threadId.split(':');
+  if (parts.length < 4) return threadId;
+  const customerId = parts.length >= 5 ? parts[3]! : parts.slice(3).join(':');
+  return buildFeedCommentThreadId(parts[1]!, parts[2]!, customerId);
+}
+
 export function buildThreadIdFromEvent(event: WebhookMessage): string | null {
   const enriched = enrichEventForThread(event);
   if (!enriched.pageId) return null;
@@ -243,11 +269,6 @@ export function buildThreadIdFromEvent(event: WebhookMessage): string | null {
   if (enriched.eventType === 'FEED_COMMENT') {
     if (!enriched.postId) return null;
 
-    // rootCommentId: parentCommentId nếu là reply, commentId nếu là root comment
-    const rootCommentId = enriched.parentCommentId ?? enriched.commentId;
-    if (!rootCommentId) return null;
-
-    // customerId: bên gửi là khách (không phải page)
     let customerId: string | null;
     if (enriched.direction === 'OUT') {
       customerId =
@@ -259,7 +280,11 @@ export function buildThreadIdFromEvent(event: WebhookMessage): string | null {
     }
     if (!customerId || customerId === enriched.pageId) return null;
 
-    return `comment:${enriched.pageId}:${enriched.postId}:${customerId}:${rootCommentId}`;
+    return buildFeedCommentThreadId(
+      enriched.pageId,
+      enriched.postId,
+      customerId,
+    );
   }
 
   return null;
@@ -267,6 +292,46 @@ export function buildThreadIdFromEvent(event: WebhookMessage): string | null {
 
 export function resolveThreadIdFromEvent(event: WebhookMessage): string | null {
   return buildThreadIdFromEvent(event);
+}
+
+export function dedupeCommentThreads(
+  threads: ConversationThread[],
+): ConversationThread[] {
+  const map = new Map<string, ConversationThread>();
+
+  for (const thread of threads) {
+    const id = normalizeCommentThreadId(thread.id);
+    const existing = map.get(id);
+    if (!existing) {
+      map.set(id, { ...thread, id });
+      continue;
+    }
+
+    const existingTs = new Date(existing.lastMessageAt).getTime();
+    const threadTs = new Date(thread.lastMessageAt).getTime();
+    map.set(id, {
+      ...existing,
+      senderName: pickBetterSenderName(existing.senderName, thread.senderName),
+      senderPictureUrl: existing.senderPictureUrl ?? thread.senderPictureUrl,
+      preview: threadTs >= existingTs ? thread.preview : existing.preview,
+      lastMessageAt:
+        threadTs >= existingTs ? thread.lastMessageAt : existing.lastMessageAt,
+      messageCount: existing.messageCount + thread.messageCount,
+      unreadCount: (existing.unreadCount ?? 0) + (thread.unreadCount ?? 0),
+      postId: thread.postId ?? existing.postId,
+      commentId: threadTs >= existingTs ? thread.commentId : existing.commentId,
+    });
+  }
+
+  return [...map.values()];
+}
+
+export function isSameConversationThread(
+  left: string | null | undefined,
+  right: string | null | undefined,
+): boolean {
+  if (!left || !right) return false;
+  return normalizeCommentThreadId(left) === normalizeCommentThreadId(right);
 }
 
 export function resolveCustomerNameFromMessages(
@@ -283,6 +348,29 @@ export function resolveCustomerNameFromMessages(
 
 export function buildMessengerThreadId(pageId: string, senderId: string): string {
   return `messenger:${pageId}:${senderId}`;
+}
+
+/** Tìm hội thoại Messenger đã có của khách (theo PSID hoặc tên). */
+export function findMessengerThreadForCustomer(
+  conversations: ConversationThread[],
+  input: { senderId?: string; senderName?: string },
+): ConversationThread | undefined {
+  const senderId = input.senderId?.trim();
+  if (senderId) {
+    const byId = conversations.find(
+      (c) => c.kind === 'MESSENGER' && c.senderId === senderId,
+    );
+    if (byId) return byId;
+  }
+
+  const normalizedName = input.senderName?.trim().toLowerCase();
+  if (!normalizedName) return undefined;
+
+  return conversations.find(
+    (c) =>
+      c.kind === 'MESSENGER' &&
+      c.senderName.trim().toLowerCase() === normalizedName,
+  );
 }
 
 /** Id bình luận Facebook dùng để so khớp / scroll. */
@@ -314,6 +402,16 @@ function commentIdsMatch(a: string, b: string): boolean {
   const suffixA = a.split('_').at(-1);
   const suffixB = b.split('_').at(-1);
   return Boolean(suffixA && suffixB && suffixA === suffixB);
+}
+
+export function facebookCommentIdsMatch(
+  a: string | null | undefined,
+  b: string | null | undefined,
+): boolean {
+  const left = a?.trim();
+  const right = b?.trim();
+  if (!left || !right) return false;
+  return commentIdsMatch(left, right);
 }
 
 export function findCommentMessageById(
@@ -406,6 +504,68 @@ export function formatReplyMention(senderName: string | null | undefined): strin
   return `@${name} `;
 }
 
+function readReplyToMid(value: unknown): string | null {
+  if (!value || typeof value !== 'object') return null;
+  const mid = (value as { mid?: unknown }).mid;
+  return typeof mid === 'string' && mid.trim() ? mid.trim() : null;
+}
+
+/** mid tin nhắn gốc khi reply Messenger (IN từ webhook hoặc OUT từ app). */
+export function extractMessengerReplyToMid(
+  msg: WebhookMessage,
+): string | null {
+  const raw = parseRawPayload(msg.rawPayload);
+  if (!raw) return null;
+
+  const fromApp = raw.replyToMessageId;
+  if (typeof fromApp === 'string' && fromApp.trim()) return fromApp.trim();
+
+  const fromTopLevel = readReplyToMid(raw.reply_to);
+  if (fromTopLevel) return fromTopLevel;
+
+  const message = raw.message;
+  if (message && typeof message === 'object') {
+    const fromMessage = readReplyToMid(
+      (message as { reply_to?: unknown }).reply_to,
+    );
+    if (fromMessage) return fromMessage;
+  }
+
+  if (typeof raw.quote === 'string' && raw.quote.trim()) {
+    try {
+      const quoted = JSON.parse(raw.quote) as { mid?: unknown };
+      const fromQuote = readReplyToMid(quoted);
+      if (fromQuote) return fromQuote;
+    } catch {
+      // quote không phải JSON hợp lệ
+    }
+  }
+
+  return null;
+}
+
+export function findMessageByMid(
+  messages: WebhookMessage[],
+  mid: string,
+): WebhookMessage | undefined {
+  const needle = mid.trim();
+  if (!needle) return undefined;
+
+  return messages.find((msg) => msg.messageId?.trim() === needle);
+}
+
+/** Tin nhắn gốc khi hiển thị quote reply Messenger. */
+export function resolveMessengerReplyTarget(
+  messages: WebhookMessage[],
+  msg: WebhookMessage,
+): { mid: string | null; target?: WebhookMessage } {
+  const mid = extractMessengerReplyToMid(msg);
+  if (!mid) return { mid: null };
+
+  const target = findMessageByMid(messages, mid);
+  return target ? { mid, target } : { mid };
+}
+
 /** Gộp tin nhắn theo messageId/id, giữ optimistic chưa có trên server. */
 export function mergeThreadMessages(
   prev: WebhookMessage[],
@@ -441,7 +601,16 @@ export function buildThreadFromEvent(
     pageId: event.pageId,
     senderId: customerId,
     senderName: pickBetterSenderName(event.senderName, 'Khách hàng'),
-    preview: event.content ?? '',
+    preview: formatConversationThreadPreview({
+      content: event.content,
+      msgType: event.msgType,
+      eventType: event.eventType,
+      direction: event.direction,
+      senderName:
+        event.direction === 'OUT'
+          ? null
+          : pickBetterSenderName(event.senderName, 'Khách hàng'),
+    }),
     lastMessageAt: event.createdAt,
     postId: event.postId,
     commentId: event.commentId,

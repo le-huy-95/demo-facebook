@@ -4,6 +4,7 @@ import { ConfigService } from '@nestjs/config';
 import * as crypto from 'crypto';
 import got from 'got';
 import {
+  buildGraphCommentIdCandidates,
   facebookCommentIdsMatch,
   isValidFacebookCommentId,
 } from '../utils/facebook-comment-id.util';
@@ -124,8 +125,9 @@ export class FacebookOAuthService {
   >();
   private static readonly INSPECT_CACHE_TTL_MS = 5 * 60_000; // 5 phút
 
-  /** Quyền tối thiểu để đọc/trả lời bình luận trên bài viết fanpage. */
+  /** Quyền tối thiểu để đọc/trả lời/ẩn bình luận trên bài viết fanpage. */
   static readonly COMMENT_SCOPES = [
+    'pages_read_engagement',
     'pages_read_user_content',
     'pages_manage_engagement',
   ] as const;
@@ -936,16 +938,50 @@ export class FacebookOAuthService {
   private mapFbError(error: any): Error {
     if (!error) return new Error('Facebook API request failed');
 
-    const { code, message, fbtrace_id: fbtraceId } = error;
+    const {
+      code,
+      message,
+      error_subcode: errorSubcode,
+      error_user_msg: errorUserMsg,
+      fbtrace_id: fbtraceId,
+    } = error;
+
+    if (errorSubcode === 1446036) {
+      return new BadRequestException(
+        'Bình luận đã được ẩn trên Facebook. App sẽ đồng bộ lại trạng thái.',
+      );
+    }
+    if (code === 1 && errorUserMsg) {
+      return new BadRequestException(String(errorUserMsg));
+    }
 
     if (code === 190) {
       return new BadRequestException(
         `Token Facebook hết hạn hoặc không hợp lệ. Vui lòng liên kết lại fanpage. (${message})`,
       );
     }
-    if (code === 10 || code === 200) {
+    if (code === 10) {
       return new BadRequestException(
         `Thiếu quyền Facebook để thao tác bình luận. Vui lòng vào Shops → "Liên kết lại Facebook" và cấp quyền đọc/trả lời bình luận. (${message})`,
+      );
+    }
+    if (code === 200) {
+      const normalized = String(message ?? '').toLowerCase();
+      if (
+        normalized.includes('can not hide or unhide') ||
+        normalized.includes('cannot hide or unhide')
+      ) {
+        return new BadRequestException(
+          'Facebook không cho phép ẩn/hiện bình luận này. Bình luận có thể không hỗ trợ ẩn (can_hide=false), là bình luận của fanpage, hoặc tài khoản Facebook của bạn cần quyền MODERATE trên fanpage.',
+        );
+      }
+      if (normalized.includes('sufficient permission')) {
+        return new BadRequestException(
+          `Thiếu quyền Facebook để thao tác bình luận. Vui lòng vào Shops → "Liên kết lại Facebook" và cấp quyền pages_manage_engagement. (${message})`,
+        );
+      }
+      return new BadRequestException(
+        `Facebook từ chối thao tác bình luận. (${message})`,
       );
     }
     if (code === 4 || code === 17 || code === 32) {
@@ -1446,6 +1482,116 @@ export class FacebookOAuthService {
     );
   }
 
+  /** Gửi tin nhắn riêng tư tới người bình luận qua Send API (hỗ trợ text + ảnh/file). */
+  async sendPrivateReplyToComment(
+    pageId: string,
+    commentId: string,
+    pageAccessToken: string,
+    input: {
+      text?: string;
+      attachment?: { type: 'image' | 'video' | 'audio' | 'file'; url: string };
+      postId?: string;
+    },
+  ): Promise<SendMessageResponse> {
+    if (!pageId?.trim()) {
+      throw new BadRequestException('Missing pageId');
+    }
+    if (!commentId?.trim()) {
+      throw new BadRequestException('Missing commentId');
+    }
+    if (!isValidFacebookCommentId(commentId)) {
+      throw new BadRequestException(
+        'commentId không hợp lệ — cần định dạng Facebook (ví dụ: 123456_789012)',
+      );
+    }
+    const text = (input.text ?? '').trim();
+    const attachment = input.attachment;
+    if (!text && !attachment?.url?.trim()) {
+      throw new BadRequestException('Message text or attachment is required');
+    }
+    if (!pageAccessToken?.trim()) {
+      throw new BadRequestException('Missing pageAccessToken');
+    }
+
+    const message: Record<string, unknown> = {};
+    if (text) message.text = text;
+    if (attachment?.url?.trim()) {
+      message.attachment = {
+        type: attachment.type,
+        payload: {
+          url: attachment.url,
+          is_reusable: true,
+        },
+      };
+    }
+
+    const triedIds: string[] = [];
+    const candidates = buildGraphCommentIdCandidates(commentId, input.postId);
+
+    let lastFbError: any = null;
+    for (const candidateId of candidates) {
+      triedIds.push(candidateId);
+      try {
+        return await got
+          .post(
+            `https://graph.facebook.com/${this.graphApiVersion}/${pageId}/messages`,
+            {
+              searchParams: { access_token: pageAccessToken },
+              json: {
+                recipient: { comment_id: candidateId },
+                message,
+              },
+              timeout: { request: 15_000 },
+            },
+          )
+          .json<SendMessageResponse>();
+      } catch (err: any) {
+        const body = err?.response?.body;
+        lastFbError =
+          typeof body === 'string'
+            ? body.startsWith('{')
+              ? JSON.parse(body)
+              : { message: body }
+            : body;
+      }
+    }
+
+    // Fallback: legacy private_replies (text-only).
+    if (text && !attachment) {
+      for (const candidateId of candidates) {
+        try {
+          const legacy = await got
+            .post(
+              `https://graph.facebook.com/${this.graphApiVersion}/${candidateId}/private_replies`,
+              {
+                searchParams: { access_token: pageAccessToken },
+                json: { message: text },
+                timeout: { request: 15_000 },
+              },
+            )
+            .json<{ id?: string }>();
+          return {
+            message_id: legacy.id,
+            recipient_id: undefined,
+          };
+        } catch (err: any) {
+          const body = err?.response?.body;
+          lastFbError =
+            typeof body === 'string'
+              ? body.startsWith('{')
+                ? JSON.parse(body)
+                : { message: body }
+              : body;
+        }
+      }
+    }
+
+    this.logger.error(
+      `Failed to send private reply. pageId=${pageId} inputId=${commentId} tried=${triedIds.join(',')} error=${JSON.stringify(lastFbError ?? {})}`,
+    );
+    throw this.mapFbError(lastFbError?.error);
+  }
+
   async sendAttachmentMessageToPsid(
     psid: string,
     pageAccessToken: string,
@@ -1493,7 +1639,7 @@ export class FacebookOAuthService {
       await got.post(
         `https://graph.facebook.com/${this.graphApiVersion}/${commentId}/likes`,
         {
-          searchParams: { access_token: pageAccessToken },
+          form: { access_token: pageAccessToken },
           timeout: { request: 15_000 },
         },
       );
@@ -1514,11 +1660,10 @@ export class FacebookOAuthService {
     }
   }
 
-  /** Ẩn / hiện bình luận trên Facebook. */
-  async setCommentHidden(
+  /** Bỏ thích bình luận (Page unlike comment). */
+  async unlikeComment(
     commentId: string,
     pageAccessToken: string,
-    isHidden: boolean,
   ): Promise<{ success: boolean }> {
     if (!commentId?.trim()) {
       throw new BadRequestException('Missing commentId');
@@ -1533,13 +1678,10 @@ export class FacebookOAuthService {
     }
 
     try {
-      await got.post(
-        `https://graph.facebook.com/${this.graphApiVersion}/${commentId}`,
+      await got.delete(
+        `https://graph.facebook.com/${this.graphApiVersion}/${commentId}/likes`,
         {
-          searchParams: {
-            access_token: pageAccessToken,
-            is_hidden: isHidden ? 'true' : 'false',
-          },
+          searchParams: { access_token: pageAccessToken },
           timeout: { request: 15_000 },
         },
       );
@@ -1553,11 +1695,269 @@ export class FacebookOAuthService {
             : { message: body }
           : body;
       this.logger.error(
-        `Failed to ${isHidden ? 'hide' : 'unhide'} comment ${commentId}`,
+        `Failed to unlike comment ${commentId}`,
         fbError ?? err.message,
       );
       throw this.mapFbError(fbError?.error);
     }
+  }
+
+  /** Thả emoji reaction lên tin nhắn Messenger của khách. */
+  async reactToMessengerMessage(
+    psid: string,
+    pageAccessToken: string,
+    messageId: string,
+    emoji: string,
+  ): Promise<{ recipient_id?: string }> {
+    if (!psid?.trim()) {
+      throw new BadRequestException('Missing psid');
+    }
+    if (!messageId?.trim()) {
+      throw new BadRequestException('Missing messageId');
+    }
+    if (!emoji?.trim()) {
+      throw new BadRequestException('Missing emoji reaction');
+    }
+    if (!pageAccessToken?.trim()) {
+      throw new BadRequestException('Missing pageAccessToken');
+    }
+
+    try {
+      return await got
+        .post(
+          `https://graph.facebook.com/${this.graphApiVersion}/me/messages`,
+          {
+            searchParams: { access_token: pageAccessToken },
+            json: {
+              recipient: { id: psid },
+              sender_action: 'react',
+              payload: {
+                message_id: messageId,
+                reaction: emoji,
+              },
+            },
+            timeout: { request: 15_000 },
+          },
+        )
+        .json<{ recipient_id?: string }>();
+    } catch (err: any) {
+      const body = err?.response?.body;
+      const fbError =
+        typeof body === 'string'
+          ? body.startsWith('{')
+            ? JSON.parse(body)
+            : { message: body }
+          : body;
+      this.logger.error(
+        `Failed to react to message ${messageId}`,
+        fbError ?? err.message,
+      );
+      throw this.mapFbError(fbError?.error);
+    }
+  }
+
+  /** Bỏ emoji reaction trên tin nhắn Messenger. */
+  async unreactToMessengerMessage(
+    psid: string,
+    pageAccessToken: string,
+    messageId: string,
+  ): Promise<{ recipient_id?: string }> {
+    if (!psid?.trim()) {
+      throw new BadRequestException('Missing psid');
+    }
+    if (!messageId?.trim()) {
+      throw new BadRequestException('Missing messageId');
+    }
+    if (!pageAccessToken?.trim()) {
+      throw new BadRequestException('Missing pageAccessToken');
+    }
+
+    try {
+      return await got
+        .post(
+          `https://graph.facebook.com/${this.graphApiVersion}/me/messages`,
+          {
+            searchParams: { access_token: pageAccessToken },
+            json: {
+              recipient: { id: psid },
+              sender_action: 'unreact',
+              payload: {
+                message_id: messageId,
+              },
+            },
+            timeout: { request: 15_000 },
+          },
+        )
+        .json<{ recipient_id?: string }>();
+    } catch (err: any) {
+      const body = err?.response?.body;
+      const fbError =
+        typeof body === 'string'
+          ? body.startsWith('{')
+            ? JSON.parse(body)
+            : { message: body }
+          : body;
+      this.logger.error(
+        `Failed to unreact message ${messageId}`,
+        fbError ?? err.message,
+      );
+      throw this.mapFbError(fbError?.error);
+    }
+  }
+
+  /** Ẩn / hiện bình luận trên Facebook. */
+  async setCommentHidden(
+    commentId: string,
+    pageAccessToken: string,
+    isHidden: boolean,
+    postId?: string | null,
+  ): Promise<{ success: boolean }> {
+    if (!commentId?.trim()) {
+      throw new BadRequestException('Missing commentId');
+    }
+    if (!isValidFacebookCommentId(commentId)) {
+      throw new BadRequestException(
+        'commentId không hợp lệ — cần định dạng Facebook (ví dụ: 123456_789012)',
+      );
+    }
+    if (!pageAccessToken?.trim()) {
+      throw new BadRequestException('Missing pageAccessToken');
+    }
+
+    const candidates = buildGraphCommentIdCandidates(commentId, postId);
+    let lastFbError: {
+      error?: {
+        code?: number;
+        message?: string;
+        error_subcode?: number;
+        error_user_msg?: string;
+      };
+    } | null = null;
+    let sawCannotHide = false;
+
+    for (const candidateId of candidates) {
+      const meta = await this.fetchCommentHideMeta(candidateId, pageAccessToken);
+      const graphId = meta?.id ?? candidateId;
+
+      if (isHidden && meta?.can_hide === false) {
+        sawCannotHide = true;
+        continue;
+      }
+
+      // Facebook đã ở trạng thái mong muốn — coi như thành công (tránh lỗi 1446036 khi ẩn lại).
+      if (meta?.is_hidden !== undefined) {
+        const hiddenNow = meta.is_hidden === true;
+        if (hiddenNow === isHidden) {
+          return { success: true };
+        }
+      }
+
+      try {
+        const response = await got.post<{ success?: boolean }>(
+          `https://graph.facebook.com/${this.graphApiVersion}/${graphId}`,
+          {
+            form: {
+              access_token: pageAccessToken,
+              is_hidden: isHidden ? 'true' : 'false',
+            },
+            timeout: { request: 15_000 },
+          },
+        ).json<{ success?: boolean }>();
+
+        const verified = await this.fetchCommentHideMeta(
+          graphId,
+          pageAccessToken,
+        );
+
+        if (verified?.is_hidden !== undefined) {
+          const hiddenNow = verified.is_hidden === true;
+          if (hiddenNow !== isHidden) {
+            throw new BadRequestException(
+              isHidden
+                ? 'Facebook không ẩn được bình luận này (có thể thiếu quyền MODERATE hoặc id không hợp lệ).'
+                : 'Facebook không hiện lại được bình luận này.',
+            );
+          }
+        } else if (response?.success === false) {
+          throw new BadRequestException(
+            isHidden
+              ? 'Facebook từ chối ẩn bình luận.'
+              : 'Facebook từ chối hiện bình luận.',
+          );
+        }
+
+        return { success: true };
+      } catch (err: any) {
+        if (err instanceof BadRequestException) throw err;
+        const body = err?.response?.body;
+        lastFbError =
+          typeof body === 'string'
+            ? body.startsWith('{')
+              ? JSON.parse(body)
+              : { error: { message: body } }
+            : body;
+        const subcode = lastFbError?.error?.error_subcode;
+        // Bình luận đã ẩn trên FB nhưng app chưa đồng bộ — không coi là lỗi.
+        if (isHidden && subcode === 1446036) {
+          return { success: true };
+        }
+        this.logger.warn(
+          `Hide/unhide attempt failed for candidate ${candidateId}`,
+          lastFbError ?? err.message,
+        );
+      }
+    }
+
+    if (sawCannotHide) {
+      throw new BadRequestException(
+        'Facebook không cho phép ẩn bình luận này (can_hide=false). Thường gặp với bình luận của fanpage hoặc một số loại bài viết.',
+      );
+    }
+
+    this.logger.error(
+      `Failed to ${isHidden ? 'hide' : 'unhide'} comment ${commentId}`,
+      lastFbError ?? {},
+    );
+    throw this.mapFbError(lastFbError?.error);
+  }
+
+  private async fetchCommentHideMeta(
+    commentId: string,
+    pageAccessToken: string,
+  ): Promise<{ id: string; is_hidden?: boolean; can_hide?: boolean } | null> {
+    try {
+      return await got
+        .get(
+          `https://graph.facebook.com/${this.graphApiVersion}/${commentId}`,
+          {
+            searchParams: {
+              access_token: pageAccessToken,
+              fields: 'id,is_hidden,can_hide',
+            },
+            timeout: { request: 15_000 },
+          },
+        )
+        .json<{ id: string; is_hidden?: boolean; can_hide?: boolean }>();
+    } catch {
+      return null;
+    }
+  }
+
+  private buildCommentPublishSearchParams(
+    pageAccessToken: string,
+    input: { message?: string; attachmentUrl?: string },
+  ): Record<string, string> {
+    const params: Record<string, string> = {
+      access_token: pageAccessToken,
+    };
+    const message = input.message?.trim();
+    const attachmentUrl = input.attachmentUrl?.trim();
+    if (message) params.message = message;
+    if (attachmentUrl) params.attachment_url = attachmentUrl;
+    if (!message && !attachmentUrl) {
+      throw new BadRequestException('Comment message or attachment is required');
+    }
+    return params;
   }
 
   /** Bình luận mới trực tiếp trên bài viết (không phải reply). */
@@ -1565,6 +1965,7 @@ export class FacebookOAuthService {
     postId: string,
     pageAccessToken: string,
     message: string,
+    attachmentUrl?: string,
   ): Promise<CreateCommentResponse> {
     if (!postId?.trim()) {
       throw new BadRequestException('Missing postId');
@@ -1572,19 +1973,16 @@ export class FacebookOAuthService {
     if (!pageAccessToken?.trim()) {
       throw new BadRequestException('Missing pageAccessToken');
     }
-    if (!message?.trim()) {
-      throw new BadRequestException('Comment message is empty');
-    }
 
     try {
       return await got
         .post(
           `https://graph.facebook.com/${this.graphApiVersion}/${postId}/comments`,
           {
-            searchParams: {
-              access_token: pageAccessToken,
-              message,
-            },
+            searchParams: this.buildCommentPublishSearchParams(
+              pageAccessToken,
+              { message, attachmentUrl },
+            ),
             timeout: { request: 15_000 },
           },
         )
@@ -1609,6 +2007,8 @@ export class FacebookOAuthService {
     commentId: string,
     pageAccessToken: string,
     message: string,
+    attachmentUrl?: string,
+    postId?: string,
   ): Promise<CreateCommentResponse> {
     if (!commentId?.trim()) {
       throw new BadRequestException('Missing commentId');
@@ -1621,21 +2021,9 @@ export class FacebookOAuthService {
     if (!pageAccessToken?.trim()) {
       throw new BadRequestException('Missing pageAccessToken');
     }
-    if (!message?.trim()) {
-      throw new BadRequestException('Reply message is empty');
-    }
 
     const triedIds: string[] = [];
-    const candidates = Array.from(
-      new Set(
-        [
-          commentId,
-          // Some sources store comment IDs as "<objectId>_<commentNumericId>".
-          // For a subset of endpoints/pages, the numeric segment is required.
-          commentId.includes('_') ? commentId.split('_').at(-1) ?? '' : '',
-        ].filter((id) => id && id.trim()),
-      ),
-    );
+    const candidates = buildGraphCommentIdCandidates(commentId, postId);
 
     let lastFbError: any = null;
     for (const candidateId of candidates) {
@@ -1645,10 +2033,10 @@ export class FacebookOAuthService {
           .post(
             `https://graph.facebook.com/${this.graphApiVersion}/${candidateId}/comments`,
             {
-              searchParams: {
-                access_token: pageAccessToken,
-                message,
-              },
+              searchParams: this.buildCommentPublishSearchParams(
+                pageAccessToken,
+                { message, attachmentUrl },
+              ),
               timeout: { request: 15_000 },
             },
           )

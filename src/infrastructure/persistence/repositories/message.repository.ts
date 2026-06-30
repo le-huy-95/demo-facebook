@@ -15,7 +15,7 @@ function toPersistData(data: WebhookEventCreateData): Prisma.WebhookEventCreateI
 }
 
 /**
- * Repository message_history — demo dùng Prisma/SQLite, production = Cassandra.
+ * Repository message_history — demo dùng Prisma/PostgreSQL.
  * Chỉ đọc/ghi DB, không gọi Facebook Graph API.
  */
 @Injectable()

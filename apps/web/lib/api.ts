@@ -59,7 +59,22 @@ export interface WebhookMessage {
   createdAt: string;
   /** ACTIVE | HIDDEN | DELETED */
   status?: string | null;
+  /** Ghim tin nhắn Messenger */
+  isPinned?: boolean;
+  /** Reaction emoji trên tin nhắn Messenger */
+  reactions?: MessageReactionView[];
 }
+
+export interface MessageReactionView {
+  emoji: string;
+  reactorId: string;
+}
+
+export interface ThreadMessagesMeta {
+  pinnedMessageIds: string[];
+}
+
+export const MESSENGER_REACTION_EMOJIS = ['👍', '❤️', '😂', '😮', '😢', '😡'] as const;
 
 export async function getAuthStatus() {
   const res = await apiFetch(`${API_BASE}/messages/auth/status`, {
@@ -167,6 +182,32 @@ export async function getConversations(
   }>;
 }
 
+export async function resolveMessengerPsid(
+  pageId: string,
+  input: { commentAuthorId?: string; senderName?: string },
+) {
+  const qs = new URLSearchParams({ pageId });
+  if (input.commentAuthorId) qs.set('commentAuthorId', input.commentAuthorId);
+  if (input.senderName) qs.set('senderName', input.senderName);
+
+  const res = await apiFetch(
+    `${API_BASE}/conversations/resolve-messenger-psid?${qs}`,
+    { cache: 'no-store' },
+  );
+  if (!res.ok) {
+    throw new Error(
+      await readApiErrorMessage(res, 'Không tìm được hội thoại Messenger'),
+    );
+  }
+  return res.json() as Promise<{
+    data: {
+      psid: string | null;
+      threadId: string | null;
+      hasExistingConversation: boolean;
+    };
+  }>;
+}
+
 async function readApiErrorMessage(
   res: Response,
   fallback: string,
@@ -204,7 +245,73 @@ export async function getConversationMessages(
   return res.json() as Promise<{
     data: WebhookMessage[];
     paging: MessagesPaging;
+    meta?: ThreadMessagesMeta;
   }>;
+}
+
+export async function reactToMessengerMessage(
+  pageId: string,
+  threadId: string,
+  messageId: string,
+  emoji: string,
+) {
+  const qs = new URLSearchParams({ pageId, threadId, emoji });
+  const res = await apiFetch(
+    `${API_BASE}/conversations/messages/${encodeURIComponent(messageId)}/reaction?${qs}`,
+    { method: 'POST', cache: 'no-store' },
+  );
+  if (!res.ok) {
+    throw new Error(await readApiErrorMessage(res, 'Không thả được emoji'));
+  }
+  return res.json() as Promise<{ data: { success: boolean; emoji: string } }>;
+}
+
+export async function unreactToMessengerMessage(
+  pageId: string,
+  threadId: string,
+  messageId: string,
+) {
+  const qs = new URLSearchParams({ pageId, threadId });
+  const res = await apiFetch(
+    `${API_BASE}/conversations/messages/${encodeURIComponent(messageId)}/unreact?${qs}`,
+    { method: 'POST', cache: 'no-store' },
+  );
+  if (!res.ok) {
+    throw new Error(await readApiErrorMessage(res, 'Không bỏ được emoji'));
+  }
+  return res.json() as Promise<{ data: { success: boolean } }>;
+}
+
+export async function pinMessengerMessage(
+  pageId: string,
+  threadId: string,
+  messageId: string,
+) {
+  const qs = new URLSearchParams({ pageId, threadId });
+  const res = await apiFetch(
+    `${API_BASE}/conversations/messages/${encodeURIComponent(messageId)}/pin?${qs}`,
+    { method: 'POST', cache: 'no-store' },
+  );
+  if (!res.ok) {
+    throw new Error(await readApiErrorMessage(res, 'Không ghim được tin nhắn'));
+  }
+  return res.json() as Promise<{ data: { success: boolean; pinned: boolean } }>;
+}
+
+export async function unpinMessengerMessage(
+  pageId: string,
+  threadId: string,
+  messageId: string,
+) {
+  const qs = new URLSearchParams({ pageId, threadId });
+  const res = await apiFetch(
+    `${API_BASE}/conversations/messages/${encodeURIComponent(messageId)}/unpin?${qs}`,
+    { method: 'POST', cache: 'no-store' },
+  );
+  if (!res.ok) {
+    throw new Error(await readApiErrorMessage(res, 'Không bỏ ghim được tin nhắn'));
+  }
+  return res.json() as Promise<{ data: { success: boolean; pinned: boolean } }>;
 }
 
 export async function getPostPreview(pageId: string, postId: string) {
@@ -237,7 +344,7 @@ export async function syncComments(pageId: string, force = false) {
   }>;
 }
 
-export type CommentAction = 'like' | 'hide' | 'unhide';
+export type CommentAction = 'like' | 'unlike' | 'hide' | 'unhide';
 
 export async function performCommentAction(
   pageId: string,

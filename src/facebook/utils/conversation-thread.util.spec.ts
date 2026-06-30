@@ -1,5 +1,8 @@
 import type { WebhookEvent } from '@prisma/client';
-import { aggregateConversations } from './conversation-thread.util';
+import {
+  aggregateConversations,
+  buildFeedCommentThreadId,
+} from './conversation-thread.util';
 
 function makeEvent(
   overrides: Partial<WebhookEvent> & Pick<WebhookEvent, 'id' | 'direction' | 'createdAt'>,
@@ -78,5 +81,40 @@ describe('aggregateConversations', () => {
     expect(threads[0]?.preview).toBe('Message deleted');
     expect(threads[0]?.messageCount).toBe(2);
     expect(threads[0]?.unreadCount).toBe(1);
+  });
+
+  it('groups feed comments from the same customer on one post into one thread', () => {
+    const rootComment = '111_222';
+    const replyComment = '111_333';
+    const threads = aggregateConversations([
+      makeEvent({
+        id: 'root-comment',
+        eventType: 'FEED_COMMENT',
+        direction: 'IN',
+        senderId: 'customer-9',
+        postId: 'page-1_999',
+        commentId: rootComment,
+        parentCommentId: null,
+        msgType: 'feed.comment',
+        createdAt: new Date('2026-06-26T01:00:00.000Z'),
+      }),
+      makeEvent({
+        id: 'reply-comment',
+        eventType: 'FEED_COMMENT',
+        direction: 'IN',
+        senderId: 'customer-9',
+        postId: 'page-1_999',
+        commentId: replyComment,
+        parentCommentId: rootComment,
+        msgType: 'feed.comment',
+        createdAt: new Date('2026-06-26T02:00:00.000Z'),
+      }),
+    ]);
+
+    expect(threads).toHaveLength(1);
+    expect(threads[0]?.id).toBe(
+      buildFeedCommentThreadId('page-1', 'page-1_999', 'customer-9'),
+    );
+    expect(threads[0]?.messageCount).toBe(2);
   });
 });

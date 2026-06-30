@@ -19,8 +19,10 @@ interface MessageComposerProps {
   commentId?: string | null;
   /** Messenger: mid của tin nhắn đang reply (không dùng cho thread comment). */
   replyToMessageId?: string | null;
-  /** Nội dung rút gọn của bình luận đang trả lời. */
+  /** Nội dung rút gọn của bình luận / tin nhắn đang trả lời. */
   replyPreview?: string | null;
+  /** Nhãn preview (Messenger vs comment). */
+  replyPreviewLabel?: string;
   /** Tag @tên khi trả lời bình luận. */
   replyMentionName?: string | null;
   /** Click vào preview để cuộn tới bình luận gốc. */
@@ -37,6 +39,8 @@ interface MessageComposerProps {
     pending: boolean;
     savedEventId?: string;
     fbMessageId?: string | null;
+    msgType?: string;
+    content?: string;
   }) => void;
   onAck?: (payload: {
     clientMessageId: string;
@@ -47,6 +51,15 @@ interface MessageComposerProps {
   }) => void;
   /** Báo parent đang gửi/upload — chặn hiển thị tin OUT từ socket trước khi xong. */
   onBusyChange?: (busy: boolean) => void;
+}
+
+type AttachmentKind = 'image' | 'video' | 'audio' | 'file';
+
+interface PendingAttachment {
+  file: File;
+  type: AttachmentKind;
+  previewUrl: string | null;
+  loading: boolean;
 }
 
 function SendIcon({ className }: { className?: string }) {
@@ -181,6 +194,7 @@ export function MessageComposer({
   commentId = null,
   replyToMessageId = null,
   replyPreview = null,
+  replyPreviewLabel = 'Trả lời bình luận',
   replyMentionName = null,
   onReplyPreviewClick,
   onClearReply,
@@ -195,13 +209,34 @@ export function MessageComposer({
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const lastMentionKeyRef = useRef<string | null>(null);
 
   const [uploading, setUploading] = useState(false);
+  const [pendingAttachment, setPendingAttachment] =
+    useState<PendingAttachment | null>(null);
+  const pendingPreviewUrlRef = useRef<string | null>(null);
 
   useEffect(() => {
     onBusyChange?.(sending || uploading);
   }, [sending, uploading, onBusyChange]);
+
+  useEffect(() => {
+    return () => {
+      if (pendingPreviewUrlRef.current) {
+        URL.revokeObjectURL(pendingPreviewUrlRef.current);
+        pendingPreviewUrlRef.current = null;
+      }
+    };
+  }, []);
+
+  function clearPendingAttachment() {
+    if (pendingPreviewUrlRef.current) {
+      URL.revokeObjectURL(pendingPreviewUrlRef.current);
+      pendingPreviewUrlRef.current = null;
+    }
+    setPendingAttachment(null);
+  }
 
   // Prefill @tên khi chọn bình luận để trả lời
   useEffect(() => {
@@ -225,21 +260,154 @@ export function MessageComposer({
     if (!commentId) {
       lastMentionKeyRef.current = null;
       setText('');
+      clearPendingAttachment();
     }
   }, [commentId]);
 
-  function inferAttachmentType(
-    mime: string,
-  ): 'image' | 'video' | 'audio' | 'file' {
+  function inferAttachmentType(mime: string): AttachmentKind {
     if (mime.startsWith('image/')) return 'image';
     if (mime.startsWith('video/')) return 'video';
     if (mime.startsWith('audio/')) return 'audio';
     return 'file';
   }
 
+  function buildOptimisticAttachmentPayload(
+    type: AttachmentKind,
+    url: string,
+    caption: string,
+    isCommentThread: boolean,
+    isReply: boolean,
+  ): { msgType: string; content: string } {
+    const trimmed = caption.trim();
+    if (type === 'image') {
+      const payload = trimmed
+        ? { text: trimmed, href: url, type: 'image', title: 'Ảnh' }
+        : { href: url, type: 'image', title: 'Ảnh' };
+      return {
+        msgType: isCommentThread
+          ? isReply
+            ? 'feed.comment.reply.photo'
+            : 'feed.comment.photo'
+          : 'chat.photo',
+        content: JSON.stringify(payload),
+      };
+    }
+    if (type === 'video') {
+      const payload = trimmed
+        ? { text: trimmed, href: url, type: 'video', title: 'Video' }
+        : { href: url, type: 'video', title: 'Video' };
+      return {
+        msgType: isCommentThread
+          ? isReply
+            ? 'feed.comment.reply.video'
+            : 'feed.comment.video'
+          : 'chat.video.msg',
+        content: JSON.stringify(payload),
+      };
+    }
+    const label = type === 'audio' ? 'Audio' : 'Tệp đính kèm';
+    const payload = trimmed
+      ? { text: trimmed, href: url, type, title: label }
+      : { href: url, type, title: label };
+    return {
+      msgType: isCommentThread
+        ? isReply
+          ? 'feed.comment.reply'
+          : 'feed.comment'
+        : type === 'file'
+          ? 'share.file'
+          : 'chat.video.msg',
+      content: JSON.stringify(payload),
+    };
+  }
+
+  const sendAttachment = useCallback(
+    async (attachment: PendingAttachment, caption: string) => {
+      const clientMessageId = `client-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const { file, type } = attachment;
+      const sentText = caption.trim() || file.name;
+      const isCommentThread = threadId.startsWith('comment:');
+      const replyCommentId =
+        commentId && isValidFacebookCommentId(commentId) ? commentId : undefined;
+
+      setUploading(true);
+      setError(null);
+
+      try {
+        const { data } = await uploadFile(file);
+        setUploading(false);
+        setSending(true);
+
+        const ack = await sendThreadMessage({
+          pageId,
+          threadId,
+          commentId: replyCommentId,
+          ...(isCommentThread || replyCommentId
+            ? {}
+            : { replyToMessageId: replyToMessageId ?? undefined }),
+          text: caption.trim() || '',
+          clientMessageId,
+          attachment: { type, url: data.url },
+        });
+
+        onAck?.({
+          clientMessageId,
+          ok: ack.ok,
+          fbMessageId: ack.fbMessageId,
+          savedEventId: ack.savedEventId,
+          error: ack.error,
+        });
+
+        if (!ack.ok) {
+          setError(ack.error ?? 'Gửi file thất bại');
+        } else {
+          const isReply = Boolean(replyCommentId);
+          const optimistic = buildOptimisticAttachmentPayload(
+            type,
+            data.url,
+            caption.trim(),
+            isCommentThread,
+            isReply,
+          );
+          onSent?.({
+            clientMessageId,
+            text: sentText,
+            pending: false,
+            savedEventId: ack.savedEventId,
+            fbMessageId: ack.fbMessageId,
+            msgType: optimistic.msgType,
+            content: optimistic.content,
+          });
+          setText('');
+          clearPendingAttachment();
+        }
+      } catch (e: unknown) {
+        setError(e instanceof Error ? e.message : 'Upload file thất bại');
+      } finally {
+        setSending(false);
+        setUploading(false);
+      }
+    },
+    [
+      pageId,
+      threadId,
+      commentId,
+      replyToMessageId,
+      onSent,
+      onAck,
+    ],
+  );
+
   const handleSend = useCallback(() => {
     const trimmed = text.trim();
-    if (!trimmed || sending || disabled) return;
+    if ((!trimmed && !pendingAttachment) || sending || uploading || disabled) {
+      return;
+    }
+
+    if (pendingAttachment) {
+      void sendAttachment(pendingAttachment, trimmed);
+      return;
+    }
 
     const isCommentThread = threadId.startsWith('comment:');
     const replyCommentId =
@@ -287,7 +455,9 @@ export function MessageComposer({
       });
   }, [
     text,
+    pendingAttachment,
     sending,
+    uploading,
     disabled,
     pageId,
     threadId,
@@ -295,87 +465,61 @@ export function MessageComposer({
     replyToMessageId,
     onSent,
     onAck,
+    sendAttachment,
   ]);
 
-  const handleAttach = useCallback(
-    async (file: File) => {
+  const handleSelectFile = useCallback(
+    (file: File) => {
       if (!allowAttachments || disabled || sending || uploading) return;
-      setUploading(true);
       setError(null);
 
-      const clientMessageId = `client-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       const type = inferAttachmentType(file.type || '');
-      const sentText = text.trim() || file.name;
+      const canPreview = type === 'image' || type === 'video';
 
-      try {
-        const { data } = await uploadFile(file);
-        setSending(true);
-        const ack = await sendThreadMessage({
-          pageId,
-          threadId,
-          commentId:
-            commentId && isValidFacebookCommentId(commentId)
-              ? commentId
-              : undefined,
-          ...(threadId.startsWith('comment:') ||
-          (commentId && isValidFacebookCommentId(commentId))
-            ? {}
-            : { replyToMessageId: replyToMessageId ?? undefined }),
-          text: text.trim() || '',
-          clientMessageId,
-          attachment: { type, url: data.url },
-        });
-        onAck?.({
-          clientMessageId,
-          ok: ack.ok,
-          fbMessageId: ack.fbMessageId,
-          savedEventId: ack.savedEventId,
-          error: ack.error,
-        });
-        if (!ack.ok) {
-          setError(ack.error ?? 'Gửi file thất bại');
-        } else {
-          onSent?.({
-            clientMessageId,
-            text: sentText,
-            pending: false,
-            savedEventId: ack.savedEventId,
-            fbMessageId: ack.fbMessageId,
-          });
-          setText('');
-        }
-      } catch (e: unknown) {
-        setError(e instanceof Error ? e.message : 'Upload file thất bại');
-      } finally {
-        setSending(false);
-        setUploading(false);
+      if (pendingPreviewUrlRef.current) {
+        URL.revokeObjectURL(pendingPreviewUrlRef.current);
+        pendingPreviewUrlRef.current = null;
       }
+
+      setPendingAttachment({
+        file,
+        type,
+        previewUrl: null,
+        loading: canPreview,
+      });
+
+      if (!canPreview) return;
+
+      requestAnimationFrame(() => {
+        const previewUrl = URL.createObjectURL(file);
+        pendingPreviewUrlRef.current = previewUrl;
+        setPendingAttachment({
+          file,
+          type,
+          previewUrl,
+          loading: false,
+        });
+      });
     },
-    [
-      allowAttachments,
-      disabled,
-      sending,
-      uploading,
-      pageId,
-      threadId,
-      commentId,
-      replyToMessageId,
-      onSent,
-      onAck,
-      text,
-    ],
+    [allowAttachments, disabled, sending, uploading],
   );
 
   const isReplyingComment = Boolean(commentId);
+  const isReplyingMessenger = Boolean(replyToMessageId && !commentId);
   const isCommentThread = threadId.startsWith('comment:');
-  const canSend = Boolean(text.trim());
+  const showReplyPreview = isReplyingComment || isReplyingMessenger;
+  const canSend = Boolean(text.trim() || pendingAttachment);
   const isBusy = sending || uploading;
+  const attachmentPreviewLoading = Boolean(
+    pendingAttachment?.loading && !pendingAttachment.previewUrl,
+  );
 
   return (
     <div className="space-y-2">
-      {commentId && (
+      {showReplyPreview && (
         <CommentReplyPreview
-          preview={replyPreview?.trim() || 'Bình luận'}
+          preview={replyPreview?.trim() || (isReplyingMessenger ? 'Tin nhắn' : 'Bình luận')}
+          label={replyPreviewLabel}
           variant="composer"
           onClick={onReplyPreviewClick}
           actions={
@@ -414,7 +558,56 @@ export function MessageComposer({
             size="sm"
             className="mt-1"
           />
-          <div className="relative min-w-0 flex-1">
+          <div className="relative min-w-0 flex-1 space-y-2">
+            {pendingAttachment && (
+              <div className="relative overflow-hidden rounded-xl border border-[#e5e7eb] bg-[#f9fafb]">
+                {pendingAttachment.type === 'image' && pendingAttachment.previewUrl ? (
+                  // eslint-disable-next-line @next/next/no-img-element
+                  <img
+                    src={pendingAttachment.previewUrl}
+                    alt={pendingAttachment.file.name}
+                    className="max-h-40 w-full object-contain"
+                  />
+                ) : pendingAttachment.type === 'video' && pendingAttachment.previewUrl ? (
+                  <video
+                    src={pendingAttachment.previewUrl}
+                    className="max-h-40 w-full object-contain"
+                    muted
+                    playsInline
+                  />
+                ) : (
+                  <div className="flex min-h-[72px] items-center gap-3 px-4 py-3">
+                    <span className="text-2xl" aria-hidden>
+                      {pendingAttachment.type === 'audio' ? '🎵' : '📎'}
+                    </span>
+                    <div className="min-w-0">
+                      <p className="truncate text-sm font-medium text-[#111827]">
+                        {pendingAttachment.file.name}
+                      </p>
+                      <p className="text-xs text-[#6b7280]">
+                        {pendingAttachment.type === 'audio' ? 'Audio' : 'Tệp đính kèm'}
+                      </p>
+                    </div>
+                  </div>
+                )}
+                {attachmentPreviewLoading && (
+                  <div className="absolute inset-0 flex items-center justify-center bg-white/70">
+                    <LoadingSpinner className="h-6 w-6 text-[#3b82f6]" />
+                  </div>
+                )}
+                {!isBusy && (
+                  <button
+                    type="button"
+                    aria-label="Bỏ đính kèm"
+                    onClick={clearPendingAttachment}
+                    className="absolute top-2 right-2 inline-flex h-7 w-7 items-center justify-center rounded-full bg-[#111827]/70 text-white transition hover:bg-[#111827]"
+                  >
+                    <CloseIcon className="h-4 w-4" />
+                  </button>
+                )}
+              </div>
+            )}
+            <div className="relative">
             <textarea
               ref={textareaRef}
               value={text}
@@ -433,9 +626,13 @@ export function MessageComposer({
                   ? 'Đang gửi...'
                   : uploading
                     ? 'Đang upload...'
+                    : pendingAttachment
+                      ? 'Thêm chú thích (tuỳ chọn)...'
                     : commentId
                       ? 'Trả lời bình luận... (Enter để gửi)'
-                      : isCommentThread
+                      : isReplyingMessenger
+                        ? 'Trả lời tin nhắn... (Enter để gửi)'
+                        : isCommentThread
                         ? 'Viết bình luận mới trên bài viết... (Enter để gửi)'
                         : 'Nhập tin nhắn... (Enter để gửi, Shift+Enter xuống dòng)'
               }
@@ -451,7 +648,38 @@ export function MessageComposer({
                 <LoadingSpinner className="h-5 w-5" />
               </span>
             )}
+            </div>
           </div>
+          <div className="flex shrink-0 items-end gap-2">
+            {allowAttachments ? (
+              <>
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  className="hidden"
+                  disabled={disabled || sending || uploading}
+                  onChange={(e) => {
+                    const f = e.target.files?.[0];
+                    if (f) handleSelectFile(f);
+                    e.currentTarget.value = '';
+                  }}
+                />
+                <ComposerIconButton
+                  label={
+                    pendingAttachment ? 'Đổi file / ảnh' : 'Đính kèm file / ảnh'
+                  }
+                  icon={<PaperclipIcon className="h-5 w-5" />}
+                  onClick={() => fileInputRef.current?.click()}
+                  disabled={disabled || isBusy}
+                />
+              </>
+            ) : iconOnlyActions ? (
+              <ComposerIconButton
+                label="Bình luận chỉ hỗ trợ văn bản. Dùng Messenger để gửi ảnh/file."
+                icon={<PaperclipIcon className="h-5 w-5" />}
+                disabled
+              />
+            ) : null}
           {iconOnlyActions ? (
             <ComposerIconButton
               label={
@@ -461,7 +689,9 @@ export function MessageComposer({
                     ? 'Đang upload'
                     : commentId
                       ? 'Gửi phản hồi'
-                      : isCommentThread
+                      : isReplyingMessenger
+                        ? 'Gửi trả lời'
+                        : isCommentThread
                         ? 'Gửi bình luận mới'
                         : 'Gửi'
               }
@@ -486,37 +716,15 @@ export function MessageComposer({
               {sending ? 'Đang gửi...' : uploading ? 'Đang upload...' : 'Gửi'}
             </button>
           )}
+          </div>
         </div>
+        {!allowAttachments && !iconOnlyActions && (
         <div className="mt-2 flex items-center justify-between gap-2">
-          {allowAttachments ? (
-            <label className="inline-flex cursor-pointer items-center gap-2 rounded-xl px-2 py-1 text-sm text-[#374151] hover:bg-[#f9fafb]">
-              <input
-                type="file"
-                className="hidden"
-                disabled={disabled || sending || uploading}
-                onChange={(e) => {
-                  const f = e.target.files?.[0];
-                  if (f) void handleAttach(f);
-                  e.currentTarget.value = '';
-                }}
-              />
-              <span className="text-base">📎</span>
-              <span>
-                {uploading ? 'Đang upload...' : 'Đính kèm file / ảnh'}
-              </span>
-            </label>
-          ) : iconOnlyActions ? (
-            <ComposerIconButton
-              label="Bình luận chỉ hỗ trợ văn bản. Dùng Messenger để gửi ảnh/file."
-              icon={<PaperclipIcon className="h-4 w-4" />}
-              disabled
-            />
-          ) : (
             <p className="text-xs text-[#9ca3af]">
               Bình luận chỉ hỗ trợ văn bản. Dùng Messenger để gửi ảnh/file.
             </p>
-          )}
         </div>
+        )}
       </div>
       {error && <p className="text-xs text-[#dc2626]">{error}</p>}
     </div>

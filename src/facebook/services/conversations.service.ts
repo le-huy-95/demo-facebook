@@ -14,18 +14,28 @@ import {
   type GraphConversationMessage,
   type GraphPostComment,
 } from './facebook-oauth.service';
+import { FacebookGraphApiService } from './facebook-graph-api.service';
 import { FacebookRepoService } from './facebook-repo.service';
 import { RedisCacheService, GRAPH_CACHE_TTL_SECONDS } from '../../redis/redis-cache.service';
 import {
   aggregateConversations,
+  buildFeedCommentThreadId,
   buildThreadEventWhere,
   isGenericSenderName,
+  normalizeCommentThreadId,
   parseThreadId,
   pickBetterSenderName,
   type ConversationThread,
 } from '../utils/conversation-thread.util';
-import { isValidFacebookCommentId } from '../utils/facebook-comment-id.util';
-import { EVENT_STATUS_DELETED } from '../utils/event-visibility.util';
+import { buildMessengerThreadId } from '../utils/messenger-thread.util';
+import {
+  serializeFeedCommentContent,
+  serializeFeedCommentFromRawPayload,
+  feedCommentContentHasMedia,
+} from '../utils/feed-comment-content.util';
+import { isValidFacebookCommentId, buildGraphCommentIdCandidates, facebookCommentIdsMatch } from '../utils/facebook-comment-id.util';
+import { formatConversationThreadPreview } from '../utils/thread-preview.util';
+import { EVENT_STATUS_ACTIVE, EVENT_STATUS_DELETED, EVENT_STATUS_HIDDEN } from '../utils/event-visibility.util';
 
 export interface FacebookPostPreview {
   id: string;
@@ -39,7 +49,18 @@ export interface FacebookPostPreview {
 
 export type ConversationMessage = MessageHistoryRecord & {
   senderPictureUrl?: string | null;
+  isPinned?: boolean;
+  reactions?: MessageReactionView[];
 };
+
+export interface MessageReactionView {
+  emoji: string;
+  reactorId: string;
+}
+
+export interface ThreadMessagesMeta {
+  pinnedMessageIds: string[];
+}
 
 export interface ThreadMessagesPage {
   messages: ConversationMessage[];
@@ -47,7 +68,17 @@ export interface ThreadMessagesPage {
     hasMore: boolean;
     nextBefore: string | null;
   };
+  meta?: ThreadMessagesMeta;
 }
+
+const ALLOWED_MESSENGER_REACTIONS = new Set([
+  '👍',
+  '❤️',
+  '😂',
+  '😮',
+  '😢',
+  '😡',
+]);
 
 export interface ConversationListPage {
   threads: ConversationThread[];
@@ -74,10 +105,15 @@ export class ConversationsService {
     private readonly prisma: PrismaService,
     private readonly facebookRepo: FacebookRepoService,
     private readonly facebookOAuth: FacebookOAuthService,
+    private readonly graphApi: FacebookGraphApiService,
     private readonly redisCache: RedisCacheService,
     private readonly logger: AppLogger,
   ) {
     this.logger.setContext(ConversationsService.name);
+  }
+
+  async invalidatePageCache(pageId: string, orgId: string): Promise<void> {
+    await this.redisCache.bumpPageRevision(orgId, pageId);
   }
 
   async listByPage(
@@ -151,11 +187,21 @@ export class ConversationsService {
 
     const fromWebhook = aggregateConversations(events, readAtByThread);
 
+    const [fromMessengerGraph, fromCommentGraph] = await Promise.all([
+      this.getCachedMessengerThreads(pageId, orgId, pageRev),
+      this.getCachedCommentThreads(pageId, orgId, pageRev),
+    ]);
+
+    const merged = this.mergeConversationThreads(fromWebhook, [
+      ...fromMessengerGraph,
+      ...fromCommentGraph,
+    ]);
+
     this.logger.log(
-      `[Conversations] Threads from DB only (event-driven): webhook=${fromWebhook.length}`,
+      `[Conversations] Threads merged: webhook=${fromWebhook.length} messenger=${fromMessengerGraph.length} comments=${fromCommentGraph.length} total=${merged.length}`,
     );
 
-    const filtered = fromWebhook.filter((thread) => thread.pageId === pageId);
+    const filtered = merged.filter((thread) => thread.pageId === pageId);
     await this.redisCache.set(
       cacheKey,
       filtered,
@@ -164,7 +210,7 @@ export class ConversationsService {
     return filtered;
   }
 
-  /** @deprecated Graph API không dùng để đọc inbox — giữ stub để tránh break import */
+  /** Graph API messenger threads — cache theo page revision, dùng khi DB chưa có webhook. */
   private async getCachedMessengerThreads(
     pageId: string,
     orgId: string,
@@ -181,7 +227,7 @@ export class ConversationsService {
     return data;
   }
 
-  /** Graph API comment threads — cache theo page revision, chỉ gọi Facebook khi miss. */
+  /** Graph API comment threads — cache theo page revision, dùng khi DB chưa có webhook. */
   private async getCachedCommentThreads(
     pageId: string,
     orgId: string,
@@ -208,24 +254,54 @@ export class ConversationsService {
     options?: { limit?: number; before?: string },
   ): Promise<ThreadMessagesPage> {
     const limit = options?.limit ?? MESSAGE_PAGE_SIZE;
-    const parsed = parseThreadId(threadId);
+    let effectiveThreadId = normalizeCommentThreadId(threadId);
+    let parsed = parseThreadId(effectiveThreadId);
     if (!parsed || parsed.pageId !== pageId) {
       throw new NotFoundException('Cuộc trò chuyện không hợp lệ');
     }
 
+    if (parsed.kind === 'MESSENGER') {
+      const resolved = await this.resolveMessengerPsid(pageId, orgId, {
+        commentAuthorId: parsed.senderId,
+      });
+      if (
+        resolved.psid &&
+        resolved.threadId &&
+        resolved.psid !== parsed.senderId
+      ) {
+        effectiveThreadId = resolved.threadId;
+        parsed = parseThreadId(effectiveThreadId)!;
+      }
+    }
+
     await this.assertPageBelongsToOrg(pageId, orgId);
 
-    const revision = await this.redisCache.getThreadRevision(pageId, threadId);
+    const revision = await this.redisCache.getThreadRevision(
+      pageId,
+      effectiveThreadId,
+    );
     const cacheKey = this.redisCache.threadMessagesKey(
       pageId,
-      threadId,
+      effectiveThreadId,
       revision,
       limit,
       options?.before,
     );
     const cached = await this.redisCache.get<ThreadMessagesPage>(cacheKey);
     if (cached) {
-      await this.markThreadRead(pageId, orgId, threadId);
+      await this.markThreadRead(pageId, orgId, effectiveThreadId);
+      if (parsed.kind === 'FEED_COMMENT') {
+        const messages = this.enrichFeedCommentContent(cached.messages);
+        return {
+          ...cached,
+          messages: await this.applyFeedCommentVisibilityFromGraph(
+            messages,
+            pageId,
+            orgId,
+            parsed.postId ?? '',
+          ),
+        };
+      }
       return cached;
     }
 
@@ -235,7 +311,7 @@ export class ConversationsService {
         pageId,
         orgId,
         parsed.senderId,
-        threadId,
+        effectiveThreadId,
         limit,
         options?.before,
       );
@@ -245,7 +321,7 @@ export class ConversationsService {
         orgId,
         parsed.postId!,
         parsed.senderId,
-        threadId,
+        effectiveThreadId,
         limit,
         options?.before,
         parsed.commentId,
@@ -253,7 +329,7 @@ export class ConversationsService {
     }
 
     await this.redisCache.set(cacheKey, result, GRAPH_CACHE_TTL_SECONDS);
-    await this.markThreadRead(pageId, orgId, threadId);
+    await this.markThreadRead(pageId, orgId, effectiveThreadId);
     return result;
   }
 
@@ -372,9 +448,17 @@ export class ConversationsService {
         const ts = new Date(comment.created_time).getTime();
         if (!Number.isFinite(ts)) continue;
 
-        const rootCommentId = comment.parent?.id ?? comment.id;
-        const threadId = `comment:${pageId}:${postId}:${senderId}:${rootCommentId}`;
+        const threadId = buildFeedCommentThreadId(pageId, postId, senderId);
         const existing = map.get(threadId);
+
+        const serialized = this.serializeGraphCommentContent(comment);
+        const preview = formatConversationThreadPreview({
+          content: serialized.content,
+          msgType: serialized.msgType,
+          eventType: 'FEED_COMMENT',
+          direction: 'IN',
+          senderName: comment.from?.name ?? 'Khách hàng',
+        });
 
         if (!existing) {
           map.set(threadId, {
@@ -384,10 +468,10 @@ export class ConversationsService {
             senderId,
             senderName: comment.from?.name ?? 'Khách hàng',
             senderPictureUrl: extractGraphPictureUrl(comment.from),
-            preview: comment.message ?? '',
+            preview,
             lastMessageAt: comment.created_time,
             postId,
-            commentId: rootCommentId,
+            commentId: comment.id,
             messageCount: 1,
             unreadCount: 0,
             _latest: ts,
@@ -399,7 +483,7 @@ export class ConversationsService {
         if (ts >= existing._latest) {
           existing._latest = ts;
           existing.lastMessageAt = comment.created_time;
-          existing.preview = comment.message ?? existing.preview;
+          existing.preview = preview;
           if (senderId !== pageId) {
             existing.commentId = comment.id;
           }
@@ -599,7 +683,7 @@ export class ConversationsService {
     limit: number,
     before?: string,
   ): Promise<ThreadMessagesPage> {
-    return this.getWebhookThreadMessages(
+    const result = await this.getWebhookThreadMessages(
       threadId,
       pageId,
       orgId,
@@ -607,9 +691,81 @@ export class ConversationsService {
       limit,
       before,
     );
+
+    const needsGraphFallback =
+      result.messages.length === 0 ||
+      (!before && result.messages.length < Math.min(limit, 3));
+
+    if (needsGraphFallback) {
+      const graphResult = await this.getMessengerThreadMessagesFromGraph(
+        pageId,
+        orgId,
+        customerPsid,
+        limit,
+        before,
+      );
+      if (graphResult.messages.length > 0) {
+        const mergedMessages = this.mergeThreadMessages(
+          result.messages as WebhookEvent[],
+          graphResult.messages,
+        );
+        const sliced = mergedMessages.slice(-limit);
+        const oldest = sliced[0];
+        const graphMeta = before
+          ? undefined
+          : await this.loadMessengerThreadMeta(pageId, threadId, orgId);
+        const pinnedSet = new Set(graphMeta?.pinnedMessageIds ?? []);
+        const reactionsByMessage = before
+          ? new Map<string, MessageReactionView[]>()
+          : await this.loadMessengerReactions(pageId, threadId);
+
+        return {
+          messages: sliced.map((msg) => {
+            const messageId = msg.messageId?.trim();
+            if (!messageId) return msg;
+            return {
+              ...msg,
+              isPinned: pinnedSet.has(messageId),
+              reactions: reactionsByMessage.get(messageId) ?? [],
+            };
+          }),
+          paging: {
+            hasMore: graphResult.paging.hasMore || result.paging.hasMore,
+            nextBefore:
+              result.paging.nextBefore ?? graphResult.paging.nextBefore,
+          },
+          meta: graphMeta,
+        };
+      }
+    }
+
+    if (before) {
+      return result;
+    }
+
+    const meta = await this.loadMessengerThreadMeta(pageId, threadId, orgId);
+    const pinnedSet = new Set(meta.pinnedMessageIds);
+    const reactionsByMessage = await this.loadMessengerReactions(
+      pageId,
+      threadId,
+    );
+
+    return {
+      ...result,
+      messages: result.messages.map((msg) => {
+        const messageId = msg.messageId?.trim();
+        if (!messageId) return msg;
+        return {
+          ...msg,
+          isPinned: pinnedSet.has(messageId),
+          reactions: reactionsByMessage.get(messageId) ?? [],
+        };
+      }),
+      meta,
+    };
   }
 
-  /** @deprecated Không đọc comment từ Graph — chỉ DB */
+  /** Kiểm tra comment thuộc thread khách trên bài viết (dùng khi đọc từ Graph API). */
   private commentBelongsToThread(
     comment: GraphPostComment,
     pageId: string,
@@ -636,7 +792,7 @@ export class ConversationsService {
     before?: string,
     _rootCommentId?: string,
   ): Promise<ThreadMessagesPage> {
-    return this.getWebhookThreadMessages(
+    const result = await this.getWebhookThreadMessages(
       threadId,
       pageId,
       orgId,
@@ -644,6 +800,151 @@ export class ConversationsService {
       limit,
       before,
     );
+
+    if (result.messages.length > 0) {
+      return {
+        ...result,
+        messages: await this.applyFeedCommentVisibilityFromGraph(
+          result.messages,
+          pageId,
+          orgId,
+          postId,
+        ),
+      };
+    }
+
+    return this.getCommentThreadMessagesFromGraph(
+      pageId,
+      orgId,
+      postId,
+      customerId,
+      limit,
+      before,
+    );
+  }
+
+  private async getMessengerThreadMessagesFromGraph(
+    pageId: string,
+    orgId: string,
+    customerPsid: string,
+    limit: number,
+    before?: string,
+  ): Promise<ThreadMessagesPage> {
+    const token = await this.getPageAccessToken(pageId, orgId);
+    if (!token) {
+      return { messages: [], paging: { hasMore: false, nextBefore: null } };
+    }
+
+    const { messages, paging } =
+      await this.facebookOAuth.getMessengerMessagesByPsid(
+        pageId,
+        customerPsid,
+        token,
+        { limit, before },
+      );
+
+    const events = messages
+      .map((msg) => this.graphMessageToEvent(msg, pageId, customerPsid, orgId))
+      .reverse();
+
+    const enriched = await this.enrichMessagePictures(
+      events,
+      pageId,
+      orgId,
+      customerPsid,
+    );
+    const withNames = await this.enrichMessageSenderNames(
+      enriched,
+      pageId,
+      orgId,
+      customerPsid,
+    );
+
+    const oldest = withNames[0];
+    const hasMore = Boolean(paging?.cursors?.before);
+
+    return {
+      messages: withNames,
+      paging: {
+        hasMore,
+        nextBefore: hasMore && oldest ? oldest.createdAt.toISOString() : null,
+      },
+    };
+  }
+
+  private async getCommentThreadMessagesFromGraph(
+    pageId: string,
+    orgId: string,
+    postId: string,
+    customerId: string,
+    limit: number,
+    before?: string,
+  ): Promise<ThreadMessagesPage> {
+    const token = await this.getPageAccessToken(pageId, orgId);
+    if (!token) {
+      return { messages: [], paging: { hasMore: false, nextBefore: null } };
+    }
+
+    const comments = await this.getCachedPostComments(
+      pageId,
+      orgId,
+      postId,
+      token,
+    );
+    const byId = new Map(
+      comments
+        .filter((c): c is GraphPostComment & { id: string } => !!c.id)
+        .map((c) => [c.id, c]),
+    );
+
+    let threadComments = comments.filter((c) =>
+      this.commentBelongsToThread(c, pageId, customerId, byId),
+    );
+
+    const beforeDate = parseDateCursor(before);
+    if (beforeDate) {
+      threadComments = threadComments.filter(
+        (c) => new Date(c.created_time).getTime() < beforeDate.getTime(),
+      );
+    }
+
+    threadComments.sort(
+      (a, b) =>
+        new Date(a.created_time).getTime() - new Date(b.created_time).getTime(),
+    );
+
+    const hasMore = threadComments.length > limit;
+    const page = hasMore
+      ? threadComments.slice(threadComments.length - limit)
+      : threadComments;
+
+    const events = page.map((c) =>
+      this.graphCommentToEvent(c, pageId, postId, customerId, orgId),
+    );
+
+    const withMedia = this.enrichFeedCommentContent(events);
+    const enriched = await this.enrichMessagePictures(
+      withMedia,
+      pageId,
+      orgId,
+      customerId,
+    );
+    const withNames = await this.enrichMessageSenderNames(
+      enriched,
+      pageId,
+      orgId,
+      customerId,
+    );
+
+    const oldest = withNames[0];
+
+    return {
+      messages: withNames,
+      paging: {
+        hasMore,
+        nextBefore: hasMore && oldest ? oldest.createdAt.toISOString() : null,
+      },
+    };
   }
 
   /** Webhook-driven only — không reconcile với Graph API */
@@ -729,6 +1030,63 @@ export class ConversationsService {
     return comments;
   }
 
+  /** Đồng bộ is_hidden từ Graph khi load thread — tránh UI ACTIVE trong khi FB đã ẩn. */
+  private async applyFeedCommentVisibilityFromGraph(
+    messages: ConversationMessage[],
+    pageId: string,
+    orgId: string,
+    postId: string,
+  ): Promise<ConversationMessage[]> {
+    const hasFeedComments = messages.some((m) => m.eventType === 'FEED_COMMENT');
+    if (!hasFeedComments || !postId?.trim()) return messages;
+
+    const token = await this.getPageAccessToken(pageId, orgId);
+    if (!token) return messages;
+
+    const graphComments = await this.getCachedPostComments(
+      pageId,
+      orgId,
+      postId,
+      token,
+    );
+    if (!graphComments.length) return messages;
+
+    const graphById = new Map<string, GraphPostComment>();
+    for (const comment of graphComments) {
+      if (comment.id) graphById.set(comment.id, comment);
+    }
+
+    const resolveGraphComment = (
+      commentKey: string,
+    ): GraphPostComment | undefined => {
+      const direct = graphById.get(commentKey);
+      if (direct) return direct;
+      for (const [id, candidate] of graphById) {
+        if (facebookCommentIdsMatch(id, commentKey)) return candidate;
+      }
+      return undefined;
+    };
+
+    return messages.map((msg) => {
+      if (msg.eventType !== 'FEED_COMMENT') return msg;
+      const key = msg.commentId ?? msg.messageId;
+      if (!key) return msg;
+
+      const graph = resolveGraphComment(key);
+      if (!graph || graph.is_hidden === undefined) return msg;
+
+      const nextStatus =
+        graph.is_hidden === true
+          ? EVENT_STATUS_HIDDEN
+          : msg.status === EVENT_STATUS_DELETED
+            ? EVENT_STATUS_DELETED
+            : EVENT_STATUS_ACTIVE;
+
+      if ((msg.status ?? EVENT_STATUS_ACTIVE) === nextStatus) return msg;
+      return { ...msg, status: nextStatus };
+    });
+  }
+
   private async getWebhookThreadMessages(
     threadId: string,
     pageId: string,
@@ -758,8 +1116,9 @@ export class ConversationsService {
     const pageEvents = hasMore ? events.slice(0, limit) : events;
     const chronological = [...pageEvents].reverse();
 
+    const withMedia = this.enrichFeedCommentContent(chronological);
     const enriched = await this.enrichMessagePictures(
-      chronological,
+      withMedia,
       pageId,
       orgId,
       customerPsid,
@@ -947,8 +1306,9 @@ export class ConversationsService {
     orgId: string,
     customerPsid: string,
   ): Promise<ConversationMessage[]> {
+    const withMedia = this.enrichFeedCommentContent(messages);
     const withPictures = await this.enrichMessagePictures(
-      messages,
+      withMedia,
       pageId,
       orgId,
       customerPsid,
@@ -1091,61 +1451,39 @@ export class ConversationsService {
     content: string;
     msgType: string;
   } {
-    const att = comment.attachment;
-    const imageUrl = att?.media?.image?.src;
-    const videoUrl = att?.media?.source;
     const isReply = !!comment.parent?.id;
-    const text = comment.message?.trim() ?? '';
+    return serializeFeedCommentContent(
+      {
+        message: comment.message,
+        attachment: comment.attachment,
+      },
+      { isReply },
+    );
+  }
 
-    if (imageUrl) {
-      if (text) {
-        return {
-          content: JSON.stringify({
-            text,
-            href: imageUrl,
-            type: 'image',
-            title: att?.title ?? 'Ảnh',
-          }),
-          msgType: isReply ? 'feed.comment.reply.photo' : 'feed.comment.photo',
-        };
+  private enrichFeedCommentContent(
+    messages: ConversationMessage[],
+  ): ConversationMessage[] {
+    return messages.map((msg) => {
+      if (msg.eventType !== 'FEED_COMMENT') return msg;
+      if (feedCommentContentHasMedia(msg.content)) return msg;
+      if (msg.msgType?.includes('photo') && msg.content?.startsWith('{')) {
+        return msg;
       }
-      return {
-        content: JSON.stringify({
-          href: imageUrl,
-          type: 'image',
-          title: att?.title ?? 'Ảnh',
-        }),
-        msgType: isReply ? 'feed.comment.reply.photo' : 'feed.comment.photo',
-      };
-    }
 
-    if (att?.type === 'sticker' && att.url) {
-      return {
-        content: JSON.stringify({
-          href: att.url,
-          type: 'sticker',
-          title: 'Sticker',
-        }),
-        msgType: isReply ? 'feed.comment.reply.sticker' : 'feed.comment.sticker',
-      };
-    }
+      const serialized = serializeFeedCommentFromRawPayload(msg.rawPayload, {
+        content: msg.content,
+        msgType: msg.msgType,
+        isReply: msg.msgType?.includes('reply'),
+      });
+      if (!serialized) return msg;
 
-    if (videoUrl || att?.type === 'video') {
-      const href = videoUrl ?? att?.url ?? '';
       return {
-        content: JSON.stringify({
-          href,
-          type: 'video',
-          title: att?.title ?? 'Video',
-        }),
-        msgType: isReply ? 'feed.comment.reply.video' : 'feed.comment.video',
+        ...msg,
+        content: serialized.content,
+        msgType: serialized.msgType,
       };
-    }
-
-    return {
-      content: text,
-      msgType: isReply ? 'feed.comment.reply' : 'feed.comment',
-    };
+    });
   }
 
   private graphCommentToEvent(
@@ -1297,5 +1635,567 @@ export class ConversationsService {
         senderPictureUrl: userId ? (fetchedPictures.get(userId) ?? null) : null,
       };
     });
+  }
+
+  private async loadMessengerThreadMeta(
+    pageId: string,
+    threadId: string,
+    orgId: string,
+  ): Promise<ThreadMessagesMeta> {
+    const pinned = await this.prisma.pinnedThreadMessage.findMany({
+      where: { pageId, threadId, organizationId: orgId },
+      orderBy: { pinnedAt: 'desc' },
+      select: { messageId: true },
+    });
+
+    return {
+      pinnedMessageIds: pinned.map((row) => row.messageId),
+    };
+  }
+
+  private async loadMessengerReactions(
+    pageId: string,
+    threadId: string,
+  ): Promise<Map<string, MessageReactionView[]>> {
+    const rows = await this.prisma.messengerMessageReaction.findMany({
+      where: { pageId, threadId },
+      orderBy: { createdAt: 'asc' },
+    });
+
+    const byMessage = new Map<string, MessageReactionView[]>();
+    for (const row of rows) {
+      const list = byMessage.get(row.messageId) ?? [];
+      list.push({ emoji: row.emoji, reactorId: row.reactorId });
+      byMessage.set(row.messageId, list);
+    }
+    return byMessage;
+  }
+
+  async reactToMessengerMessage(input: {
+    pageId: string;
+    threadId: string;
+    messageId: string;
+    emoji: string;
+    orgId: string;
+  }): Promise<{ success: boolean; emoji: string }> {
+    const pageId = input.pageId?.trim();
+    const threadId = normalizeCommentThreadId(input.threadId?.trim() ?? '');
+    const messageId = input.messageId?.trim();
+    const emoji = input.emoji?.trim();
+
+    if (!pageId || !threadId || !messageId || !emoji) {
+      throw new BadRequestException('Thiếu pageId, threadId, messageId hoặc emoji');
+    }
+    if (!ALLOWED_MESSENGER_REACTIONS.has(emoji)) {
+      throw new BadRequestException('Emoji reaction không được hỗ trợ');
+    }
+
+    const parsed = parseThreadId(threadId);
+    if (!parsed || parsed.pageId !== pageId || parsed.kind !== 'MESSENGER') {
+      throw new BadRequestException('Chỉ hỗ trợ reaction trên tin nhắn Messenger');
+    }
+
+    await this.assertPageBelongsToOrg(pageId, input.orgId);
+
+    const event = await this.prisma.webhookEvent.findFirst({
+      where: {
+        pageId,
+        messageId,
+        eventType: 'MESSENGER',
+        direction: 'IN',
+        OR: [
+          { senderId: parsed.senderId },
+          { recipientId: parsed.senderId },
+        ],
+      },
+      select: { id: true },
+    });
+    if (!event) {
+      throw new NotFoundException('Không tìm thấy tin nhắn khách hàng');
+    }
+
+    const token = await this.getPageAccessToken(pageId, input.orgId);
+    if (token) {
+      try {
+        await this.graphApi.reactToMessengerMessage(
+          parsed.senderId,
+          token,
+          messageId,
+          emoji,
+        );
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err);
+        this.logger.warn(
+          `[Conversations] Graph react failed for ${messageId}: ${message}`,
+        );
+      }
+    }
+
+    await this.prisma.messengerMessageReaction.upsert({
+      where: {
+        pageId_threadId_messageId_reactorId: {
+          pageId,
+          threadId,
+          messageId,
+          reactorId: pageId,
+        },
+      },
+      create: {
+        organizationId: input.orgId,
+        pageId,
+        threadId,
+        messageId,
+        emoji,
+        reactorId: pageId,
+      },
+      update: { emoji },
+    });
+
+    await this.redisCache.bumpThreadRevision(pageId, threadId);
+    return { success: true, emoji };
+  }
+
+  async unreactToMessengerMessage(input: {
+    pageId: string;
+    threadId: string;
+    messageId: string;
+    orgId: string;
+  }): Promise<{ success: boolean }> {
+    const pageId = input.pageId?.trim();
+    const threadId = normalizeCommentThreadId(input.threadId?.trim() ?? '');
+    const messageId = input.messageId?.trim();
+
+    if (!pageId || !threadId || !messageId) {
+      throw new BadRequestException('Thiếu pageId, threadId hoặc messageId');
+    }
+
+    const parsed = parseThreadId(threadId);
+    if (!parsed || parsed.pageId !== pageId || parsed.kind !== 'MESSENGER') {
+      throw new BadRequestException('Chỉ hỗ trợ bỏ reaction trên tin nhắn Messenger');
+    }
+
+    await this.assertPageBelongsToOrg(pageId, input.orgId);
+
+    const token = await this.getPageAccessToken(pageId, input.orgId);
+    if (token) {
+      try {
+        await this.graphApi.unreactToMessengerMessage(
+          parsed.senderId,
+          token,
+          messageId,
+        );
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : String(err);
+        this.logger.warn(
+          `[Conversations] Graph unreact failed for ${messageId}: ${message}`,
+        );
+      }
+    }
+
+    await this.prisma.messengerMessageReaction.deleteMany({
+      where: {
+        pageId,
+        threadId,
+        messageId,
+        reactorId: pageId,
+      },
+    });
+
+    await this.redisCache.bumpThreadRevision(pageId, threadId);
+    return { success: true };
+  }
+
+  async pinMessengerMessage(input: {
+    pageId: string;
+    threadId: string;
+    messageId: string;
+    orgId: string;
+  }): Promise<{ success: boolean; pinned: boolean }> {
+    const pageId = input.pageId?.trim();
+    const threadId = normalizeCommentThreadId(input.threadId?.trim() ?? '');
+    const messageId = input.messageId?.trim();
+
+    if (!pageId || !threadId || !messageId) {
+      throw new BadRequestException('Thiếu pageId, threadId hoặc messageId');
+    }
+
+    const parsed = parseThreadId(threadId);
+    if (!parsed || parsed.pageId !== pageId || parsed.kind !== 'MESSENGER') {
+      throw new BadRequestException('Chỉ hỗ trợ ghim tin nhắn Messenger');
+    }
+
+    await this.assertPageBelongsToOrg(pageId, input.orgId);
+
+    const event = await this.prisma.webhookEvent.findFirst({
+      where: {
+        pageId,
+        messageId,
+        eventType: 'MESSENGER',
+      },
+      select: { id: true },
+    });
+    if (!event) {
+      throw new NotFoundException('Không tìm thấy tin nhắn');
+    }
+
+    await this.prisma.pinnedThreadMessage.upsert({
+      where: {
+        pageId_threadId_messageId: {
+          pageId,
+          threadId,
+          messageId,
+        },
+      },
+      create: {
+        organizationId: input.orgId,
+        pageId,
+        threadId,
+        messageId,
+      },
+      update: { pinnedAt: new Date() },
+    });
+
+    await this.redisCache.bumpThreadRevision(pageId, threadId);
+    return { success: true, pinned: true };
+  }
+
+  async unpinMessengerMessage(input: {
+    pageId: string;
+    threadId: string;
+    messageId: string;
+    orgId: string;
+  }): Promise<{ success: boolean; pinned: boolean }> {
+    const pageId = input.pageId?.trim();
+    const threadId = normalizeCommentThreadId(input.threadId?.trim() ?? '');
+    const messageId = input.messageId?.trim();
+
+    if (!pageId || !threadId || !messageId) {
+      throw new BadRequestException('Thiếu pageId, threadId hoặc messageId');
+    }
+
+    const parsed = parseThreadId(threadId);
+    if (!parsed || parsed.pageId !== pageId || parsed.kind !== 'MESSENGER') {
+      throw new BadRequestException('Chỉ hỗ trợ bỏ ghim tin nhắn Messenger');
+    }
+
+    await this.assertPageBelongsToOrg(pageId, input.orgId);
+
+    await this.prisma.pinnedThreadMessage.deleteMany({
+      where: { pageId, threadId, messageId },
+    });
+
+    await this.redisCache.bumpThreadRevision(pageId, threadId);
+    return { success: true, pinned: false };
+  }
+
+  /**
+   * Tìm PSID Messenger từ ID người bình luận (Graph user id ≠ PSID).
+   * Dùng khi chuyển từ tab bình luận sang nhắn tin Messenger.
+   */
+  async resolveMessengerPsid(
+    pageId: string,
+    orgId: string,
+    input: { commentAuthorId?: string; senderName?: string },
+  ): Promise<{
+    psid: string | null;
+    threadId: string | null;
+    hasExistingConversation: boolean;
+  }> {
+    const commentAuthorId = input.commentAuthorId?.trim();
+    const senderName = input.senderName?.trim();
+    const empty = {
+      psid: null,
+      threadId: null,
+      hasExistingConversation: false,
+    };
+
+    if (commentAuthorId) {
+      const token = await this.getPageAccessToken(pageId, orgId);
+
+      const fromPrivateReply = await this.resolvePsidFromPrivateReplyHistory(
+        pageId,
+        orgId,
+        commentAuthorId,
+        senderName,
+        token,
+      );
+      if (fromPrivateReply) {
+        return {
+          psid: fromPrivateReply,
+          threadId: buildMessengerThreadId(pageId, fromPrivateReply),
+          hasExistingConversation: true,
+        };
+      }
+
+      const messengerInEvent = await this.prisma.webhookEvent.findFirst({
+        where: {
+          pageId,
+          eventType: { in: ['MESSENGER', 'MESSENGER_POSTBACK'] },
+          direction: 'IN',
+          senderId: commentAuthorId,
+        },
+        orderBy: { createdAt: 'desc' },
+        select: { senderId: true },
+      });
+      if (messengerInEvent?.senderId && token) {
+        const verified = await this.verifyMessengerPsid(
+          pageId,
+          messengerInEvent.senderId,
+          token,
+        );
+        if (verified) {
+          return {
+            psid: verified,
+            threadId: buildMessengerThreadId(pageId, verified),
+            hasExistingConversation: true,
+          };
+        }
+      }
+
+      if (token) {
+        const verifiedPsid = await this.verifyMessengerPsid(
+          pageId,
+          commentAuthorId,
+          token,
+        );
+        if (verifiedPsid) {
+          return {
+            psid: verifiedPsid,
+            threadId: buildMessengerThreadId(pageId, verifiedPsid),
+            hasExistingConversation: true,
+          };
+        }
+      }
+    }
+
+    if (senderName && !isGenericSenderName(senderName)) {
+      const normalized = senderName.toLowerCase();
+      const messengerEvents = await this.prisma.webhookEvent.findMany({
+        where: {
+          pageId,
+          eventType: { in: ['MESSENGER', 'MESSENGER_POSTBACK'] },
+          direction: 'IN',
+          senderName: { not: null },
+        },
+        select: { senderId: true, senderName: true },
+        orderBy: { createdAt: 'desc' },
+        take: 500,
+      });
+      const byName = messengerEvents.find(
+        (e) => e.senderName?.trim().toLowerCase() === normalized,
+      );
+      const token = await this.getPageAccessToken(pageId, orgId);
+      if (byName?.senderId && token) {
+        const verified = await this.verifyMessengerPsid(
+          pageId,
+          byName.senderId,
+          token,
+        );
+        if (verified) {
+          return {
+            psid: verified,
+            threadId: buildMessengerThreadId(pageId, verified),
+            hasExistingConversation: true,
+          };
+        }
+      }
+
+      if (token) {
+        const conversations = await this.facebookOAuth.listPageConversations(
+          pageId,
+          token,
+        );
+        for (const conv of conversations) {
+          const customer = conv.participants?.data?.find((p) => p.id !== pageId);
+          const name = customer?.name?.trim().toLowerCase();
+          if (customer?.id && name === normalized) {
+            const verified = await this.verifyMessengerPsid(
+              pageId,
+              customer.id,
+              token,
+            );
+            if (verified) {
+              return {
+                psid: verified,
+                threadId: buildMessengerThreadId(pageId, verified),
+                hasExistingConversation: true,
+              };
+            }
+          }
+        }
+      }
+    }
+
+    return empty;
+  }
+
+  /**
+   * Sau private reply: PSID có thể nằm trong payload hoặc tin IN đầu tiên của khách (cùng tên).
+   */
+  private async resolvePsidFromPrivateReplyHistory(
+    pageId: string,
+    orgId: string,
+    commentAuthorId: string,
+    senderName: string | undefined,
+    token: string | null,
+  ): Promise<string | null> {
+    if (!commentAuthorId?.trim() || !token) return null;
+
+    const outRows = await this.prisma.webhookEvent.findMany({
+      where: {
+        pageId,
+        eventType: 'MESSENGER',
+        direction: 'OUT',
+        recipientId: commentAuthorId.trim(),
+      },
+      orderBy: { createdAt: 'desc' },
+      take: 20,
+      select: { rawPayload: true, createdAt: true },
+    });
+
+    let privateReplyAt: Date | null = null;
+    for (const row of outRows) {
+      try {
+        const raw = JSON.parse(row.rawPayload ?? '{}') as {
+          source?: string;
+          resolvedPsid?: string;
+        };
+        if (raw.source !== 'app_send_private_reply') continue;
+        privateReplyAt = row.createdAt;
+        const candidate = raw.resolvedPsid?.trim();
+        if (candidate) {
+          const verified = await this.verifyMessengerPsid(
+            pageId,
+            candidate,
+            token,
+          );
+          if (verified) return verified;
+        }
+      } catch {
+        // ignore malformed payload
+      }
+    }
+
+    const name =
+      senderName?.trim() ||
+      (await this.lookupFeedCommentAuthorName(pageId, commentAuthorId));
+    if (!name || isGenericSenderName(name) || !privateReplyAt) return null;
+
+    const normalized = name.toLowerCase();
+    const inRows = await this.prisma.webhookEvent.findMany({
+      where: {
+        pageId,
+        eventType: { in: ['MESSENGER', 'MESSENGER_POSTBACK'] },
+        direction: 'IN',
+        createdAt: { gte: privateReplyAt },
+        senderName: { not: null },
+      },
+      orderBy: { createdAt: 'desc' },
+      take: 50,
+      select: { senderId: true, senderName: true },
+    });
+
+    const match = inRows.find(
+      (e) => e.senderName?.trim().toLowerCase() === normalized,
+    );
+    if (!match?.senderId) return null;
+
+    return this.verifyMessengerPsid(pageId, match.senderId, token);
+  }
+
+  private async lookupFeedCommentAuthorName(
+    pageId: string,
+    commentAuthorId: string,
+  ): Promise<string | null> {
+    const row = await this.prisma.webhookEvent.findFirst({
+      where: {
+        pageId,
+        eventType: 'FEED_COMMENT',
+        direction: 'IN',
+        senderId: commentAuthorId.trim(),
+        senderName: { not: null },
+      },
+      orderBy: { createdAt: 'desc' },
+      select: { senderName: true },
+    });
+    return row?.senderName?.trim() ?? null;
+  }
+
+  /** Chỉ coi là PSID hợp lệ khi Graph trả về hội thoại Messenger thật. */
+  private async verifyMessengerPsid(
+    pageId: string,
+    candidateId: string,
+    token: string,
+  ): Promise<string | null> {
+    if (!candidateId?.trim()) return null;
+    const { messages } = await this.facebookOAuth.getMessengerMessagesByPsid(
+      pageId,
+      candidateId,
+      token,
+      { limit: 1 },
+    );
+    return messages.length > 0 ? candidateId : null;
+  }
+
+  /**
+   * Chuẩn hóa comment id trước khi gọi Graph (webhook id đôi khi khác format).
+   * Trả về id Graph xác nhận được, hoặc id gốc nếu không tra được.
+   */
+  async resolveCanonicalCommentId(
+    pageId: string,
+    orgId: string,
+    commentId: string,
+    postIdHint?: string | null,
+  ): Promise<string> {
+    const trimmed = commentId?.trim();
+    if (!trimmed || !isValidFacebookCommentId(trimmed)) return trimmed;
+
+    const token = await this.getPageAccessToken(pageId, orgId);
+    if (!token) return trimmed;
+
+    const sample = await this.prisma.webhookEvent.findFirst({
+      where: {
+        pageId,
+        eventType: 'FEED_COMMENT',
+        OR: [{ commentId: trimmed }, { messageId: trimmed }],
+      },
+      select: { postId: true, commentId: true, messageId: true },
+    });
+
+    const postId = postIdHint?.trim() || sample?.postId?.trim() || undefined;
+    for (const candidate of buildGraphCommentIdCandidates(trimmed, postId)) {
+      const direct = await this.facebookOAuth.getCommentMeta(candidate, token, {
+        silent: true,
+      });
+      if (direct?.id) return direct.id;
+    }
+
+    if (postId) {
+      for (const candidate of buildGraphCommentIdCandidates(trimmed, postId)) {
+        const fromPost = await this.facebookOAuth.getCommentMeta(
+          candidate,
+          token,
+          { postId, silent: true },
+        );
+        if (fromPost?.id) return fromPost.id;
+      }
+    }
+
+    if (sample) {
+      for (const candidate of [sample.commentId, sample.messageId]) {
+        if (!candidate || candidate === trimmed) continue;
+        for (const lookupId of buildGraphCommentIdCandidates(candidate, postId)) {
+          const meta = await this.facebookOAuth.getCommentMeta(lookupId, token, {
+            postId: postId ?? undefined,
+            silent: true,
+          });
+          if (meta?.id && facebookCommentIdsMatch(meta.id, trimmed)) {
+            return meta.id;
+          }
+        }
+      }
+    }
+
+    return trimmed;
   }
 }

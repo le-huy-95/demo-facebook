@@ -19,6 +19,7 @@ export interface CommentReplyPreviewProps {
   preview: string;
   /** composer = banner phía trên ô nhập; bubble = khối quote trong tin nhắn */
   variant?: 'composer' | 'bubble-in' | 'bubble-out';
+  label?: string;
   onClick?: () => void;
   className?: string;
   actions?: ReactNode;
@@ -27,11 +28,11 @@ export interface CommentReplyPreviewProps {
 export function CommentReplyPreview({
   preview,
   variant = 'composer',
+  label = 'Trả lời bình luận',
   onClick,
   className = '',
   actions,
 }: CommentReplyPreviewProps) {
-  const label = 'Trả lời bình luận';
   const text = preview.trim() || 'Bình luận';
 
   if (variant === 'composer') {

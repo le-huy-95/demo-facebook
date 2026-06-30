@@ -10,7 +10,7 @@ const nextConfig: NextConfig = {
   },
   allowedDevOrigins: ['even-spindle-collie.ngrok-free.dev', '*.ngrok-free.dev'],
   async rewrites() {
-    return [
+    const apiRewrites = [
       {
         source: '/facebook-page/:path*',
         destination: `${backendUrl}/facebook-page/:path*`,
@@ -36,6 +36,14 @@ const nextConfig: NextConfig = {
         source: '/conversations/sync-comments',
         destination: `${backendUrl}/conversations/sync-comments`,
       },
+      {
+        source: '/conversations/comments/:commentId/action',
+        destination: `${backendUrl}/conversations/comments/:commentId/action`,
+      },
+      {
+        source: '/conversations/messages/:messageId/:action',
+        destination: `${backendUrl}/conversations/messages/:messageId/:action`,
+      },
       { source: '/messages', destination: `${backendUrl}/messages` },
       {
         source: '/messages/:path*',
@@ -56,6 +64,21 @@ const nextConfig: NextConfig = {
         destination: `${backendUrl}/api-docs/:path*`,
       },
     ];
+
+    return {
+      // Socket.IO bắt buộc trailing slash — rewrite thường strip "/" → backend 404
+      beforeFiles: [
+        {
+          source: '/socket.io/',
+          destination: `${backendUrl}/socket.io/`,
+        },
+        {
+          source: '/socket.io/:path*',
+          destination: `${backendUrl}/socket.io/:path*`,
+        },
+      ],
+      fallback: apiRewrites,
+    };
   },
 };
 

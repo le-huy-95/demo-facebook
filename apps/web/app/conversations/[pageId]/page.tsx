@@ -23,6 +23,12 @@ import {
   getPostPreview,
   initiateOAuth,
   performCommentAction,
+  syncComments,
+  reactToMessengerMessage,
+  unreactToMessengerMessage,
+  pinMessengerMessage,
+  unpinMessengerMessage,
+  resolveMessengerPsid,
   subscribeMessages,
   type CommentAction,
   type ConversationKind,
@@ -34,11 +40,18 @@ import {
 import {
   buildMessengerThreadId,
   buildThreadFromEvent,
+  dedupeCommentThreads,
   enrichEventForThread,
+  facebookCommentIdsMatch,
   findCommentMessageById,
+  findMessageByMid,
+  getMessageCommentKey,
   getRealtimeEventKey,
+  isSameConversationThread,
   isValidFacebookCommentId,
   mergeThreadMessages,
+  normalizeCommentThreadId,
+  parseRootCommentIdFromThreadId,
   pickBetterSenderName,
   pickDefaultReplyComment,
   resolveCustomerNameFromMessages,
@@ -46,7 +59,7 @@ import {
   upsertThreadMessage,
 } from '@/lib/conversation';
 import { isActiveContentStatus } from '@/lib/event-status';
-import { getCommentPreviewText, isReceiptMessage } from '@/lib/message-content';
+import { getCommentPreviewText, formatConversationThreadPreview, isReceiptMessage } from '@/lib/message-content';
 import { MessageComposer } from '@/components/message-composer';
 import {
   joinPageRoom,
@@ -181,6 +194,15 @@ export default function ConversationsPage() {
   const [replyCommentId, setReplyCommentId] = useState<string | null>(null);
   const [replyPreview, setReplyPreview] = useState<string | null>(null);
   const [replyMentionName, setReplyMentionName] = useState<string | null>(null);
+  const [replyToMessageId, setReplyToMessageId] = useState<string | null>(null);
+  const [replyMessagePreview, setReplyMessagePreview] = useState<string | null>(
+    null,
+  );
+  /** Comment gốc khi mở Messenger từ tab bình luận (dùng private reply lần đầu). */
+  const [messengerSourceCommentId, setMessengerSourceCommentId] = useState<
+    string | null
+  >(null);
+  const messengerSourceCommentIdRef = useRef<string | null>(null);
   const [postExpanded, setPostExpanded] = useState(false);
   const [loading, setLoading] = useState(true);
   const [postLoading, setPostLoading] = useState(false);
@@ -189,6 +211,7 @@ export default function ConversationsPage() {
   const [loadingMoreMessages, setLoadingMoreMessages] = useState(false);
   const [hasMoreMessages, setHasMoreMessages] = useState(false);
   const [messagesCursor, setMessagesCursor] = useState<string | null>(null);
+  const [pinnedMessageIds, setPinnedMessageIds] = useState<string[]>([]);
   const [hasMoreConversations, setHasMoreConversations] = useState(false);
   const [loadingMoreConversations, setLoadingMoreConversations] =
     useState(false);
@@ -203,6 +226,11 @@ export default function ConversationsPage() {
   const threadMessagesRef = useRef<ThreadMessagesHandle>(null);
   /** Chặn socket OUT hiển thị tin trước khi HTTP gửi xong (spinner). */
   const outboundInFlightRef = useRef(false);
+  const selectedRef = useRef(selected);
+
+  useEffect(() => {
+    selectedRef.current = selected;
+  }, [selected]);
 
   useEffect(() => {
     selectedThreadIdRef.current = selected?.id ?? null;
@@ -251,6 +279,23 @@ export default function ConversationsPage() {
     setReplyMentionName(null);
   }, []);
 
+  const clearReplyMessage = useCallback(() => {
+    setReplyToMessageId(null);
+    setReplyMessagePreview(null);
+  }, []);
+
+  const messengerReplyPreview = useMemo(() => {
+    if (!replyToMessageId) return null;
+    const target = findMessageByMid(messages, replyToMessageId);
+    if (target) return getCommentPreviewText(target);
+    return replyMessagePreview;
+  }, [replyToMessageId, messages, replyMessagePreview]);
+
+  const scrollToReplyMessage = useCallback(() => {
+    if (!replyToMessageId) return;
+    threadMessagesRef.current?.scrollToMessage(replyToMessageId);
+  }, [replyToMessageId]);
+
   const shouldApplyConversationEvent = useCallback(
     (event: WebhookMessage): boolean => {
       const key = getRealtimeEventKey(event);
@@ -269,7 +314,9 @@ export default function ConversationsPage() {
 
   const appendRealtimeMessage = useCallback(
     (event: WebhookMessage, threadId: string) => {
-      if (selectedThreadIdRef.current !== threadId) return;
+      if (!isSameConversationThread(selectedThreadIdRef.current, threadId)) {
+        return;
+      }
       if (event.direction === 'OUT' && outboundInFlightRef.current) return;
       setMessages((msgs) => upsertThreadMessage(msgs, event));
     },
@@ -282,7 +329,7 @@ export default function ConversationsPage() {
 
       const currentId = selectedThreadIdRef.current;
 
-      if (currentId === threadId) {
+      if (isSameConversationThread(currentId, threadId)) {
         appendRealtimeMessage(event, threadId);
         return;
       }
@@ -341,8 +388,28 @@ export default function ConversationsPage() {
     setMissingCommentScopes(page?.missingCommentScopes ?? []);
     setWebhookFeedOk(page?.feedSubscribed !== false);
 
-    const { data, paging } = await getConversations(pageId, { limit: 30 });
-    const filtered = data.filter((c) => c.pageId === pageId);
+    let { data, paging } = await getConversations(pageId, { limit: 30 });
+    let filtered = dedupeCommentThreads(
+      data.filter((c) => c.pageId === pageId),
+    );
+
+    const shouldSyncComments =
+      filtered.length === 0 ||
+      filtered.every((c) => c.kind === 'MESSENGER');
+
+    if (shouldSyncComments) {
+      try {
+        await syncComments(pageId, true);
+        const refreshed = await getConversations(pageId, { limit: 30 });
+        data = refreshed.data;
+        paging = refreshed.paging;
+        filtered = dedupeCommentThreads(
+          data.filter((c) => c.pageId === pageId),
+        );
+      } catch {
+        // Graph merge vẫn trả thread qua API list; sync chỉ ghi vào DB
+      }
+    }
     setConversations((prev) => {
       const prevUnread = new Map(prev.map((c) => [c.id, c.unreadCount ?? 0]));
       const openedId = explicitlyOpenedThreadIdRef.current;
@@ -390,9 +457,12 @@ export default function ConversationsPage() {
         return;
 
       setConversations((prev) => {
-        const existing = prev.find((c) => c.id === threadId);
+        const normalizedId = normalizeCommentThreadId(threadId);
+        const existing = prev.find(
+          (c) => isSameConversationThread(c.id, normalizedId),
+        );
         if (!existing) {
-          const created = buildThreadFromEvent(event, threadId);
+          const created = buildThreadFromEvent(event, normalizedId);
           if (created) {
             return [created, ...prev].sort(
               (a, b) =>
@@ -405,17 +475,33 @@ export default function ConversationsPage() {
         }
 
         const updated = prev.map((c) =>
-          c.id === threadId
+          isSameConversationThread(c.id, normalizedId)
             ? {
                 ...c,
-                preview: event.content ?? c.preview,
+                id: normalizedId,
+                preview: formatConversationThreadPreview({
+                  content: event.content,
+                  msgType: event.msgType,
+                  eventType: event.eventType,
+                  direction: event.direction,
+                  senderName:
+                    event.direction === 'OUT'
+                      ? null
+                      : existing.senderName,
+                }),
                 lastMessageAt: event.createdAt,
                 messageCount: c.messageCount + 1,
                 unreadCount:
                   event.direction === 'IN' &&
-                  explicitlyOpenedThreadIdRef.current !== threadId
+                  !isSameConversationThread(
+                    explicitlyOpenedThreadIdRef.current,
+                    normalizedId,
+                  )
                     ? (c.unreadCount ?? 0) + 1
-                    : explicitlyOpenedThreadIdRef.current === threadId
+                    : isSameConversationThread(
+                          explicitlyOpenedThreadIdRef.current,
+                          normalizedId,
+                        )
                       ? 0
                       : (c.unreadCount ?? 0),
               }
@@ -432,6 +518,10 @@ export default function ConversationsPage() {
     [loadConversations, shouldApplyConversationEvent],
   );
 
+  const migrateMessengerThreadRef = useRef(
+    async (_commentAuthorId: string, _senderName: string) => false,
+  );
+
   const handleRealtimeEvent = useCallback(
     (raw: WebhookMessage, reloadMissing: boolean) => {
       if (raw.pageId !== pageId) return;
@@ -445,9 +535,30 @@ export default function ConversationsPage() {
       if (event.eventType === 'FEED_COMMENT') {
         if (event.direction === 'IN') {
           applyInboundCommentRealtime(event, threadId);
-        } else if (selectedThreadIdRef.current === threadId) {
+        } else if (isSameConversationThread(selectedThreadIdRef.current, threadId)) {
           appendRealtimeMessage(event, threadId);
         }
+        return;
+      }
+
+      const sel = selectedRef.current;
+      if (
+        event.direction === 'IN' &&
+        event.eventType === 'MESSENGER' &&
+        sel?.kind === 'MESSENGER' &&
+        sel.senderId !== event.senderId &&
+        sel.senderName &&
+        event.senderName &&
+        sel.senderName.trim().toLowerCase() ===
+          event.senderName.trim().toLowerCase()
+      ) {
+        void migrateMessengerThreadRef.current(sel.senderId, sel.senderName).then(
+          (migrated) => {
+            if (migrated) {
+              appendRealtimeMessage(event, threadId);
+            }
+          },
+        );
         return;
       }
 
@@ -504,15 +615,21 @@ export default function ConversationsPage() {
   }, []);
 
   const loadThread = useCallback(
-    async (thread: ConversationThread, options?: { markRead?: boolean }) => {
+    async (
+      thread: ConversationThread,
+      options?: { markRead?: boolean; messengerSourceCommentId?: string | null },
+    ) => {
+      const normalizedId = normalizeCommentThreadId(thread.id);
+      const normalizedThread =
+        normalizedId === thread.id ? thread : { ...thread, id: normalizedId };
       const markRead = options?.markRead === true;
       const loadSeq = threadLoadSeqRef.current + 1;
       threadLoadSeqRef.current = loadSeq;
-      selectedThreadIdRef.current = thread.id;
+      selectedThreadIdRef.current = normalizedId;
       if (markRead) {
-        markThreadAsRead(thread.id);
+        markThreadAsRead(normalizedId);
       }
-      setSelected(markRead ? { ...thread, unreadCount: 0 } : thread);
+      setSelected(markRead ? { ...normalizedThread, unreadCount: 0 } : normalizedThread);
       setMessages([]);
       setMessagesCursor(null);
       setHasMoreMessages(false);
@@ -521,32 +638,52 @@ export default function ConversationsPage() {
       setReplyCommentId(null);
       setReplyPreview(null);
       setReplyMentionName(null);
+      setReplyToMessageId(null);
+      setReplyMessagePreview(null);
+      const nextSourceCommentId =
+        options?.messengerSourceCommentId !== undefined
+          ? options.messengerSourceCommentId
+          : normalizedThread.kind === 'MESSENGER' &&
+              normalizedThread.commentId &&
+              isValidFacebookCommentId(normalizedThread.commentId)
+            ? normalizedThread.commentId
+            : null;
+      setMessengerSourceCommentId(nextSourceCommentId);
+      messengerSourceCommentIdRef.current = nextSourceCommentId;
+      setPinnedMessageIds([]);
       setPostExpanded(false);
       setThreadLoadError(null);
 
       try {
-        const { data: msgs, paging } = await getConversationMessages(
+        const { data: msgs, paging, meta } = await getConversationMessages(
           pageId,
-          thread.id,
+          normalizedId,
           { limit: 15 },
         );
         if (threadLoadSeqRef.current !== loadSeq) return;
 
+        if (normalizedThread.kind === 'MESSENGER') {
+          setPinnedMessageIds(meta?.pinnedMessageIds ?? []);
+        } else {
+          setPinnedMessageIds([]);
+        }
+
         const resolvedName = resolveCustomerNameFromMessages(
           msgs,
-          thread.senderName,
+          normalizedThread.senderName,
         );
         const enrichedThread = {
-          ...thread,
+          ...normalizedThread,
           senderName: resolvedName,
-          unreadCount: markRead ? 0 : (thread.unreadCount ?? 0),
+          unreadCount: markRead ? 0 : (normalizedThread.unreadCount ?? 0),
         };
         setSelected(enrichedThread);
         setConversations((prev) =>
           prev.map((c) =>
-            c.id === thread.id
+            isSameConversationThread(c.id, normalizedId)
               ? {
                   ...c,
+                  id: normalizedId,
                   senderName: resolvedName,
                   unreadCount: markRead ? 0 : (c.unreadCount ?? 0),
                 }
@@ -557,7 +694,7 @@ export default function ConversationsPage() {
         setMessagesCursor(paging.nextBefore);
         setHasMoreMessages(paging.hasMore);
 
-        if (thread.kind === 'FEED_COMMENT') {
+        if (normalizedThread.kind === 'FEED_COMMENT') {
           const defaultReply = pickDefaultReplyComment(msgs, pageId);
           if (defaultReply.commentId) {
             const target = findCommentMessageById(
@@ -718,6 +855,25 @@ export default function ConversationsPage() {
     ],
   );
 
+  const handleReplyToMessengerMessage = useCallback(
+    (msg: WebhookMessage) => {
+      const mid = msg.messageId?.trim();
+      if (!mid || msg.eventType !== 'MESSENGER' || isReceiptMessage(msg)) {
+        return;
+      }
+
+      if (replyToMessageId === mid) {
+        clearReplyMessage();
+        return;
+      }
+
+      setReplyToMessageId(mid);
+      setReplyMessagePreview(getCommentPreviewText(msg));
+      clearReplyComment();
+    },
+    [replyToMessageId, clearReplyMessage, clearReplyComment],
+  );
+
   const handleReplyToComment = useCallback(
     (msg: WebhookMessage) => {
       const commentKey = msg.commentId ?? msg.messageId;
@@ -740,6 +896,7 @@ export default function ConversationsPage() {
       setReplyMentionName(
         pickBetterSenderName(msg.senderName, selected?.senderName),
       );
+      clearReplyMessage();
       void handleSelectMessage(msg);
     },
     [
@@ -748,68 +905,277 @@ export default function ConversationsPage() {
       handleSelectMessage,
       replyCommentId,
       clearReplyComment,
+      clearReplyMessage,
     ],
   );
 
   const handleCommentAction = useCallback(
     async (commentId: string, action: CommentAction) => {
-      await performCommentAction(pageId, commentId, action);
+      try {
+        await performCommentAction(pageId, commentId, action);
 
-      if (action === 'hide' || action === 'unhide') {
-        setMessages((msgs) =>
-          msgs.map((m) => {
-            const key = m.commentId ?? m.messageId;
-            if (key !== commentId) return m;
-            return {
-              ...m,
-              status: action === 'hide' ? 'HIDDEN' : 'ACTIVE',
-            };
-          }),
-        );
-      }
+        if (action === 'hide' || action === 'unhide') {
+          setMessages((msgs) =>
+            msgs.map((m) => {
+              const key = m.commentId ?? m.messageId;
+              if (!key || !facebookCommentIdsMatch(key, commentId)) return m;
+              return {
+                ...m,
+                status: action === 'hide' ? 'HIDDEN' : 'ACTIVE',
+              };
+            }),
+          );
+        }
 
-      if (action === 'hide' && replyCommentId === commentId) {
-        setReplyCommentId(null);
-        setReplyPreview(null);
-        setReplyMentionName(null);
+        if (action === 'hide' && replyCommentId === commentId) {
+          setReplyCommentId(null);
+          setReplyPreview(null);
+          setReplyMentionName(null);
+        }
+      } catch (err) {
+        const message =
+          err instanceof Error
+            ? err.message
+            : 'Không thực hiện được hành động trên bình luận';
+        setThreadLoadError(message);
       }
     },
     [pageId, replyCommentId],
   );
 
-  const openMessengerThread = useCallback(() => {
-    if (!selected || selected.kind !== 'FEED_COMMENT') return;
+  const handleMessengerReact = useCallback(
+    async (messageId: string, emoji: string) => {
+      if (!selected) return;
+      try {
+        await reactToMessengerMessage(pageId, selected.id, messageId, emoji);
+        setMessages((msgs) =>
+          msgs.map((m) => {
+            if (m.messageId !== messageId) return m;
+            const others =
+              m.reactions?.filter((r) => r.reactorId !== pageId) ?? [];
+            return {
+              ...m,
+              reactions: [...others, { emoji, reactorId: pageId }],
+            };
+          }),
+        );
+      } catch (err) {
+        const message =
+          err instanceof Error ? err.message : 'Không thả được emoji';
+        setThreadLoadError(message);
+        throw err;
+      }
+    },
+    [pageId, selected],
+  );
 
-    const messengerId = buildMessengerThreadId(pageId, selected.senderId);
-    const existing = conversations.find((c) => c.id === messengerId);
-    const thread: ConversationThread = existing ?? {
-      id: messengerId,
-      kind: 'MESSENGER',
-      pageId,
-      senderId: selected.senderId,
-      senderName: selected.senderName,
-      senderPictureUrl: selected.senderPictureUrl ?? null,
-      preview: '',
-      lastMessageAt: new Date().toISOString(),
-      postId: null,
-      commentId: null,
-      messageCount: 0,
-      unreadCount: 0,
-    };
+  const handleMessengerUnreact = useCallback(
+    async (messageId: string) => {
+      if (!selected) return;
+      try {
+        await unreactToMessengerMessage(pageId, selected.id, messageId);
+        setMessages((msgs) =>
+          msgs.map((m) => {
+            if (m.messageId !== messageId) return m;
+            return {
+              ...m,
+              reactions: m.reactions?.filter((r) => r.reactorId !== pageId),
+            };
+          }),
+        );
+      } catch (err) {
+        const message =
+          err instanceof Error ? err.message : 'Không bỏ được emoji';
+        setThreadLoadError(message);
+        throw err;
+      }
+    },
+    [pageId, selected],
+  );
 
-    if (!existing) {
-      setConversations((prev) =>
-        [thread, ...prev].sort(
+  const handleMessengerTogglePin = useCallback(
+    async (messageId: string, pinned: boolean) => {
+      if (!selected) return;
+      try {
+        if (pinned) {
+          await pinMessengerMessage(pageId, selected.id, messageId);
+          setPinnedMessageIds((prev) =>
+            prev.includes(messageId)
+              ? prev
+              : [messageId, ...prev],
+          );
+        } else {
+          await unpinMessengerMessage(pageId, selected.id, messageId);
+          setPinnedMessageIds((prev) => prev.filter((id) => id !== messageId));
+        }
+        setMessages((msgs) =>
+          msgs.map((m) =>
+            m.messageId === messageId ? { ...m, isPinned: pinned } : m,
+          ),
+        );
+      } catch (err) {
+        const message =
+          err instanceof Error ? err.message : 'Không ghim được tin nhắn';
+        setThreadLoadError(message);
+        throw err;
+      }
+    },
+    [pageId, selected],
+  );
+
+  const openMessengerThread = useCallback(
+    async (preferredCommentId?: string) => {
+      if (!selected || selected.kind !== 'FEED_COMMENT') return;
+
+      const preferred =
+        preferredCommentId && isValidFacebookCommentId(preferredCommentId)
+          ? preferredCommentId
+          : null;
+
+      // Ưu tiên bình luận inbound mới nhất — dùng cho Private Reply API.
+      const latestInboundCommentId = [...messages]
+        .reverse()
+        .find((msg) => msg.direction === 'IN' && getMessageCommentKey(msg));
+      const sourceCommentId =
+        preferred ??
+        (latestInboundCommentId
+          ? getMessageCommentKey(latestInboundCommentId)
+          : null) ??
+        (selected.commentId && isValidFacebookCommentId(selected.commentId)
+          ? selected.commentId
+          : null) ??
+        parseRootCommentIdFromThreadId(selected.id);
+
+      let psid = selected.senderId;
+      let messengerId = buildMessengerThreadId(pageId, psid);
+
+      try {
+        const { data } = await resolveMessengerPsid(pageId, {
+          commentAuthorId: selected.senderId,
+          senderName: selected.senderName,
+        });
+        if (data.psid && data.threadId && data.hasExistingConversation) {
+          psid = data.psid;
+          messengerId = data.threadId;
+        }
+      } catch {
+        // Giữ thread tạm; gửi qua private reply nhờ sourceCommentId.
+      }
+
+      const existing = conversations.find((c) => c.id === messengerId);
+      const thread: ConversationThread = {
+        ...(existing ?? {
+          id: messengerId,
+          kind: 'MESSENGER',
+          pageId,
+          senderId: psid,
+          senderName: selected.senderName,
+          senderPictureUrl: selected.senderPictureUrl ?? null,
+          preview: '',
+          lastMessageAt: new Date().toISOString(),
+          postId: null,
+          messageCount: 0,
+          unreadCount: 0,
+        }),
+        commentId: sourceCommentId,
+      };
+
+      setConversations((prev) => {
+        const withoutDup = prev.filter((c) => c.id !== messengerId);
+        return [thread, ...withoutDup].sort(
           (a, b) =>
             new Date(b.lastMessageAt).getTime() -
             new Date(a.lastMessageAt).getTime(),
-        ),
-      );
-    }
+        );
+      });
 
-    setActiveTab('MESSENGER');
-    void loadThread(thread);
-  }, [selected, pageId, conversations, loadThread]);
+      setActiveTab('MESSENGER');
+      void loadThread(thread, {
+        markRead: true,
+        messengerSourceCommentId: sourceCommentId,
+      });
+    },
+    [selected, pageId, conversations, loadThread, messages],
+  );
+
+  /** Chuyển thread ảo (comment author id) sang PSID Messenger thật sau khi khách trả lời. */
+  const tryMigrateMessengerThread = useCallback(
+    async (commentAuthorId: string, senderName: string) => {
+      try {
+        const { data } = await resolveMessengerPsid(pageId, {
+          commentAuthorId,
+          senderName,
+        });
+        if (
+          !data.psid ||
+          !data.threadId ||
+          !data.hasExistingConversation ||
+          data.psid === commentAuthorId
+        ) {
+          return false;
+        }
+
+        const virtualId = buildMessengerThreadId(pageId, commentAuthorId);
+        const viewingVirtual = selectedThreadIdRef.current === virtualId;
+
+        setConversations((prev) => {
+          const virtual = prev.find((c) => c.id === virtualId);
+          const withoutVirtual = prev.filter((c) => c.id !== virtualId);
+          const existing = withoutVirtual.find((c) => c.id === data.threadId);
+          const migrated: ConversationThread = existing ?? {
+            id: data.threadId!,
+            kind: 'MESSENGER',
+            pageId,
+            senderId: data.psid!,
+            senderName: virtual?.senderName ?? senderName,
+            senderPictureUrl: virtual?.senderPictureUrl ?? null,
+            preview: virtual?.preview ?? '',
+            lastMessageAt: virtual?.lastMessageAt ?? new Date().toISOString(),
+            postId: null,
+            commentId: null,
+            messageCount: virtual?.messageCount ?? 0,
+            unreadCount: 0,
+          };
+          return [migrated, ...withoutVirtual.filter((c) => c.id !== data.threadId)]
+            .sort(
+              (a, b) =>
+                new Date(b.lastMessageAt).getTime() -
+                new Date(a.lastMessageAt).getTime(),
+            );
+        });
+
+        if (viewingVirtual) {
+          setMessengerSourceCommentId(null);
+          messengerSourceCommentIdRef.current = null;
+          const migrated: ConversationThread = {
+            id: data.threadId!,
+            kind: 'MESSENGER',
+            pageId,
+            senderId: data.psid!,
+            senderName,
+            senderPictureUrl: selectedRef.current?.senderPictureUrl ?? null,
+            preview: selectedRef.current?.preview ?? '',
+            lastMessageAt:
+              selectedRef.current?.lastMessageAt ?? new Date().toISOString(),
+            postId: null,
+            commentId: null,
+            messageCount: selectedRef.current?.messageCount ?? 0,
+            unreadCount: 0,
+          };
+          await loadThread(migrated, { markRead: true });
+        }
+
+        return true;
+      } catch {
+        return false;
+      }
+    },
+    [pageId, loadThread],
+  );
+
+  useEffect(() => {
+    migrateMessengerThreadRef.current = tryMigrateMessengerThread;
+  }, [tryMigrateMessengerThread]);
 
   const loadMoreMessages = useCallback(async () => {
     if (!selected || !hasMoreMessages || loadingMoreMessages || !messagesCursor)
@@ -1094,6 +1460,9 @@ export default function ConversationsPage() {
                   selectedCommentId={
                     selected.kind === 'FEED_COMMENT' ? replyCommentId : null
                   }
+                  selectedReplyMessageId={
+                    selected.kind === 'MESSENGER' ? replyToMessageId : null
+                  }
                   hasMore={hasMoreMessages}
                   loadingMore={loadingMoreMessages}
                   onLoadMore={() => {
@@ -1112,8 +1481,15 @@ export default function ConversationsPage() {
                   postExpanded={postExpanded}
                   onTogglePostExpanded={() => setPostExpanded((v) => !v)}
                   showCommentActions={selected.kind === 'FEED_COMMENT'}
+                  showMessengerReply={selected.kind === 'MESSENGER'}
+                  showMessengerActions={selected.kind === 'MESSENGER'}
+                  pinnedMessageIds={pinnedMessageIds}
+                  onMessengerReact={handleMessengerReact}
+                  onMessengerUnreact={handleMessengerUnreact}
+                  onMessengerTogglePin={handleMessengerTogglePin}
                   postPermalinkUrl={post?.permalinkUrl}
                   onReplyComment={handleReplyToComment}
+                  onReplyMessage={handleReplyToMessengerMessage}
                   onMessageCustomer={openMessengerThread}
                   onCommentAction={handleCommentAction}
                 />
@@ -1124,6 +1500,19 @@ export default function ConversationsPage() {
                       pageId={pageId}
                       threadId={selected.id}
                       shopPictureUrl={pagePictureUrl}
+                      commentId={
+                        messengerSourceCommentId ??
+                        messengerSourceCommentIdRef.current ??
+                        (selected.commentId &&
+                        isValidFacebookCommentId(selected.commentId)
+                          ? selected.commentId
+                          : null)
+                      }
+                      replyToMessageId={replyToMessageId}
+                      replyPreview={messengerReplyPreview}
+                      replyPreviewLabel="Trả lời tin nhắn"
+                      onReplyPreviewClick={scrollToReplyMessage}
+                      onClearReply={clearReplyMessage}
                       onBusyChange={(busy) => {
                         outboundInFlightRef.current = busy;
                       }}
@@ -1150,10 +1539,12 @@ export default function ConversationsPage() {
                           rawPayload: JSON.stringify({
                             source: 'app_send',
                             clientMessageId,
+                            replyToMessageId: replyToMessageId ?? null,
                           }),
                           createdAt: new Date().toISOString(),
                         };
                         setMessages((msgs) => upsertThreadMessage(msgs, sent));
+                        clearReplyMessage();
                         setConversations((prev) =>
                           [...prev]
                             .map((c) =>
@@ -1175,6 +1566,14 @@ export default function ConversationsPage() {
                       }}
                       onAck={({ ok }) => {
                         if (!ok) return;
+                        setMessengerSourceCommentId(null);
+                        messengerSourceCommentIdRef.current = null;
+                        if (selected) {
+                          void tryMigrateMessengerThread(
+                            selected.senderId,
+                            selected.senderName,
+                          );
+                        }
                       }}
                     />
                   ) : (
@@ -1188,7 +1587,7 @@ export default function ConversationsPage() {
                       onReplyPreviewClick={scrollToReplyTarget}
                       onClearReply={clearReplyComment}
                       iconOnlyActions
-                      allowAttachments={false}
+                      allowAttachments
                       onBusyChange={(busy) => {
                         outboundInFlightRef.current = busy;
                       }}
@@ -1197,6 +1596,8 @@ export default function ConversationsPage() {
                         text,
                         savedEventId,
                         fbMessageId,
+                        msgType,
+                        content,
                       }) => {
                         const isReply = Boolean(replyCommentId);
                         const sent: WebhookMessage = {
@@ -1212,10 +1613,10 @@ export default function ConversationsPage() {
                           postId: selected.postId,
                           commentId: fbMessageId ?? null,
                           parentCommentId: isReply ? replyCommentId : null,
-                          msgType: isReply
-                            ? 'feed.comment.reply'
-                            : 'feed.comment',
-                          content: text,
+                          msgType:
+                            msgType ??
+                            (isReply ? 'feed.comment.reply' : 'feed.comment'),
+                          content: content ?? text,
                           rawPayload: JSON.stringify({
                             source: 'app_send',
                             clientMessageId,
@@ -1229,7 +1630,16 @@ export default function ConversationsPage() {
                               c.id === selected.id
                                 ? {
                                     ...c,
-                                    preview: text,
+                                    preview: formatConversationThreadPreview({
+                                      content: content ?? text,
+                                      msgType:
+                                        msgType ??
+                                        (isReply
+                                          ? 'feed.comment.reply'
+                                          : 'feed.comment'),
+                                      eventType: 'FEED_COMMENT',
+                                      direction: 'OUT',
+                                    }),
                                     lastMessageAt: sent.createdAt,
                                     unreadCount: 0,
                                   }

@@ -32,6 +32,93 @@ function parseAttachmentJson(raw: string): ParsedAttachment | null {
   return null;
 }
 
+const PLACEHOLDER_COMMENT_TEXT = '[Bình luận mới trên bài viết]';
+
+function isPlaceholderCommentText(text: string | null | undefined): boolean {
+  const trimmed = text?.trim();
+  return !trimmed || trimmed === PLACEHOLDER_COMMENT_TEXT;
+}
+
+function extractAttachmentFromPayload(
+  payload: Record<string, unknown>,
+): {
+  type?: string;
+  url?: string;
+  title?: string;
+  media?: { image?: { src?: string }; source?: string };
+} | null {
+  const direct = payload.attachment;
+  if (direct && typeof direct === 'object') {
+    return direct as {
+      type?: string;
+      url?: string;
+      title?: string;
+      media?: { image?: { src?: string }; source?: string };
+    };
+  }
+
+  const photo = payload.photo;
+  if (typeof photo === 'string' && photo.trim()) {
+    const url = photo.trim();
+    return { type: 'photo', url, media: { image: { src: url } } };
+  }
+
+  const link = payload.link;
+  if (typeof link === 'string' && link.trim()) {
+    const url = link.trim();
+    if (/\.(png|jpe?g|gif|webp)(\?|$)/i.test(url) || url.includes('fbcdn.net')) {
+      return { type: 'photo', url, media: { image: { src: url } } };
+    }
+  }
+
+  return null;
+}
+
+function serializeAttachment(
+  att: NonNullable<ReturnType<typeof extractAttachmentFromPayload>>,
+  text: string,
+): { text: string; attachment: ParsedAttachment } {
+  const imageUrl = att.media?.image?.src ?? att.url;
+  const videoUrl = att.media?.source;
+
+  if (imageUrl) {
+    return {
+      text,
+      attachment: {
+        href: imageUrl,
+        thumb: imageUrl,
+        type: 'image',
+        title: att.title ?? 'Ảnh',
+      },
+    };
+  }
+
+  if (att.type === 'sticker' && att.url) {
+    return {
+      text,
+      attachment: {
+        href: att.url,
+        thumb: att.url,
+        type: 'sticker',
+        title: 'Sticker',
+      },
+    };
+  }
+
+  if (videoUrl || att.type === 'video') {
+    return {
+      text,
+      attachment: {
+        href: videoUrl ?? att.url,
+        type: 'video',
+        title: att.title ?? 'Video',
+      },
+    };
+  }
+
+  return { text, attachment: { href: att.url, type: att.type, title: att.title } };
+}
+
 function extractFeedCommentFromRaw(
   msg: WebhookMessage,
 ): { text: string; attachment?: ParsedAttachment } | null {
@@ -39,7 +126,10 @@ function extractFeedCommentFromRaw(
 
   try {
     const payload = JSON.parse(msg.rawPayload) as {
+      source?: string;
       message?: string;
+      photo?: string;
+      link?: string;
       comment?: {
         message?: string;
         attachment?: {
@@ -57,49 +147,24 @@ function extractFeedCommentFromRaw(
       };
     };
 
-    const comment = payload.comment ?? payload;
-    const att = comment.attachment ?? payload.attachment;
-    const text =
-      msg.content?.trim() ||
-      comment.message?.trim() ||
+    const commentNode =
+      payload.comment && typeof payload.comment === 'object'
+        ? payload.comment
+        : payload;
+    const att =
+      commentNode.attachment ??
+      payload.attachment ??
+      extractAttachmentFromPayload(payload);
+    const textFromPayload =
+      commentNode.message?.trim() ||
       payload.message?.trim() ||
       '';
+    const text = isPlaceholderCommentText(msg.content)
+      ? textFromPayload
+      : msg.content?.trim() || textFromPayload;
 
     if (att) {
-      const imageUrl = att.media?.image?.src;
-      const videoUrl = att.media?.source;
-      if (imageUrl) {
-        return {
-          text,
-          attachment: {
-            href: imageUrl,
-            thumb: imageUrl,
-            type: 'image',
-            title: att.title ?? 'Ảnh',
-          },
-        };
-      }
-      if (att.type === 'sticker' && att.url) {
-        return {
-          text,
-          attachment: {
-            href: att.url,
-            thumb: att.url,
-            type: 'sticker',
-            title: 'Sticker',
-          },
-        };
-      }
-      if (videoUrl || att.type === 'video') {
-        return {
-          text,
-          attachment: {
-            href: videoUrl ?? att.url,
-            type: 'video',
-            title: att.title ?? 'Video',
-          },
-        };
-      }
+      return serializeAttachment(att, text);
     }
 
     if (text) return { text };
@@ -202,6 +267,75 @@ export function isFeedCommentReply(msg: WebhookMessage): boolean {
   if (msg.msgType?.includes('reply')) return true;
   if (msg.parentCommentId?.trim()) return true;
   return !!extractParentCommentId(msg);
+}
+
+export interface ThreadPreviewInput {
+  content?: string | null;
+  msgType?: string | null;
+  eventType?: string | null;
+  direction?: string | null;
+  senderName?: string | null;
+}
+
+function formatMediaThreadPreview(
+  mediaType: string | undefined,
+  direction: string | null | undefined,
+  senderName: string | null | undefined,
+): string {
+  const who =
+    direction === 'OUT' ? 'Bạn' : senderName?.trim() || 'Khách hàng';
+  if (mediaType?.includes('sticker')) return `${who} đã gửi 1 sticker`;
+  if (mediaType?.includes('video')) return `${who} đã gửi 1 video`;
+  return `${who} đã gửi 1 hình ảnh`;
+}
+
+function isFeedCommentMediaMsgType(msgType?: string | null): boolean {
+  if (!msgType) return false;
+  return (
+    msgType.includes('photo') ||
+    msgType.includes('video') ||
+    msgType.includes('sticker')
+  );
+}
+
+/** Rút gọn nội dung cuối để hiển thị trên sidebar hội thoại. */
+export function formatConversationThreadPreview(
+  input: ThreadPreviewInput,
+): string {
+  const content = input.content?.trim() ?? '';
+  const isFeedComment =
+    input.eventType === 'FEED_COMMENT' || input.msgType?.startsWith('feed.');
+
+  if (content.startsWith('{')) {
+    const attachment = parseAttachmentJson(content);
+    if (attachment?.href || attachment?.thumb) {
+      return formatMediaThreadPreview(
+        attachment.type,
+        input.direction,
+        input.senderName,
+      );
+    }
+    if (isFeedComment) return 'Bình luận';
+  }
+
+  if (isFeedCommentMediaMsgType(input.msgType)) {
+    const mediaType = input.msgType!.includes('video')
+      ? 'video'
+      : input.msgType!.includes('sticker')
+        ? 'sticker'
+        : 'image';
+    return formatMediaThreadPreview(
+      mediaType,
+      input.direction,
+      input.senderName,
+    );
+  }
+
+  if (!content) {
+    return isFeedComment ? 'Bình luận' : '';
+  }
+
+  return content.length > 120 ? `${content.slice(0, 120)}…` : content;
 }
 
 /** Rút gọn nội dung bình luận để hiển thị preview trả lời. */

@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef } from 'react';
 import type { ConversationKind, ConversationThread } from '@/lib/api';
 import { formatDateTime } from '@/lib/datetime';
+import { formatConversationThreadPreview } from '@/lib/message-content';
 import { UserAvatar } from '@/components/user-avatar';
 
 interface ConversationListProps {
@@ -211,7 +212,13 @@ export function ConversationList({
                           : 'text-[#6b7280]'
                       }`}
                     >
-                      {item.preview}
+                      {item.kind === 'FEED_COMMENT'
+                        ? formatConversationThreadPreview({
+                            content: item.preview,
+                            eventType: 'FEED_COMMENT',
+                            senderName: item.senderName,
+                          })
+                        : item.preview}
                     </p>
                   </div>
                   <div className="flex shrink-0 flex-col items-end justify-between gap-2 pb-1">

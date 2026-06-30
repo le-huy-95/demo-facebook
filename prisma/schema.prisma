@@ -3,7 +3,7 @@ generator client {
 }
 
 datasource db {
-  provider = "sqlite"
+  provider = "postgresql"
   url      = env("DATABASE_URL")
 }
 
@@ -102,4 +102,32 @@ model ConversationReadState {
   @@unique([organizationId, pageId, threadId])
   @@index([pageId])
   @@map("conversation_read_states")
+}
+
+model MessengerMessageReaction {
+  id             String   @id @default(uuid())
+  organizationId String   @map("organization_id")
+  pageId         String   @map("page_id")
+  threadId       String   @map("thread_id")
+  messageId      String   @map("message_id")
+  emoji          String
+  reactorId      String   @map("reactor_id")
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  @@unique([pageId, threadId, messageId, reactorId])
+  @@index([pageId, threadId])
+  @@map("messenger_message_reactions")
+}
+
+model PinnedThreadMessage {
+  id             String   @id @default(uuid())
+  organizationId String   @map("organization_id")
+  pageId         String   @map("page_id")
+  threadId       String   @map("thread_id")
+  messageId      String   @map("message_id")
+  pinnedAt       DateTime @default(now()) @map("pinned_at")
+
+  @@unique([pageId, threadId, messageId])
+  @@index([pageId, threadId])
+  @@map("pinned_thread_messages")
 }

@@ -56,29 +56,43 @@ export class ConversationsController {
       before: before || undefined,
     });
 
+    if (!before && result.threads.length === 0) {
+      void this.webhookService
+        .syncCommentsForPage(pageId, true)
+        .then(() =>
+          this.conversationsService.invalidatePageCache(pageId, orgId),
+        )
+        .catch(() => undefined);
+    }
+
     return { statusCode: 200, data: result.threads, paging: result.paging };
   }
 
   @Post('sync-comments')
   @ApiOperation({
     summary:
-      '[Deprecated] Không sync/backfill từ Facebook — lịch sử chỉ từ webhook',
+      'Đồng bộ bình luận từ Facebook Graph API vào DB (dùng khi DB trống hoặc thiếu webhook)',
   })
   @ApiQuery({ name: 'pageId', required: true })
-  async syncComments(@Query('pageId') pageId: string) {
+  @ApiQuery({ name: 'force', required: false })
+  async syncComments(
+    @Query('pageId') pageId: string,
+    @Query('force') force?: string,
+  ) {
     if (!pageId?.trim()) {
       throw new BadRequestException('Thiếu tham số pageId');
     }
 
+    const orgId = this.facebookPageService.getDefaultOrgId();
+    const result = await this.webhookService.syncCommentsForPage(
+      pageId,
+      force === 'true' || force === '1',
+    );
+    await this.conversationsService.invalidatePageCache(pageId, orgId);
+
     return {
       statusCode: 200,
-      data: {
-        deprecated: true,
-        ingested: 0,
-        threadIds: [],
-        message:
-          'Event-driven architecture: không pull lịch sử từ Facebook Graph API.',
-      },
+      data: result,
     };
   }
 
@@ -131,6 +145,33 @@ export class ConversationsController {
     return res.status(404).send('No avatar');
   }
 
+  @Get('resolve-messenger-psid')
+  @ApiOperation({
+    summary:
+      'Tìm PSID Messenger từ người bình luận (khi chuyển từ tab bình luận sang nhắn tin)',
+  })
+  @ApiQuery({ name: 'pageId', required: true })
+  @ApiQuery({ name: 'commentAuthorId', required: false })
+  @ApiQuery({ name: 'senderName', required: false })
+  async resolveMessengerPsid(
+    @Query('pageId') pageId: string,
+    @Query('commentAuthorId') commentAuthorId?: string,
+    @Query('senderName') senderName?: string,
+  ) {
+    if (!pageId?.trim()) {
+      throw new BadRequestException('Thiếu pageId');
+    }
+
+    const orgId = this.facebookPageService.getDefaultOrgId();
+    const data = await this.conversationsService.resolveMessengerPsid(
+      pageId,
+      orgId,
+      { commentAuthorId, senderName },
+    );
+
+    return { statusCode: 200, data };
+  }
+
   @Get(':threadId/messages')
   @ApiOperation({
     summary: 'Tin nhắn / bình luận trong một cuộc trò chuyện (phân trang)',
@@ -179,7 +220,102 @@ export class ConversationsController {
       parentCommentId: (e as any).parentCommentId ?? null,
     }));
 
-    return { statusCode: 200, data, paging: result.paging };
+    return { statusCode: 200, data, paging: result.paging, meta: result.meta };
+  }
+
+  @Post('messages/:messageId/reaction')
+  @ApiOperation({ summary: 'Thả emoji reaction lên tin nhắn Messenger của khách' })
+  @ApiQuery({ name: 'pageId', required: true })
+  @ApiQuery({ name: 'threadId', required: true })
+  @ApiQuery({ name: 'emoji', required: true })
+  async reactToMessage(
+    @Param('messageId') messageId: string,
+    @Query('pageId') pageId: string,
+    @Query('threadId') threadId: string,
+    @Query('emoji') emoji: string,
+  ) {
+    if (!pageId?.trim() || !threadId?.trim() || !messageId?.trim()) {
+      throw new BadRequestException('Thiếu pageId, threadId hoặc messageId');
+    }
+
+    const orgId = this.facebookPageService.getDefaultOrgId();
+    const data = await this.conversationsService.reactToMessengerMessage({
+      pageId,
+      threadId,
+      messageId,
+      emoji,
+      orgId,
+    });
+    return { statusCode: 200, data };
+  }
+
+  @Post('messages/:messageId/unreact')
+  @ApiOperation({ summary: 'Bỏ emoji reaction trên tin nhắn Messenger' })
+  @ApiQuery({ name: 'pageId', required: true })
+  @ApiQuery({ name: 'threadId', required: true })
+  async unreactToMessage(
+    @Param('messageId') messageId: string,
+    @Query('pageId') pageId: string,
+    @Query('threadId') threadId: string,
+  ) {
+    if (!pageId?.trim() || !threadId?.trim() || !messageId?.trim()) {
+      throw new BadRequestException('Thiếu pageId, threadId hoặc messageId');
+    }
+
+    const orgId = this.facebookPageService.getDefaultOrgId();
+    const data = await this.conversationsService.unreactToMessengerMessage({
+      pageId,
+      threadId,
+      messageId,
+      orgId,
+    });
+    return { statusCode: 200, data };
+  }
+
+  @Post('messages/:messageId/pin')
+  @ApiOperation({ summary: 'Ghim tin nhắn Messenger lên đầu cuộc trò chuyện' })
+  @ApiQuery({ name: 'pageId', required: true })
+  @ApiQuery({ name: 'threadId', required: true })
+  async pinMessage(
+    @Param('messageId') messageId: string,
+    @Query('pageId') pageId: string,
+    @Query('threadId') threadId: string,
+  ) {
+    if (!pageId?.trim() || !threadId?.trim() || !messageId?.trim()) {
+      throw new BadRequestException('Thiếu pageId, threadId hoặc messageId');
+    }
+
+    const orgId = this.facebookPageService.getDefaultOrgId();
+    const data = await this.conversationsService.pinMessengerMessage({
+      pageId,
+      threadId,
+      messageId,
+      orgId,
+    });
+    return { statusCode: 200, data };
+  }
+
+  @Post('messages/:messageId/unpin')
+  @ApiOperation({ summary: 'Bỏ ghim tin nhắn Messenger' })
+  @ApiQuery({ name: 'pageId', required: true })
+  @ApiQuery({ name: 'threadId', required: true })
+  async unpinMessage(
+    @Param('messageId') messageId: string,
+    @Query('pageId') pageId: string,
+    @Query('threadId') threadId: string,
+  ) {
+    if (!pageId?.trim() || !threadId?.trim() || !messageId?.trim()) {
+      throw new BadRequestException('Thiếu pageId, threadId hoặc messageId');
+    }
+
+    const orgId = this.facebookPageService.getDefaultOrgId();
+    const data = await this.conversationsService.unpinMessengerMessage({
+      pageId,
+      threadId,
+      messageId,
+      orgId,
+    });
+    return { statusCode: 200, data };
   }
 
   @Post(':threadId/send')
@@ -241,7 +377,7 @@ export class ConversationsController {
   @ApiQuery({
     name: 'action',
     required: true,
-    description: 'like | hide | unhide',
+    description: 'like | unlike | hide | unhide',
   })
   async commentAction(
     @Param('commentId') commentId: string,
@@ -255,6 +391,14 @@ export class ConversationsController {
     const normalized = action?.trim().toLowerCase();
     if (normalized === 'like') {
       const data = await this.webhookService.likeCommentOnPage(
+        pageId,
+        commentId,
+      );
+      return { statusCode: 200, data };
+    }
+
+    if (normalized === 'unlike') {
+      const data = await this.webhookService.unlikeCommentOnPage(
         pageId,
         commentId,
       );
@@ -280,7 +424,7 @@ export class ConversationsController {
     }
 
     throw new BadRequestException(
-      'action không hợp lệ — dùng like, hide hoặc unhide',
+      'action không hợp lệ — dùng like, unlike, hide hoặc unhide',
     );
   }
 }

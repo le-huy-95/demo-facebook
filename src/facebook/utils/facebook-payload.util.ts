@@ -136,7 +136,8 @@ export function transformInboundMessage(event: any): InboundSocialMsgTransform {
     return {
       msgType: 'webchat',
       content: text,
-      contentRaw: text,
+      // Giữ full webhook event để FE đọc message.reply_to (phản hồi tin Page).
+      contentRaw,
       filename: '',
       quote,
       lastMessagePreview: text.substring(0, 200),
