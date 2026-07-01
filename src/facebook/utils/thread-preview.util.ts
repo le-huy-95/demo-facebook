@@ -1,3 +1,8 @@
+import {
+  formatMessengerTemplatePreview,
+  parseMessengerTemplateJson,
+} from './messenger-template.util';
+
 export interface FormatThreadPreviewInput {
   content?: string | null;
   msgType?: string | null;
@@ -6,19 +11,60 @@ export interface FormatThreadPreviewInput {
   senderName?: string | null;
 }
 
+function humanizeBracketLabel(value: string | undefined): string {
+  const trimmed = value?.trim() ?? '';
+  if (!trimmed) return '';
+  const match = trimmed.match(/^\[(.+)\]$/);
+  return match ? match[1] : trimmed;
+}
+
 function parseAttachmentPayload(
   content: string,
-): { type?: string; href?: string; thumb?: string } | null {
+): { type?: string; href?: string; thumb?: string; title?: string; preview?: string } | null {
   if (!content.startsWith('{')) return null;
   try {
     const parsed = JSON.parse(content) as {
       type?: string;
       href?: string;
       thumb?: string;
+      title?: string;
+      preview?: string;
+      params?: string;
     };
-    if (parsed && typeof parsed === 'object' && (parsed.href || parsed.thumb)) {
+    if (!parsed || typeof parsed !== 'object') return null;
+
+    if (parsed.href || parsed.thumb) {
       return parsed;
     }
+
+    const isFileObject =
+      'params' in parsed ||
+      /^\[.+\]$/.test(parsed.title ?? '') ||
+      /^\[.+\]$/.test(parsed.preview ?? '');
+
+    if (!isFileObject) return null;
+
+    let mediaType = parsed.type;
+    if (parsed.params) {
+      try {
+        const params = JSON.parse(parsed.params) as {
+          fileExt?: string;
+          fType?: number;
+        };
+        if (params.fType === 1) mediaType = 'image';
+        else if (params.fType === 3) mediaType = 'video';
+        else if (params.fType === 2) mediaType = 'file';
+      } catch {
+        // ignore
+      }
+    }
+
+    return {
+      type: mediaType ?? 'file',
+      title:
+        humanizeBracketLabel(parsed.title || parsed.preview) || 'Tệp đính kèm',
+      preview: parsed.preview,
+    };
   } catch {
     // not JSON attachment payload
   }
@@ -57,9 +103,31 @@ export function formatConversationThreadPreview(
   const isFeedComment =
     input.eventType === 'FEED_COMMENT' || input.msgType?.startsWith('feed.');
 
+  if (input.msgType === 'chat.template' && content.startsWith('{')) {
+    const template = parseMessengerTemplateJson(content);
+    if (template) return formatMessengerTemplatePreview(template);
+  }
+
   if (content.startsWith('{')) {
+    const template = parseMessengerTemplateJson(content);
+    if (template) return formatMessengerTemplatePreview(template);
+
     const attachment = parseAttachmentPayload(content);
-    if (attachment?.href || attachment?.thumb) {
+    if (attachment) {
+      if (attachment.href || attachment.thumb) {
+        return formatMediaThreadPreview(
+          attachment.type,
+          input.direction,
+          input.senderName,
+        );
+      }
+      const who =
+        input.direction === 'OUT'
+          ? 'Bạn'
+          : input.senderName?.trim() || 'Khách hàng';
+      if (attachment.type === 'file' || attachment.type === 'template') {
+        return `${who}: ${attachment.title ?? 'Tệp đính kèm'}`;
+      }
       return formatMediaThreadPreview(
         attachment.type,
         input.direction,

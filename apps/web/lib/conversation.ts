@@ -227,23 +227,46 @@ export function enrichEventForThread(event: WebhookMessage): WebhookMessage {
  * Tính threadId từ event — mirror CHÍNH XÁC logic backend `buildThreadId`.
  *
  * MESSENGER/POSTBACK : `messenger:{pageId}:{customerId}` hoặc `...:{postId}` (quảng cáo)
- * FEED_COMMENT       : `comment:{pageId}:{postId}:{customerId}`
+ * FEED_COMMENT       : `comment:{pageId}:{postId}:{customerId}:{rootCommentId}`
  */
 export function buildFeedCommentThreadId(
   pageId: string,
   postId: string,
   customerId: string,
+  rootCommentId?: string | null,
 ): string {
+  if (rootCommentId) {
+    return `comment:${pageId}:${postId}:${customerId}:${rootCommentId}`;
+  }
   return `comment:${pageId}:${postId}:${customerId}`;
 }
 
-/** Gộp thread id cũ (có rootCommentId) về định dạng chuẩn. */
+/** Chuẩn hóa thread id bình luận — giữ rootCommentId nếu có. */
 export function normalizeCommentThreadId(threadId: string): string {
   if (!threadId.startsWith('comment:')) return threadId;
   const parts = threadId.split(':');
   if (parts.length < 4) return threadId;
   const customerId = parts.length >= 5 ? parts[3]! : parts.slice(3).join(':');
-  return buildFeedCommentThreadId(parts[1]!, parts[2]!, customerId);
+  const rootCommentId =
+    parts.length >= 5 ? parts.slice(4).join(':') : undefined;
+  return buildFeedCommentThreadId(
+    parts[1]!,
+    parts[2]!,
+    customerId,
+    rootCommentId,
+  );
+}
+
+function resolveRootCommentIdFromEvent(
+  event: WebhookMessage,
+): string | null {
+  if (
+    event.commentId &&
+    (!event.parentCommentId || event.parentCommentId === event.postId)
+  ) {
+    return event.commentId;
+  }
+  return event.parentCommentId ?? event.commentId ?? null;
 }
 
 export function buildThreadIdFromEvent(event: WebhookMessage): string | null {
@@ -280,10 +303,14 @@ export function buildThreadIdFromEvent(event: WebhookMessage): string | null {
     }
     if (!customerId || customerId === enriched.pageId) return null;
 
+    const rootCommentId = resolveRootCommentIdFromEvent(enriched);
+    if (!rootCommentId) return null;
+
     return buildFeedCommentThreadId(
       enriched.pageId,
       enriched.postId,
       customerId,
+      rootCommentId,
     );
   }
 

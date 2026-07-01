@@ -1,6 +1,6 @@
 $ErrorActionPreference = 'Stop'
 
-# Tunnel ngrok -> backend (3000) WITHOUT killing other ngrok processes.
+# Tunnel ngrok -> backend (3002) WITHOUT killing other ngrok processes.
 $userConfig = Join-Path $env:LOCALAPPDATA 'Packages\ngrok.ngrok_1g87z0zv29zzc\LocalCache\Local\ngrok\ngrok.yml'
 
 if (-not (Test-Path $userConfig)) {
@@ -8,5 +8,5 @@ if (-not (Test-Path $userConfig)) {
   exit 1
 }
 
-& ngrok http 3000 --config $userConfig --log=stdout
+& ngrok http 3002 --config $userConfig --log=stdout
 

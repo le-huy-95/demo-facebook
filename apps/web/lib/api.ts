@@ -2,7 +2,7 @@
 export const API_BASE =
   typeof window !== 'undefined'
     ? ''
-    : (process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:3000');
+    : (process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:3002');
 
 const API_HEADERS: HeadersInit = {
   'ngrok-skip-browser-warning': 'true',
@@ -128,7 +128,33 @@ export async function initiateOAuth(friendlyName: string) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ friendlyName }),
   });
-  if (!res.ok) throw new Error('Không tạo được OAuth URL');
+  if (!res.ok) {
+    let detail = '';
+    try {
+      const body = (await res.json()) as { message?: string | string[] };
+      if (typeof body.message === 'string') detail = body.message;
+      else if (Array.isArray(body.message)) detail = body.message.join(', ');
+    } catch {
+      try {
+        detail = (await res.text()).trim();
+      } catch {
+        // ignore
+      }
+    }
+    const cannotPost =
+      detail.includes('Cannot POST') ||
+      detail.includes('Cannot GET') ||
+      detail.includes('Not Found');
+    const hint = cannotPost
+      ? 'API không tới được NestJS — kiểm tra backend (:3002), Next.js (:3001), và ngrok phải trỏ cổng 3001 (npm run dev:ngrok)'
+      : res.status >= 500
+        ? 'Backend chưa chạy hoặc không kết nối được DB — hãy bật Docker Desktop rồi chạy: npm run db:up && npm run dev:backend'
+        : '';
+    throw new Error(
+      detail ||
+        `Không tạo được OAuth URL (HTTP ${res.status})${hint ? `. ${hint}` : ''}`,
+    );
+  }
   return res.json() as Promise<{ data: { url: string; credentialId: string } }>;
 }
 
@@ -280,6 +306,20 @@ export async function unreactToMessengerMessage(
     throw new Error(await readApiErrorMessage(res, 'Không bỏ được emoji'));
   }
   return res.json() as Promise<{ data: { success: boolean } }>;
+}
+
+export async function getMessageAttachmentUrl(pageId: string, messageId: string) {
+  const qs = new URLSearchParams({ pageId });
+  const res = await apiFetch(
+    `${API_BASE}/conversations/messages/${encodeURIComponent(messageId)}/attachment-url?${qs}`,
+    { cache: 'no-store' },
+  );
+  if (!res.ok) {
+    throw new Error(
+      await readApiErrorMessage(res, 'Không lấy được link tệp đính kèm'),
+    );
+  }
+  return res.json() as Promise<{ data: { url: string | null } }>;
 }
 
 export async function pinMessengerMessage(

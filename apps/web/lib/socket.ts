@@ -2,7 +2,7 @@ import { io, type Socket } from 'socket.io-client';
 
 /**
  * Socket.IO backend URL.
- * - localhost: kết nối thẳng Nest (3000) — tránh lỗi proxy Next dev.
+ * - localhost: kết nối thẳng Nest (3002) — tránh lỗi proxy Next dev.
  * - ngrok HTTPS: same-origin → Next rewrite `/socket.io` → Nest.
  */
 function getSocketUrl(): string {
@@ -10,13 +10,13 @@ function getSocketUrl(): string {
     return (
       process.env.NEXT_PUBLIC_SOCKET_URL ??
       process.env.NEXT_PUBLIC_API_URL ??
-      'http://localhost:3000'
+      'http://localhost:3002'
     );
   }
 
   const { hostname, origin } = window.location;
   if (hostname === 'localhost' || hostname === '127.0.0.1') {
-    return process.env.NEXT_PUBLIC_SOCKET_URL ?? 'http://localhost:3000';
+    return process.env.NEXT_PUBLIC_SOCKET_URL ?? 'http://localhost:3002';
   }
 
   return origin;

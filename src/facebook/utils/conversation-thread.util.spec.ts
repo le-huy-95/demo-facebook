@@ -2,6 +2,7 @@ import type { WebhookEvent } from '@prisma/client';
 import {
   aggregateConversations,
   buildFeedCommentThreadId,
+  resolveRootCommentId,
 } from './conversation-thread.util';
 
 function makeEvent(
@@ -83,7 +84,7 @@ describe('aggregateConversations', () => {
     expect(threads[0]?.unreadCount).toBe(1);
   });
 
-  it('groups feed comments from the same customer on one post into one thread', () => {
+  it('groups root comment and its replies into one thread per root', () => {
     const rootComment = '111_222';
     const replyComment = '111_333';
     const threads = aggregateConversations([
@@ -113,8 +114,62 @@ describe('aggregateConversations', () => {
 
     expect(threads).toHaveLength(1);
     expect(threads[0]?.id).toBe(
-      buildFeedCommentThreadId('page-1', 'page-1_999', 'customer-9'),
+      buildFeedCommentThreadId('page-1', 'page-1_999', 'customer-9', rootComment),
     );
     expect(threads[0]?.messageCount).toBe(2);
+  });
+
+  it('creates separate threads for multiple root comments from the same customer', () => {
+    const rootA = '111_100';
+    const rootB = '111_200';
+    const threads = aggregateConversations([
+      makeEvent({
+        id: 'root-a',
+        eventType: 'FEED_COMMENT',
+        direction: 'IN',
+        senderId: 'customer-9',
+        postId: 'page-1_999',
+        commentId: rootA,
+        parentCommentId: null,
+        msgType: 'feed.comment',
+        createdAt: new Date('2026-06-26T01:00:00.000Z'),
+      }),
+      makeEvent({
+        id: 'root-b',
+        eventType: 'FEED_COMMENT',
+        direction: 'IN',
+        senderId: 'customer-9',
+        postId: 'page-1_999',
+        commentId: rootB,
+        parentCommentId: null,
+        msgType: 'feed.comment',
+        createdAt: new Date('2026-06-26T02:00:00.000Z'),
+      }),
+    ]);
+
+    expect(threads).toHaveLength(2);
+    expect(threads.map((t) => t.id).sort()).toEqual(
+      [
+        buildFeedCommentThreadId('page-1', 'page-1_999', 'customer-9', rootA),
+        buildFeedCommentThreadId('page-1', 'page-1_999', 'customer-9', rootB),
+      ].sort(),
+    );
+  });
+
+  it('resolveRootCommentId returns commentId for top-level comments', () => {
+    expect(
+      resolveRootCommentId({
+        commentId: '111_1',
+        parentCommentId: null,
+        postId: 'page-1_999',
+      }),
+    ).toBe('111_1');
+    expect(
+      resolveRootCommentId({
+        commentId: '111_2',
+        parentCommentId: '111_1',
+        postId: 'page-1_999',
+      }),
+    ).toBe('111_1');
   });
 });
