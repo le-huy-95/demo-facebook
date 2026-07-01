@@ -345,11 +345,15 @@ export function aggregateConversations(
         lastMessageAt: event.createdAt.toISOString(),
         postId: event.postId,
         commentId:
+          event.eventType === 'FEED_COMMENT' &&
           event.direction === 'IN' &&
           event.senderId &&
-          event.senderId !== event.pageId
+          event.senderId !== event.pageId &&
+          event.commentId
             ? event.commentId
-            : resolveRootCommentId(event),
+            : event.eventType === 'FEED_COMMENT'
+              ? resolveRootCommentId(event)
+              : null,
         messageCount: 1,
         unreadCount: isUnreadInbound ? 1 : 0,
         _latest: ts,
@@ -380,6 +384,7 @@ export function aggregateConversations(
         existing.senderName = event.senderName;
       }
       if (
+        event.eventType === 'FEED_COMMENT' &&
         event.direction === 'IN' &&
         event.senderId &&
         event.senderId !== event.pageId &&

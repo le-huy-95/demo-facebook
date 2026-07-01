@@ -77,6 +77,14 @@ export function transformFeedChange(
     }
   }
 
+  // Reaction webhook có comment_id trỏ tới bình luận được thích — không phải comment
+  // thật trong DB và không dùng được cho private reply / reply comment.
+  const storedCommentId = item === 'reaction' ? '' : commentId;
+  const storedMessageId =
+    item === 'reaction'
+      ? postId || `${item}-${Date.now()}`
+      : commentId || postId || `${item}-${Date.now()}`;
+
   return {
     eventType,
     msgType,
@@ -84,10 +92,10 @@ export function transformFeedChange(
     senderId: from.id ?? '',
     senderName: from.name ?? 'Facebook User',
     postId,
-    commentId,
+    commentId: storedCommentId,
     parentId,
     parentCommentId,
-    messageId: commentId || postId || `${item}-${Date.now()}`,
+    messageId: storedMessageId,
     verb,
   };
 }

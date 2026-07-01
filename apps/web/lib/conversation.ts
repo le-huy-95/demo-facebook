@@ -404,6 +404,7 @@ export function findMessengerThreadForCustomer(
 export function getMessageCommentKey(
   msg: WebhookMessage,
 ): string | null {
+  if (msg.eventType !== 'FEED_COMMENT') return null;
   const id = msg.commentId ?? msg.messageId;
   return isValidFacebookCommentId(id) ? id! : null;
 }
