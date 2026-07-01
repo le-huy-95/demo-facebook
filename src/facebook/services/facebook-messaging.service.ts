@@ -286,30 +286,26 @@ export class FacebookMessagingService {
       },
     );
 
-    let sourceCommentId = input.sourceCommentId?.trim() || undefined;
-    if (!sourceCommentId || !isValidFacebookCommentId(sourceCommentId)) {
-      const fromDb = await this.resolveSourceCommentIdForPrivateReply(
-        input.pageId,
-        commentAuthorId,
-      );
-      if (fromDb) sourceCommentId = fromDb;
-    } else {
-      sourceCommentId = await this.ensureCustomerCommentIdForPrivateReply(
-        input.pageId,
-        sourceCommentId,
-        commentAuthorId,
-      );
-      if (
-        sourceCommentId &&
-        (await this.hasPrivateReplyBeenSent(input.pageId, sourceCommentId))
-      ) {
-        sourceCommentId = undefined;
-      }
+    const hasRealPsidConversation = Boolean(
+      resolved.hasExistingConversation &&
+        resolved.psid &&
+        resolved.psid !== commentAuthorId,
+    );
+
+    let sourceCommentId: string | undefined;
+    if (!hasRealPsidConversation) {
+      sourceCommentId =
+        (await this.resolveVerifiedPrivateReplyCommentId(
+          input.pageId,
+          commentAuthorId,
+          input.sourceCommentId?.trim(),
+        )) ?? undefined;
     }
 
     // Có commentId → private reply lần đầu (mỗi comment chỉ được 1 tin).
     const shouldUsePrivateReply = Boolean(
-      sourceCommentId &&
+      !hasRealPsidConversation &&
+        sourceCommentId &&
         isValidFacebookCommentId(sourceCommentId) &&
         (input.text.trim() || input.attachment),
     );
@@ -765,6 +761,43 @@ export class FacebookMessagingService {
     return resolvePublicAssetUrl(url, publicBaseUrl);
   }
 
+  /**
+   * Chỉ dùng bình luận IN thật (FEED_COMMENT) của đúng khách — bỏ qua reaction id,
+   * message id Messenger, hoặc commentId FE gửi nhầm.
+   */
+  private async resolveVerifiedPrivateReplyCommentId(
+    pageId: string,
+    commentAuthorId: string,
+    preferredId?: string,
+  ): Promise<string | null> {
+    const verify = async (id: string): Promise<string | null> => {
+      const row = await this.prisma.webhookEvent.findFirst({
+        where: {
+          pageId,
+          eventType: 'FEED_COMMENT',
+          direction: 'IN',
+          senderId: commentAuthorId.trim(),
+          status: 'ACTIVE',
+          commentId: { not: null },
+          OR: [{ commentId: id }, { messageId: id }],
+        },
+        orderBy: { createdAt: 'desc' },
+        select: { commentId: true },
+      });
+      const cid = row?.commentId?.trim();
+      if (!cid || !isValidFacebookCommentId(cid)) return null;
+      if (await this.hasPrivateReplyBeenSent(pageId, cid)) return null;
+      return cid;
+    };
+
+    if (preferredId && isValidFacebookCommentId(preferredId)) {
+      const verified = await verify(preferredId);
+      if (verified) return verified;
+    }
+
+    return this.resolveSourceCommentIdForPrivateReply(pageId, commentAuthorId);
+  }
+
   /** Bình luận inbound mới nhất của khách — dùng private reply khi FE chưa gửi commentId. */
   private async resolveSourceCommentIdForPrivateReply(
     pageId: string,
@@ -858,35 +891,6 @@ export class FacebookMessagingService {
       select: { senderName: true },
     });
     return row?.senderName?.trim() ?? null;
-  }
-
-  /** Đảm bảo private reply nhắm đúng bình luận IN của khách, không phải parent/Page. */
-  private async ensureCustomerCommentIdForPrivateReply(
-    pageId: string,
-    commentId: string,
-    commentAuthorId: string,
-  ): Promise<string | undefined> {
-    const owner = await this.prisma.webhookEvent.findFirst({
-      where: {
-        pageId,
-        eventType: 'FEED_COMMENT',
-        OR: [{ commentId }, { messageId: commentId }],
-      },
-      select: { senderId: true, direction: true },
-    });
-
-    if (
-      owner?.direction === 'IN' &&
-      owner.senderId === commentAuthorId.trim()
-    ) {
-      return commentId;
-    }
-
-    const fromDb = await this.resolveSourceCommentIdForPrivateReply(
-      pageId,
-      commentAuthorId,
-    );
-    return fromDb ?? commentId;
   }
 
   private async lookupPostIdForComment(
