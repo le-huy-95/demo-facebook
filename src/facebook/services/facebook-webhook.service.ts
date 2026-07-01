@@ -14,8 +14,7 @@ import {
   transformMessagingReceipt,
 } from '../utils/facebook-payload.util';
 import { transformFeedChange, extractFeedCommentKey, extractFeedPostKey, type FeedEventTransform } from '../utils/facebook-feed.util';
-import { buildThreadId } from '../utils/conversation-thread.util';
-import { flattenGraphComments } from '../utils/graph-comment.util';
+import { buildThreadId, resolveFeedCommentThreadCustomerId } from '../utils/conversation-thread.util';
 import { extractPostIdFromMessengerPayload } from '../utils/messenger-thread.util';
 import { isValidFacebookCommentId, facebookCommentIdsMatch, buildFacebookCommentIdCandidates, facebookCommentIdSuffix } from '../utils/facebook-comment-id.util';
 import {
@@ -296,9 +295,7 @@ export class FacebookWebhookService implements OnModuleInit {
 
     const hasGraphMedia = feedCommentContentHasMedia(serialized.content);
     const hasExistingMedia = feedCommentContentHasMedia(existing.content);
-    const needsMsgType =
-      existing.msgType === 'feed.comment' &&
-      serialized.msgType !== existing.msgType;
+    const needsMsgType = serialized.msgType !== existing.msgType;
     const needsRaw =
       !existing.rawPayload?.includes('"attachment"') &&
       !existing.rawPayload?.includes('"photo"') &&
@@ -940,9 +937,9 @@ export class FacebookWebhookService implements OnModuleInit {
       pageId,
       eventType: 'FEED_COMMENT',
       direction: 'OUT',
-      senderId: ctx.customerId,
+      senderId: pageId,
       senderName: parsed.senderName || 'Page',
-      recipientId: pageId,
+      recipientId: ctx.customerId,
       messageId: parsed.messageId,
       postId: resolvedPostId,
       commentId: parsed.commentId || null,
@@ -1020,6 +1017,102 @@ export class FacebookWebhookService implements OnModuleInit {
     const parentId = comment.parent?.id;
     if (!parentId || parentId === postId) return null;
     return isValidFacebookCommentId(parentId) ? parentId : null;
+  }
+
+  private async ingestSyncedGraphFeedComment(
+    comment: GraphPostComment,
+    postId: string,
+    pageId: string,
+    orgId: string | null,
+    graphCommentsById: Map<string, GraphPostComment>,
+    sinceMs: number,
+    force: boolean,
+    threadIds: Set<string>,
+  ): Promise<{ ingested: number; updated: number }> {
+    let ingested = 0;
+    let updated = 0;
+
+    const senderId = comment.from?.id;
+    if (!senderId || !comment.id) return { ingested, updated };
+
+    const createdMs = new Date(comment.created_time).getTime();
+    if (!force && (!Number.isFinite(createdMs) || createdMs < sinceMs)) {
+      return { ingested, updated };
+    }
+
+    if (!isValidFacebookCommentId(comment.id)) return { ingested, updated };
+
+    const isFromPage = senderId === pageId;
+    const parentCommentId = this.resolveGraphParentCommentId(comment, postId);
+    const serialized = serializeFeedCommentContent(
+      {
+        message: comment.message,
+        attachment: comment.attachment,
+      },
+      { isReply: !!parentCommentId },
+    );
+
+    let direction: 'IN' | 'OUT' = 'IN';
+    let eventSenderId = senderId;
+    let recipientId: string | null = null;
+    let senderName = comment.from?.name ?? 'Facebook User';
+
+    if (isFromPage) {
+      const customerId = resolveFeedCommentThreadCustomerId(
+        comment,
+        pageId,
+        postId,
+        graphCommentsById,
+      );
+      if (!customerId) return { ingested, updated };
+      direction = 'OUT';
+      eventSenderId = pageId;
+      recipientId = customerId;
+      senderName = comment.from?.name ?? 'Page';
+    }
+
+    const payload = {
+      organizationId: orgId,
+      pageId,
+      eventType: 'FEED_COMMENT' as const,
+      direction,
+      senderId: eventSenderId,
+      recipientId,
+      senderName,
+      messageId: comment.id,
+      postId,
+      commentId: comment.id,
+      parentCommentId,
+      msgType: serialized.msgType,
+      content: serialized.content,
+      rawPayload: JSON.stringify({
+        source: 'webhook_changed_fields_sync',
+        comment,
+      }),
+    };
+
+    const existing = await this.findDuplicateEvent(payload);
+    if (existing) {
+      if (
+        await this.upgradeFeedCommentFromGraph(
+          existing,
+          comment,
+          parentCommentId,
+          pageId,
+        )
+      ) {
+        updated += 1;
+      }
+      const threadId = buildThreadId(existing);
+      if (threadId) threadIds.add(threadId);
+      return { ingested, updated };
+    }
+
+    const saved = await this.saveAndBroadcast(payload);
+    ingested += 1;
+    const threadId = buildThreadId(saved);
+    if (threadId) threadIds.add(threadId);
+    return { ingested, updated };
   }
 
   private async getPageAccessToken(
@@ -1141,82 +1234,32 @@ export class FacebookWebhookService implements OnModuleInit {
 
       for (const post of posts) {
         if (!post.id) continue;
-        const rawComments =
-          post.comments?.data?.length
-            ? post.comments.data
-            : await this.facebookOAuth.listAllPostComments(post.id, token, {
-                pageSize: force || totalEvents === 0 ? 100 : 25,
-                maxComments: force || totalEvents === 0 ? 500 : 40,
-              });
-        const comments = flattenGraphComments(rawComments);
+        const comments = await this.facebookOAuth.listAllPostComments(
+          post.id,
+          token,
+          {
+            pageSize: force || totalEvents === 0 ? 100 : 25,
+            maxComments: force || totalEvents === 0 ? 500 : 40,
+          },
+        );
 
         for (const comment of comments) {
           if (comment.id) graphCommentsById.set(comment.id, comment);
-          const senderId = comment.from?.id;
-          if (!senderId || senderId === pageId || !comment.id) continue;
+        }
 
-          const createdMs = new Date(comment.created_time).getTime();
-          if (
-            !force &&
-            (!Number.isFinite(createdMs) || createdMs < sinceMs)
-          ) {
-            continue;
-          }
-
-          if (!isValidFacebookCommentId(comment.id)) continue;
-
-          const parentCommentId = this.resolveGraphParentCommentId(
+        for (const comment of comments) {
+          const result = await this.ingestSyncedGraphFeedComment(
             comment,
             post.id,
-          );
-          const serialized = serializeFeedCommentContent(
-            {
-              message: comment.message,
-              attachment: comment.attachment,
-            },
-            { isReply: !!parentCommentId },
-          );
-
-          const payload = {
-            organizationId: orgId,
             pageId,
-            eventType: 'FEED_COMMENT' as const,
-            direction: 'IN' as const,
-            senderId,
-            senderName: comment.from?.name ?? 'Facebook User',
-            messageId: comment.id,
-            postId: post.id,
-            commentId: comment.id,
-            parentCommentId,
-            msgType: serialized.msgType,
-            content: serialized.content,
-            rawPayload: JSON.stringify({
-              source: 'webhook_changed_fields_sync',
-              comment,
-            }),
-          };
-
-          const existing = await this.findDuplicateEvent(payload);
-          if (existing) {
-            if (
-              await this.upgradeFeedCommentFromGraph(
-                existing,
-                comment,
-                parentCommentId,
-                pageId,
-              )
-            ) {
-              updated += 1;
-            }
-            const threadId = buildThreadId(existing);
-            if (threadId) threadIds.add(threadId);
-            continue;
-          }
-
-          const saved = await this.saveAndBroadcast(payload);
-          ingested += 1;
-          const threadId = buildThreadId(saved);
-          if (threadId) threadIds.add(threadId);
+            orgId,
+            graphCommentsById,
+            sinceMs,
+            force,
+            threadIds,
+          );
+          ingested += result.ingested;
+          updated += result.updated;
         }
       }
 
@@ -1233,71 +1276,21 @@ export class FacebookWebhookService implements OnModuleInit {
 
           for (const comment of comments) {
             if (comment.id) graphCommentsById.set(comment.id, comment);
-            const senderId = comment.from?.id;
-            if (!senderId || senderId === pageId || !comment.id) continue;
+          }
 
-            const createdMs = new Date(comment.created_time).getTime();
-            if (
-              !force &&
-              (!Number.isFinite(createdMs) || createdMs < sinceMs)
-            ) {
-              continue;
-            }
-
-            if (!isValidFacebookCommentId(comment.id)) continue;
-
-            const parentCommentId = this.resolveGraphParentCommentId(
+          for (const comment of comments) {
+            const result = await this.ingestSyncedGraphFeedComment(
               comment,
               postId,
-            );
-            const serialized = serializeFeedCommentContent(
-              {
-                message: comment.message,
-                attachment: comment.attachment,
-              },
-              { isReply: !!parentCommentId },
-            );
-
-            const payload = {
-              organizationId: orgId,
               pageId,
-              eventType: 'FEED_COMMENT' as const,
-              direction: 'IN' as const,
-              senderId,
-              senderName: comment.from?.name ?? 'Facebook User',
-              messageId: comment.id,
-              postId,
-              commentId: comment.id,
-              parentCommentId,
-              msgType: serialized.msgType,
-              content: serialized.content,
-              rawPayload: JSON.stringify({
-                source: 'webhook_changed_fields_sync',
-                comment,
-              }),
-            };
-
-            const existing = await this.findDuplicateEvent(payload);
-            if (existing) {
-              if (
-                await this.upgradeFeedCommentFromGraph(
-                  existing,
-                  comment,
-                  parentCommentId,
-                  pageId,
-                )
-              ) {
-                updated += 1;
-              }
-              const threadId = buildThreadId(existing);
-              if (threadId) threadIds.add(threadId);
-              continue;
-            }
-
-            const saved = await this.saveAndBroadcast(payload);
-            ingested += 1;
-            const threadId = buildThreadId(saved);
-            if (threadId) threadIds.add(threadId);
+              orgId,
+              graphCommentsById,
+              sinceMs,
+              force,
+              threadIds,
+            );
+            ingested += result.ingested;
+            updated += result.updated;
           }
         }
       }

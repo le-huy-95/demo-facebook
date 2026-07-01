@@ -8,10 +8,6 @@ import {
   facebookCommentIdsMatch,
   isValidFacebookCommentId,
 } from '../utils/facebook-comment-id.util';
-import {
-  GRAPH_COMMENT_FIELDS_WITH_REPLIES,
-  flattenGraphComments,
-} from '../utils/graph-comment.util';
 
 export interface OAuthStateData {
   orgId: string;
@@ -86,8 +82,15 @@ export interface GraphPostComment {
   };
 }
 
-/** Fields Graph API cho comment — gồm ảnh/sticker đính kèm + reply lồng nhau. */
-export const GRAPH_COMMENT_FIELDS = GRAPH_COMMENT_FIELDS_WITH_REPLIES;
+/** Fields Graph API cho comment — gồm ảnh/sticker đính kèm. */
+export const GRAPH_COMMENT_FIELDS =
+  'id,message,from{id,name,picture},created_time,parent{id},is_hidden,attachment{type,url,title,media,target}';
+
+/**
+ * Field expansion lồng 2 cấp — Graph mặc định chỉ trả vài reply gần nhất nếu không chỉ limit.
+ * Dùng khi không thể gọi /comments?filter=stream (ví dụ feed edge).
+ */
+export const GRAPH_COMMENT_FIELDS_WITH_REPLIES = `${GRAPH_COMMENT_FIELDS},comments.limit(100){${GRAPH_COMMENT_FIELDS},comments.limit(100){${GRAPH_COMMENT_FIELDS}}}`;
 
 export interface GraphFeedPost {
   id: string;
@@ -667,7 +670,7 @@ export class FacebookOAuthService {
           {
             searchParams: {
               access_token: accessToken,
-              fields: `id,message,created_time,comments.limit(100){${GRAPH_COMMENT_FIELDS}}`,
+              fields: `id,message,created_time,comments.limit(100){${GRAPH_COMMENT_FIELDS_WITH_REPLIES}}`,
               limit,
             },
             timeout: { request: 15_000 },
@@ -712,9 +715,9 @@ export class FacebookOAuthService {
       access_token: accessToken,
       fields: GRAPH_COMMENT_FIELDS,
       limit,
+      // stream = mọi cấp reply phẳng (Meta: Object Comments — filter stream)
       filter: 'stream',
-      // Mặc định lấy comment mới nhất trước — tránh bỏ sót thread khi bài có >100 comment
-      order: options?.order ?? 'reverse_chronological',
+      order: options?.order ?? 'chronological',
     };
 
     if (options?.before) {
@@ -738,7 +741,7 @@ export class FacebookOAuthService {
           paging?: { cursors?: { before?: string; after?: string } };
         }>();
 
-      const flat = flattenGraphComments(response.data ?? []);
+      const flat = this.flattenComments(response.data ?? []);
       return {
         comments: flat,
         paging: response.paging,
@@ -751,6 +754,24 @@ export class FacebookOAuthService {
       );
       return { comments: [] };
     }
+  }
+
+  private flattenComments(comments: GraphPostComment[]): GraphPostComment[] {
+    const flat: GraphPostComment[] = [];
+    const stack = [...comments];
+
+    while (stack.length > 0) {
+      const current = stack.shift();
+      if (!current?.id) continue;
+      flat.push(current);
+
+      const children = current.comments?.data ?? [];
+      if (children.length > 0) {
+        stack.push(...children);
+      }
+    }
+
+    return flat;
   }
 
   /** Lấy comment của bài viết qua phân trang (tối đa maxComments). */
@@ -771,7 +792,7 @@ export class FacebookOAuthService {
         {
           limit: pageSize,
           after,
-          order: 'reverse_chronological',
+          order: 'chronological',
         },
       );
 

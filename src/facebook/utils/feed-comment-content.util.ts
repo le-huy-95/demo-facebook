@@ -6,48 +6,38 @@ interface FeedCommentAttachment {
     image?: { src?: string; width?: number; height?: number };
     source?: string;
   };
-  target?: { id?: string; url?: string };
+  target?: { url?: string };
 }
 
 const PLACEHOLDER_COMMENT_TEXT = '[Bình luận mới trên bài viết]';
 
-const STICKER_ATTACHMENT_TYPES = new Set([
-  'sticker',
-  'animated_image',
-  'animated_image_share',
-  'gif',
-]);
-
-function isStickerAttachmentType(type?: string): boolean {
-  if (!type) return false;
-  const lower = type.toLowerCase();
-  return (
-    STICKER_ATTACHMENT_TYPES.has(lower) ||
-    lower.includes('sticker') ||
-    lower.includes('animated')
-  );
+function isGifUrl(url: string): boolean {
+  return /\.gif(\?|#|$)/i.test(url);
 }
 
-function isDirectMediaUrl(url: string): boolean {
-  return (
-    /\.(png|jpe?g|gif|webp|mp4|webm)(\?|$)/i.test(url) ||
-    url.includes('fbcdn.net') ||
-    url.includes('fbsbx.com')
-  );
+function isAnimatedAttachment(att: FeedCommentAttachment): boolean {
+  const type = att.type?.toLowerCase() ?? '';
+  if (type.includes('animated') || type === 'gif') return true;
+
+  const source = att.media?.source ?? '';
+  const image = att.media?.image?.src ?? '';
+  const url = att.url ?? '';
+
+  if (isGifUrl(source) || isGifUrl(url) || isGifUrl(image)) return true;
+  if (source && /\.(mp4|webm)(\?|$)/i.test(source)) return true;
+  // FB đôi khi trả photo + media.source là bản animated (GIF dạng video)
+  if (source && image && source !== image && type === 'photo') return true;
+
+  return false;
 }
 
-function resolveAttachmentMediaUrl(att: FeedCommentAttachment): {
-  imageUrl: string;
-  videoUrl: string;
-} {
-  const imageUrl =
-    att.media?.image?.src?.trim() ||
-    (att.url && isDirectMediaUrl(att.url) ? att.url.trim() : '') ||
-    (att.target?.url && isDirectMediaUrl(att.target.url)
-      ? att.target.url.trim()
-      : '');
-  const videoUrl = att.media?.source?.trim() || '';
-  return { imageUrl, videoUrl };
+function buildAttachmentPayload(
+  trimmedText: string,
+  payload: Record<string, unknown>,
+): string {
+  return JSON.stringify(
+    trimmedText ? { text: trimmedText, ...payload } : payload,
+  );
 }
 
 export function feedCommentContentHasMedia(
@@ -77,18 +67,6 @@ function extractAttachmentFromPayload(
     return { type: 'photo', url, media: { image: { src: url } } };
   }
 
-  const gif = payload.gif;
-  if (typeof gif === 'string' && gif.trim()) {
-    const url = gif.trim();
-    return { type: 'animated_image', url, media: { image: { src: url } } };
-  }
-
-  const sticker = payload.sticker;
-  if (typeof sticker === 'string' && sticker.trim()) {
-    const url = sticker.trim();
-    return { type: 'sticker', url, media: { image: { src: url } } };
-  }
-
   const link = payload.link;
   if (typeof link === 'string' && link.trim()) {
     const url = link.trim();
@@ -105,68 +83,67 @@ function serializeGraphAttachment(
   text: string,
   isReply: boolean,
 ): { content: string; msgType: string } {
-  const { imageUrl, videoUrl } = resolveAttachmentMediaUrl(att);
   const trimmedText = text.trim();
-  const isSticker =
-    isStickerAttachmentType(att.type) ||
-    /\.gif(\?|$)/i.test(imageUrl) ||
-    (isStickerAttachmentType(att.type) && Boolean(imageUrl || att.url));
-  const isVideo = Boolean(
-    videoUrl && (att.type === 'video' || !imageUrl || videoUrl !== imageUrl),
-  );
+  const imageUrl = att.media?.image?.src ?? att.url;
+  const videoUrl = att.media?.source;
+  const directUrl = att.url ?? '';
 
-  if (isVideo) {
-    const href = videoUrl || att.url || '';
-    const payload = trimmedText
-      ? { text: trimmedText, href, type: 'video', title: att.title ?? 'Video' }
-      : { href, type: 'video', title: att.title ?? 'Video' };
+  if (att.type === 'sticker') {
+    const href = directUrl || imageUrl || '';
+    return {
+      msgType: isReply ? 'feed.comment.reply.sticker' : 'feed.comment.sticker',
+      content: buildAttachmentPayload(trimmedText, {
+        href,
+        type: 'sticker',
+        title: att.title ?? 'Sticker',
+      }),
+    };
+  }
+
+  if (isAnimatedAttachment(att)) {
+    const href = videoUrl ?? directUrl ?? imageUrl ?? '';
+    return {
+      msgType: isReply ? 'feed.comment.reply.animated' : 'feed.comment.animated',
+      content: buildAttachmentPayload(trimmedText, {
+        href,
+        thumb: imageUrl ?? href,
+        type: 'animated',
+        title: att.title ?? 'Ảnh động',
+      }),
+    };
+  }
+
+  if (videoUrl || att.type === 'video' || att.type?.includes('video')) {
+    const href = videoUrl ?? directUrl ?? '';
     return {
       msgType: isReply ? 'feed.comment.reply.video' : 'feed.comment.video',
-      content: JSON.stringify(payload),
+      content: buildAttachmentPayload(trimmedText, {
+        href,
+        type: 'video',
+        title: att.title ?? 'Video',
+      }),
     };
   }
 
-  if (imageUrl || att.type === 'photo' || isSticker) {
-    const href = imageUrl || att.url || '';
-    const mediaType = isSticker ? 'sticker' : 'image';
-    const suffix = isSticker ? 'sticker' : 'photo';
-    const payload = trimmedText
-      ? {
-          text: trimmedText,
-          href,
-          thumb: href,
-          type: mediaType,
-          title: att.title ?? (isSticker ? 'Sticker' : 'Ảnh'),
-        }
-      : {
-          href,
-          thumb: href,
-          type: mediaType,
-          title: att.title ?? (isSticker ? 'Sticker' : 'Ảnh'),
-        };
+  if (imageUrl || att.type === 'photo') {
+    const href = imageUrl ?? directUrl ?? '';
     return {
-      msgType: isReply
-        ? `feed.comment.reply.${suffix}`
-        : `feed.comment.${suffix}`,
-      content: JSON.stringify(payload),
+      msgType: isReply ? 'feed.comment.reply.photo' : 'feed.comment.photo',
+      content: buildAttachmentPayload(trimmedText, {
+        href,
+        type: 'image',
+        title: att.title ?? 'Ảnh',
+      }),
     };
   }
 
-  const payload = trimmedText
-    ? {
-        text: trimmedText,
-        href: att.url,
-        type: att.type ?? 'file',
-        title: att.title ?? 'Đính kèm',
-      }
-    : {
-        href: att.url,
-        type: att.type ?? 'file',
-        title: att.title ?? 'Đính kèm',
-      };
   return {
     msgType: isReply ? 'feed.comment.reply' : 'feed.comment',
-    content: JSON.stringify(payload),
+    content: buildAttachmentPayload(trimmedText, {
+      href: directUrl || undefined,
+      type: att.type ?? 'file',
+      title: att.title ?? 'Đính kèm',
+    }),
   };
 }
 

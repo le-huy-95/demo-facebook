@@ -280,26 +280,14 @@ export class ConversationsService {
       pageId,
       effectiveThreadId,
     );
-    const cacheKey =
-      parsed.kind === 'FEED_COMMENT'
-        ? `${this.redisCache.threadMessagesKey(
-            pageId,
-            effectiveThreadId,
-            revision,
-            limit,
-            options?.before,
-          )}:feed-graph-merge`
-        : this.redisCache.threadMessagesKey(
-            pageId,
-            effectiveThreadId,
-            revision,
-            limit,
-            options?.before,
-          );
-    const cached =
-      parsed.kind === 'FEED_COMMENT'
-        ? null
-        : await this.redisCache.get<ThreadMessagesPage>(cacheKey);
+    const cacheKey = this.redisCache.threadMessagesKey(
+      pageId,
+      effectiveThreadId,
+      revision,
+      limit,
+      options?.before,
+    );
+    const cached = await this.redisCache.get<ThreadMessagesPage>(cacheKey);
     if (cached) {
       await this.markThreadRead(pageId, orgId, effectiveThreadId);
       if (parsed.kind === 'FEED_COMMENT') {
@@ -508,7 +496,12 @@ export class ConversationsService {
 
     for (const post of posts) {
       if (post.id) {
-        ingestPost(post.id, post.comments?.data ?? []);
+        const comments = await this.facebookOAuth.listAllPostComments(
+          post.id,
+          token,
+          { pageSize: 100, maxComments: 500 },
+        );
+        ingestPost(post.id, comments);
       }
     }
 
@@ -804,7 +797,7 @@ export class ConversationsService {
     before?: string,
     _rootCommentId?: string,
   ): Promise<ThreadMessagesPage> {
-    const result = await this.getWebhookThreadMessages(
+    const webhookResult = await this.getWebhookThreadMessages(
       threadId,
       pageId,
       orgId,
@@ -813,55 +806,74 @@ export class ConversationsService {
       before,
     );
 
-    const graphResult = await this.getCommentThreadMessagesFromGraph(
-      pageId,
-      orgId,
-      postId,
-      customerId,
-      limit,
-      before,
-    );
-
-    if (graphResult.messages.length === 0 && result.messages.length === 0) {
-      return graphResult;
-    }
-
-    if (graphResult.messages.length === 0) {
-      return {
-        ...result,
-        messages: await this.applyFeedCommentVisibilityFromGraph(
-          result.messages,
-          pageId,
-          orgId,
-          postId,
-        ),
-      };
-    }
-
-    const mergedMessages = this.mergeThreadMessages(
-      result.messages as WebhookEvent[],
-      graphResult.messages,
-    );
-    const sliced = mergedMessages.slice(-limit);
-    const oldest = sliced[0];
-    const hasMore =
-      mergedMessages.length > limit ||
-      graphResult.paging.hasMore ||
-      result.paging.hasMore;
-
-    return {
-      messages: await this.applyFeedCommentVisibilityFromGraph(
-        sliced,
+    const token = await this.getPageAccessToken(pageId, orgId);
+    let graphMessages: ConversationMessage[] = [];
+    if (token && postId?.trim()) {
+      const comments = await this.getCachedPostComments(
         pageId,
         orgId,
         postId,
-      ),
+        token,
+      );
+      const byId = new Map(
+        comments
+          .filter((c): c is GraphPostComment & { id: string } => !!c.id)
+          .map((c) => [c.id, c]),
+      );
+      graphMessages = comments
+        .filter((c) =>
+          this.commentBelongsToThread(c, pageId, customerId, byId),
+        )
+        .map((c) =>
+          this.graphCommentToEvent(c, pageId, postId, customerId, orgId),
+        );
+    }
+
+    const merged = this.mergeThreadMessages(
+      webhookResult.messages as WebhookEvent[],
+      graphMessages,
+    );
+
+    let threadMessages = merged;
+    const beforeDate = parseDateCursor(before);
+    if (beforeDate) {
+      threadMessages = threadMessages.filter(
+        (m) => m.createdAt.getTime() < beforeDate.getTime(),
+      );
+    }
+
+    const hasMore = threadMessages.length > limit;
+    const page = hasMore
+      ? threadMessages.slice(threadMessages.length - limit)
+      : threadMessages;
+
+    const withMedia = this.enrichFeedCommentContent(page);
+    const enriched = await this.enrichMessagePictures(
+      withMedia,
+      pageId,
+      orgId,
+      customerId,
+    );
+    const withNames = await this.enrichMessageSenderNames(
+      enriched,
+      pageId,
+      orgId,
+      customerId,
+    );
+    const withVisibility = await this.applyFeedCommentVisibilityFromGraph(
+      withNames,
+      pageId,
+      orgId,
+      postId,
+    );
+
+    const oldest = withVisibility[0];
+
+    return {
+      messages: withVisibility,
       paging: {
         hasMore,
-        nextBefore:
-          hasMore && oldest
-            ? oldest.createdAt.toISOString()
-            : result.paging.nextBefore ?? graphResult.paging.nextBefore,
+        nextBefore: hasMore && oldest ? oldest.createdAt.toISOString() : null,
       },
     };
   }
@@ -1549,7 +1561,7 @@ export class ConversationsService {
       senderId: isFromPage ? pageId : senderId,
       senderName: comment.from?.name ?? (isFromPage ? 'Page' : 'Khách hàng'),
       senderPictureUrl: extractGraphPictureUrl(comment.from),
-      recipientId: isFromPage ? customerPsid : null,
+      recipientId: isFromPage ? customerPsid : pageId,
       messageId: comment.id,
       postId,
       commentId: comment.id,

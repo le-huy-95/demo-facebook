@@ -63,18 +63,6 @@ function extractAttachmentFromPayload(
     return { type: 'photo', url, media: { image: { src: url } } };
   }
 
-  const gif = payload.gif;
-  if (typeof gif === 'string' && gif.trim()) {
-    const url = gif.trim();
-    return { type: 'animated_image', url, media: { image: { src: url } } };
-  }
-
-  const sticker = payload.sticker;
-  if (typeof sticker === 'string' && sticker.trim()) {
-    const url = sticker.trim();
-    return { type: 'sticker', url, media: { image: { src: url } } };
-  }
-
   const link = payload.link;
   if (typeof link === 'string' && link.trim()) {
     const url = link.trim();
@@ -86,86 +74,72 @@ function extractAttachmentFromPayload(
   return null;
 }
 
-function isStickerAttachmentType(type?: string): boolean {
-  if (!type) return false;
-  const lower = type.toLowerCase();
-  return (
-    lower === 'sticker' ||
-    lower === 'animated_image' ||
-    lower === 'animated_image_share' ||
-    lower === 'gif' ||
-    lower.includes('sticker') ||
-    lower.includes('animated')
-  );
-}
-
-function isDirectMediaUrl(url: string): boolean {
-  return (
-    /\.(png|jpe?g|gif|webp|mp4|webm)(\?|$)/i.test(url) ||
-    url.includes('fbcdn.net') ||
-    url.includes('fbsbx.com')
-  );
-}
-
 function serializeAttachment(
   att: NonNullable<ReturnType<typeof extractAttachmentFromPayload>>,
   text: string,
 ): { text: string; attachment: ParsedAttachment } {
-  const imageUrl =
-    att.media?.image?.src?.trim() ||
-    (att.url && isDirectMediaUrl(att.url) ? att.url.trim() : '');
-  const videoUrl = att.media?.source?.trim() || '';
-  const isSticker =
-    isStickerAttachmentType(att.type) || /\.gif(\?|$)/i.test(imageUrl);
+  const imageUrl = att.media?.image?.src ?? att.url;
+  const videoUrl = att.media?.source;
+  const directUrl = att.url ?? '';
+  const type = att.type?.toLowerCase() ?? '';
 
-  if (videoUrl && (att.type === 'video' || !imageUrl)) {
+  if (type === 'sticker' && (directUrl || imageUrl)) {
+    const href = directUrl || imageUrl || '';
     return {
       text,
       attachment: {
-        href: videoUrl,
-        type: 'video',
-        title: att.title ?? 'Video',
-      },
-    };
-  }
-
-  if (imageUrl) {
-    const mediaType = isSticker ? 'sticker' : 'image';
-    return {
-      text,
-      attachment: {
-        href: imageUrl,
-        thumb: imageUrl,
-        type: mediaType,
-        title: att.title ?? (isSticker ? 'Sticker' : 'Ảnh'),
-      },
-    };
-  }
-
-  if (att.type === 'sticker' && att.url) {
-    return {
-      text,
-      attachment: {
-        href: att.url,
-        thumb: att.url,
+        href,
+        thumb: href,
         type: 'sticker',
         title: 'Sticker',
       },
     };
   }
 
-  if (att.type === 'video') {
+  const isAnimated =
+    type.includes('animated') ||
+    type === 'gif' ||
+    (videoUrl && /\.(mp4|webm|gif)(\?|$)/i.test(videoUrl)) ||
+    (directUrl && /\.gif(\?|$)/i.test(directUrl)) ||
+    (videoUrl && imageUrl && videoUrl !== imageUrl && type === 'photo');
+
+  if (isAnimated) {
+    const href = videoUrl ?? directUrl ?? imageUrl ?? '';
     return {
       text,
       attachment: {
-        href: videoUrl ?? att.url,
+        href,
+        thumb: imageUrl ?? href,
+        type: 'animated',
+        title: att.title ?? 'Ảnh động',
+      },
+    };
+  }
+
+  if (imageUrl) {
+    return {
+      text,
+      attachment: {
+        href: imageUrl,
+        thumb: imageUrl,
+        type: 'image',
+        title: att.title ?? 'Ảnh',
+      },
+    };
+  }
+
+  if (videoUrl || type === 'video' || type.includes('video')) {
+    return {
+      text,
+      attachment: {
+        href: videoUrl ?? directUrl,
         type: 'video',
         title: att.title ?? 'Video',
       },
     };
   }
 
-  return { text, attachment: { href: att.url, type: att.type, title: att.title } };
+  return { text, attachment: { href: directUrl, type: att.type, title: att.title } };
 }
 
 function extractFeedCommentFromRaw(
@@ -241,6 +215,8 @@ function parseFeedCommentContent(msg: WebhookMessage): ParsedMessageContent | nu
     'feed.comment.reply.photo',
     'feed.comment.sticker',
     'feed.comment.reply.sticker',
+    'feed.comment.animated',
+    'feed.comment.reply.animated',
     'feed.comment.video',
     'feed.comment.reply.video',
   ]);
@@ -334,6 +310,9 @@ function formatMediaThreadPreview(
   const who =
     direction === 'OUT' ? 'Bạn' : senderName?.trim() || 'Khách hàng';
   if (mediaType?.includes('sticker')) return `${who} đã gửi 1 sticker`;
+  if (mediaType?.includes('animated') || mediaType?.includes('gif')) {
+    return `${who} đã gửi 1 ảnh động`;
+  }
   if (mediaType?.includes('video')) return `${who} đã gửi 1 video`;
   return `${who} đã gửi 1 hình ảnh`;
 }
@@ -343,7 +322,8 @@ function isFeedCommentMediaMsgType(msgType?: string | null): boolean {
   return (
     msgType.includes('photo') ||
     msgType.includes('video') ||
-    msgType.includes('sticker')
+    msgType.includes('sticker') ||
+    msgType.includes('animated')
   );
 }
 
@@ -372,7 +352,9 @@ export function formatConversationThreadPreview(
       ? 'video'
       : input.msgType!.includes('sticker')
         ? 'sticker'
-        : 'image';
+        : input.msgType!.includes('animated')
+          ? 'animated'
+          : 'image';
     return formatMediaThreadPreview(
       mediaType,
       input.direction,

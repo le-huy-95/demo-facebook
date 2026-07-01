@@ -52,6 +52,39 @@ export function resolveRootCommentId(event: WebhookEvent): string | null {
   return event.parentCommentId ?? event.commentId ?? null;
 }
 
+type GraphCommentNode = {
+  from?: { id?: string };
+  parent?: { id?: string };
+};
+
+/** Xác định khách hàng của thread từ comment (kể cả reply của page lồng nhiều cấp). */
+export function resolveFeedCommentThreadCustomerId(
+  comment: GraphCommentNode,
+  pageId: string,
+  postId: string,
+  commentsById: Map<string, GraphCommentNode>,
+): string | null {
+  const senderId = comment.from?.id;
+  if (!senderId) return null;
+  if (senderId !== pageId) return senderId;
+
+  let current: GraphCommentNode | undefined = comment;
+  for (let depth = 0; depth < 12; depth += 1) {
+    const parentId = current?.parent?.id;
+    if (!parentId || parentId === postId) return null;
+
+    const parent = commentsById.get(parentId);
+    if (!parent) return null;
+
+    const parentSender = parent.from?.id;
+    if (parentSender && parentSender !== pageId) return parentSender;
+
+    current = parent;
+  }
+
+  return null;
+}
+
 /** Một hội thoại bình luận = khách + bài viết (gộp mọi reply trong cùng chuỗi). */
 export function buildFeedCommentThreadId(
   pageId: string,
@@ -200,18 +233,6 @@ export function buildThreadEventWhere(
           OR: [
             { commentId: parsed.commentId },
             { parentCommentId: parsed.commentId },
-            { senderId: parsed.senderId },
-            {
-              senderId: parsed.pageId,
-              direction: 'OUT',
-              recipientId: parsed.senderId,
-            },
-            {
-              senderId: parsed.pageId,
-              direction: 'OUT',
-              recipientId: null,
-            },
-            { direction: 'OUT', senderId: parsed.senderId },
           ],
         },
       ],

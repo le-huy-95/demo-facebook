@@ -33,6 +33,9 @@ function formatMediaThreadPreview(
   const who =
     direction === 'OUT' ? 'Bạn' : senderName?.trim() || 'Khách hàng';
   if (mediaType?.includes('sticker')) return `${who} đã gửi 1 sticker`;
+  if (mediaType?.includes('animated') || mediaType?.includes('gif')) {
+    return `${who} đã gửi 1 ảnh động`;
+  }
   if (mediaType?.includes('video')) return `${who} đã gửi 1 video`;
   return `${who} đã gửi 1 hình ảnh`;
 }
@@ -42,7 +45,8 @@ function isFeedCommentMediaMsgType(msgType?: string | null): boolean {
   return (
     msgType.includes('photo') ||
     msgType.includes('video') ||
-    msgType.includes('sticker')
+    msgType.includes('sticker') ||
+    msgType.includes('animated')
   );
 }
 
@@ -70,7 +74,9 @@ export function formatConversationThreadPreview(
       ? 'video'
       : input.msgType!.includes('sticker')
         ? 'sticker'
-        : 'image';
+        : input.msgType!.includes('animated')
+          ? 'animated'
+          : 'image';
     return formatMediaThreadPreview(
       mediaType,
       input.direction,
